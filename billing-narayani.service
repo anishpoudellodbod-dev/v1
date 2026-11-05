@@ -1,0 +1,19 @@
+[Unit]
+Description=Narayani Billing API
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/billing-narayani/v1
+Environment=APP_PORT=5001
+ExecStart=/home/ubuntu/billing-narayani/v1/target/release/v1
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
