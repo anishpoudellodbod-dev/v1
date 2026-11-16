@@ -1,23 +1,23 @@
-#[derive(Debug, PartialEq, Clone, Copy, Eq)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DateType{
     AD,
     BS
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Eq)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Date{
     pub date: DateParams,
     pub date_type: DateType
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Eq)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DateParams{
     pub year:i32,
     pub month:i32,
     pub day:i32
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Eq)]
+#[derive(Debug, PartialEq, Clone, Copy, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DateRange{
     pub start: Date,
     pub end: Date

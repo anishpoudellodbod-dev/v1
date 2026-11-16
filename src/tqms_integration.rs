@@ -232,7 +232,7 @@ pub async fn search_vehicles(
 
     //Search in vehicle cache first and if found send both cache and tqms result, if not found search in tqms and send result and insert a flag that is in billing but not in tqms
 
-
+    
     match s_data.tqms_client.search_vehicles(params).await {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(e) => HttpResponse::InternalServerError()

@@ -1,6 +1,6 @@
 use crate::resource::{DatabaseResource, ResourceName};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Cache {
@@ -170,6 +170,136 @@ impl Cache {
         self.cache.entry(resource_name).or_default().insert(id, resource);
     }
 
+    fn extract_vehicle_id(inner: &Value) -> Option<String> {
+        inner.get("VehicleId").and_then(|id| {
+            id.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .or_else(|| id.as_i64().map(|n| n.to_string()))
+                .or_else(|| id.as_u64().map(|n| n.to_string()))
+        })
+    }
+
+    fn normalize_vehicle_number(raw: &str) -> Option<String> {
+        let normalized: String = raw
+            .chars()
+            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+            .flat_map(char::to_uppercase)
+            .collect();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn extract_normalized_vehicle_number(inner: &Value) -> Option<String> {
+        inner
+            .get("VehicleNumber")
+            .and_then(Value::as_str)
+            .and_then(Self::normalize_vehicle_number)
+            .or_else(|| {
+                inner
+                    .get("NormalizedVehicleNumber")
+                    .and_then(Value::as_str)
+                    .and_then(Self::normalize_vehicle_number)
+            })
+    }
+
+    fn extract_created_time(resource: &DatabaseResource) -> Option<chrono::DateTime<chrono::Utc>> {
+        let raw = resource
+            .external_content
+            .as_ref()?
+            .get("createdTime")?
+            .as_str()?
+            .trim();
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    }
+
+    /// Deduplicates `VehicleResource` entries by unique `VehicleId` and normalized `VehicleNumber`,
+    /// selecting the latest record by `external_content.createdTime` (missing `createdTime` is
+    /// treated as oldest) and copying a non-null `metadata` field from any matching duplicate.
+    pub fn deduplicate_vehicle_resources(
+        mut resources: Vec<DatabaseResource>,
+    ) -> Vec<DatabaseResource> {
+        resources.sort_by(|a, b| {
+            let time_a = Self::extract_created_time(a);
+            let time_b = Self::extract_created_time(b);
+            time_b.cmp(&time_a).then_with(|| b.id.cmp(&a.id))
+        });
+
+        let mut metadata_by_id: HashMap<String, Value> = HashMap::new();
+        let mut metadata_by_number: HashMap<String, Value> = HashMap::new();
+
+        for resource in &resources {
+            let Some(inner) = &resource.inner_content else {
+                continue;
+            };
+            let Some(metadata) = inner.get("metadata").filter(|m| !m.is_null()) else {
+                continue;
+            };
+
+            if let Some(v_id) = Self::extract_vehicle_id(inner) {
+                metadata_by_id.entry(v_id).or_insert_with(|| metadata.clone());
+            }
+            if let Some(v_num) = Self::extract_normalized_vehicle_number(inner) {
+                metadata_by_number
+                    .entry(v_num)
+                    .or_insert_with(|| metadata.clone());
+            }
+        }
+
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_numbers: HashSet<String> = HashSet::new();
+        let mut unique_resources = Vec::with_capacity(resources.len());
+
+        for mut resource in resources {
+            let (v_id, v_num) = match &resource.inner_content {
+                Some(inner) => (
+                    Self::extract_vehicle_id(inner),
+                    Self::extract_normalized_vehicle_number(inner),
+                ),
+                None => (None, None),
+            };
+
+            let is_duplicate_id = v_id.as_ref().is_some_and(|id| seen_ids.contains(id));
+            let is_duplicate_num = v_num.as_ref().is_some_and(|num| seen_numbers.contains(num));
+
+            if is_duplicate_id || is_duplicate_num {
+                continue;
+            }
+
+            if let Some(id) = &v_id {
+                seen_ids.insert(id.clone());
+            }
+            if let Some(num) = &v_num {
+                seen_numbers.insert(num.clone());
+            }
+
+            if let Some(Value::Object(ref mut map)) = resource.inner_content {
+                let has_metadata = map.get("metadata").is_some_and(|m| !m.is_null());
+                if !has_metadata {
+                    let copied_metadata = v_id
+                        .as_ref()
+                        .and_then(|id| metadata_by_id.get(id))
+                        .or_else(|| v_num.as_ref().and_then(|num| metadata_by_number.get(num)))
+                        .cloned();
+
+                    if let Some(metadata) = copied_metadata {
+                        map.insert("metadata".to_string(), metadata);
+                    }
+                }
+            }
+
+            unique_resources.push(resource);
+        }
+
+        unique_resources
+    }
+
     pub async fn load_from_db(&mut self, db: &crate::db::Database) {
         let resource_names: Vec<_> = db
             .resource_name
@@ -184,6 +314,12 @@ impl Cache {
         for (i, resource_name) in resource_names.into_iter().enumerate() {
             match db.read_all_resource(resource_name.clone()).await {
                 Ok(resources) => {
+                    let resources = if resource_name == ResourceName::VehicleResource {
+                        Self::deduplicate_vehicle_resources(resources)
+                    } else {
+                        resources
+                    };
+
                     // Single outer HashMap lookup and pre-allocation per resource type
                     let entry = self
                         .cache
@@ -402,5 +538,96 @@ mod tests {
         // Empty query batch pagination
         let page_empty = cache.search_innercontent_batch(ResourceName::VehicleResource, "Owners.Name", "", 4, 0);
         assert_eq!(page_empty.len(), 4);
+    }
+
+    #[test]
+    fn test_deduplicate_vehicles_by_id_and_copy_metadata() {
+        let mut v1 = make_sample_vehicle(1, "Ba Pra-53-01-0-2256", "Addidas vandari", 35903);
+        v1.external_content = Some(serde_json::json!({ "createdTime": "2026-11-04T11:46:07Z" }));
+
+        let mut v2 = make_sample_vehicle(2, "OTHER-NUM-9999", "Addidas vandari", 35903);
+        v2.external_content = Some(serde_json::json!({ "createdTime": "2026-11-01T06:56:22Z" }));
+        if let Some(Value::Object(ref mut map)) = v2.inner_content {
+            map.insert(
+                "metadata".to_string(),
+                serde_json::json!({
+                    "tags": ["blacklisted"],
+                    "isBlacklisted": true,
+                    "blacklistSource": "tqms"
+                }),
+            );
+        }
+
+        let deduped = Cache::deduplicate_vehicle_resources(vec![v1, v2]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, Some(1));
+        let meta = deduped[0]
+            .inner_content
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .expect("metadata should be copied onto retained latest vehicle");
+        assert_eq!(meta["isBlacklisted"], true);
+        assert_eq!(meta["blacklistSource"], "tqms");
+    }
+
+    #[test]
+    fn test_deduplicate_vehicles_by_number_and_copy_metadata() {
+        let mut v1 = make_sample_vehicle(10, "Ba Pra-53-01-0-2256", "Owner A", 1001);
+        v1.external_content = Some(serde_json::json!({ "createdTime": "2026-11-05T10:00:00Z" }));
+        if let Some(Value::Object(ref mut map)) = v1.inner_content {
+            map.insert("metadata".to_string(), Value::Null);
+        }
+
+        let mut v2 = make_sample_vehicle(11, "BA PRA 53 01 0 2256", "Owner B", 1002);
+        // No createdTime -> assumed oldest
+        if let Some(Value::Object(ref mut map)) = v2.inner_content {
+            map.insert(
+                "metadata".to_string(),
+                serde_json::json!({
+                    "tags": ["blacklisted"],
+                    "performedBy": "admin@narayanisangh.com"
+                }),
+            );
+        }
+
+        let v3 = make_sample_vehicle(12, "BA-01-PA-9999", "Owner C", 1003);
+
+        let deduped = Cache::deduplicate_vehicle_resources(vec![v1, v2, v3]);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].id, Some(10));
+        assert_eq!(deduped[1].id, Some(12));
+
+        let meta = deduped[0]
+            .inner_content
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .expect("metadata should be copied from older duplicate without createdTime");
+        assert_eq!(meta["performedBy"], "admin@narayanisangh.com");
+        assert!(deduped[1].inner_content.as_ref().unwrap().get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_deduplicate_vehicles_selects_latest_created_time_and_missing_is_oldest() {
+        // Record with no createdTime (even with highest DB id) should be treated as oldest
+        let mut v_no_time = make_sample_vehicle(99, "Ba Pra-53-01-0-2256", "Oldest No Time", 35903);
+        if let Some(Value::Object(ref mut map)) = v_no_time.inner_content {
+            map.insert(
+                "metadata".to_string(),
+                serde_json::json!({ "tags": ["blacklisted"], "blacklistedReason": "legacy" }),
+            );
+        }
+
+        let mut v_older = make_sample_vehicle(10, "Ba Pra-53-01-0-2256", "Middle Owner", 35903);
+        v_older.external_content = Some(serde_json::json!({ "createdTime": "2026-11-01T06:56:22Z" }));
+
+        let mut v_latest = make_sample_vehicle(20, "Ba Pra-53-01-0-2256", "Latest Owner", 35903);
+        v_latest.external_content = Some(serde_json::json!({ "createdTime": "2026-11-04T11:46:07Z" }));
+
+        let deduped = Cache::deduplicate_vehicle_resources(vec![v_no_time, v_older, v_latest]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, Some(20));
+        let inner = deduped[0].inner_content.as_ref().unwrap();
+        assert_eq!(inner["Owners"][0]["Name"], "Latest Owner");
+        assert_eq!(inner["metadata"]["blacklistedReason"], "legacy");
     }
 }

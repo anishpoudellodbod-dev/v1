@@ -19,6 +19,7 @@ mod resource;
 mod roles;
 mod tqms_integration;
 pub mod billing_actions;
+pub mod dashboard_statistics;
 mod api_stream;
 pub mod date;
 pub mod log;
@@ -204,6 +205,17 @@ async fn main() -> std::io::Result<()> {
             //     .route("/Read/{resource_name}/{id}", web::post().to(routes::read_resource))
             //     .app_data(web::Data::new(Arc::new(vec![roles::Roles::Visitor])))//Store Role
             // )
+            .service(
+                web::scope("/api/v1/dashboard")
+                    .route(
+                        "/statistics",
+                        web::get().to(dashboard_statistics::get_dashboard_statistics),
+                    )
+                    .route(
+                        "/statistics/{fiscal_year}",
+                        web::get().to(dashboard_statistics::get_dashboard_statistics_by_fy),
+                    ),
+            )
             .service(
                 web::scope("/api/v1/tqms")
                     .route("/search", web::post().to(tqms_integration::search_vehicles))
