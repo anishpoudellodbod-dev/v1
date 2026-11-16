@@ -1,5 +1,6 @@
 use crate::date::{Date, DateParams};
 use crate::resource::{DatabaseResource, ResourceName};
+use crate::tqms_integration::VehicleSearchParameters;
 use crate::ServerData;
 use actix_web::{http::StatusCode, web, HttpMessage, HttpRequest, HttpResponse};
 use chrono::Utc;
@@ -109,10 +110,10 @@ pub struct CreatedByInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LodbodVehicleQuery {
-    #[serde(rename = "vehicleId", default)]
-    pub vehicle_id: Option<String>,
-    #[serde(rename = "vehicleNumber", default)]
-    pub vehicle_number: Option<String>,
+    #[serde(rename = "vehicleId")]
+    pub vehicle_id: String,
+    #[serde(rename = "vehicleNumber")]
+    pub vehicle_number: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +520,44 @@ fn eq_normalized_vehicle_number(raw: &str, normalized_upper: &str) -> bool {
         .eq(normalized_upper.chars())
 }
 
+/// Returns `true` if a vehicle's JSON inner content matches the given `VehicleId` or normalized `VehicleNumber`.
+fn vehicle_inner_matches(
+    inner: &Value,
+    q_id: &str,
+    q_id_i64: Option<i64>,
+    q_id_u64: Option<u64>,
+    q_norm: &str,
+    check_normalized_field: bool,
+) -> bool {
+    if !q_id.is_empty() {
+        if let Some(vid) = inner.get("VehicleId") {
+            if vid.as_str() == Some(q_id)
+                || (q_id_i64.is_some() && vid.as_i64() == q_id_i64)
+                || (q_id_u64.is_some() && vid.as_u64() == q_id_u64)
+            {
+                return true;
+            }
+        }
+    }
+
+    if !q_norm.is_empty() {
+        if let Some(vnum) = inner.get("VehicleNumber").and_then(Value::as_str) {
+            if eq_normalized_vehicle_number(vnum, q_norm) {
+                return true;
+            }
+        }
+        if check_normalized_field {
+            if let Some(vnorm) = inner.get("NormalizedVehicleNumber").and_then(Value::as_str) {
+                if eq_normalized_vehicle_number(vnorm, q_norm) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Zero-allocation vehicle lookup across an iterator of `DatabaseResource`.
 fn find_matching_vehicle<'a, I>(
     vehicles: I,
@@ -530,43 +569,78 @@ where
     I: IntoIterator<Item = &'a DatabaseResource>,
 {
     let has_id = !q_id.is_empty();
-    let has_norm = !q_norm.is_empty();
     let q_id_i64 = if has_id { q_id.parse::<i64>().ok() } else { None };
     let q_id_u64 = if has_id { q_id.parse::<u64>().ok() } else { None };
 
     vehicles.into_iter().find(|res| {
-        let Some(inner) = &res.inner_content else {
-            return false;
-        };
-
-        if has_id {
-            if let Some(vid) = inner.get("VehicleId") {
-                if vid.as_str() == Some(q_id)
-                    || (q_id_i64.is_some() && vid.as_i64() == q_id_i64)
-                    || (q_id_u64.is_some() && vid.as_u64() == q_id_u64)
-                {
-                    return true;
-                }
-            }
-        }
-
-        if has_norm {
-            if let Some(vnum) = inner.get("VehicleNumber").and_then(Value::as_str) {
-                if eq_normalized_vehicle_number(vnum, q_norm) {
-                    return true;
-                }
-            }
-            if check_normalized_field {
-                if let Some(vnorm) = inner.get("NormalizedVehicleNumber").and_then(Value::as_str) {
-                    if eq_normalized_vehicle_number(vnorm, q_norm) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+        res.inner_content.as_ref().is_some_and(|inner| {
+            vehicle_inner_matches(inner, q_id, q_id_i64, q_id_u64, q_norm, check_normalized_field)
+        })
     })
+}
+
+/// Checks whether a vehicle's JSON inner content indicates it is blacklisted.
+pub fn is_vehicle_blacklisted(inner: &Value) -> bool {
+    if let Some(meta) = inner.get("metadata") {
+        if meta.get("isBlacklisted").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        if meta
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .any(|t| t.trim().eq_ignore_ascii_case("blacklisted"))
+            })
+        {
+            return true;
+        }
+    }
+
+    if inner.get("isBlacklisted").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+
+    inner
+        .get("Registration")
+        .and_then(|r| r.get("Status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("BLACKLISTED"))
+}
+
+/// Moves the matching vehicle record out of a mutable TQMS `search_vehicles` response without cloning.
+fn take_matching_tqms_vehicle(
+    tqms_response: &mut Value,
+    q_id: &str,
+    q_norm: &str,
+) -> Option<Value> {
+    let items = tqms_response
+        .get_mut("Data")?
+        .get_mut("Data")?
+        .as_array_mut()?;
+    let has_id = !q_id.is_empty();
+    let q_id_i64 = if has_id { q_id.parse::<i64>().ok() } else { None };
+    let q_id_u64 = if has_id { q_id.parse::<u64>().ok() } else { None };
+
+    items
+        .iter_mut()
+        .find(|item| vehicle_inner_matches(item, q_id, q_id_i64, q_id_u64, q_norm, true))
+        .map(Value::take)
+}
+
+/// Extracts the matching vehicle record from a TQMS `search_vehicles` JSON response.
+#[allow(dead_code)]
+fn find_matching_tqms_vehicle(tqms_response: &Value, q_id: &str, q_norm: &str) -> Option<Value> {
+    let items = tqms_response.get("Data")?.get("Data")?.as_array()?;
+    let has_id = !q_id.is_empty();
+    let q_id_i64 = if has_id { q_id.parse::<i64>().ok() } else { None };
+    let q_id_u64 = if has_id { q_id.parse::<u64>().ok() } else { None };
+
+    items
+        .iter()
+        .find(|item| vehicle_inner_matches(item, q_id, q_id_i64, q_id_u64, q_norm, true))
+        .cloned()
 }
 
 pub fn resolve_owners_from_inner(inner: &Value) -> Option<OwnersResolution> {
@@ -1305,6 +1379,166 @@ where
 // 4. API Endpoints
 // =========================================================================
 
+async fn resolve_single_vehicle_billing_details(
+    q_id: &str,
+    q_num: &str,
+    q_norm: &str,
+    tqms_vehicle: Option<Value>,
+    s_data: &ServerData,
+) -> VehicleBillingDetails {
+    let q_id_i64 = q_id.parse::<i64>().ok();
+    let q_id_u64 = q_id.parse::<u64>().ok();
+
+    let (resolved_outcome, cache_update) = {
+        let cache = s_data.cache.read().await;
+        let vehicles_map = cache.cache.get(&ResourceName::VehicleResource);
+
+        let mut matched_cached: Option<&DatabaseResource> = None;
+        let mut cached_is_blacklisted = false;
+
+        if let Some(m) = vehicles_map {
+            for res in m.values() {
+                let Some(inner) = res.inner_content.as_ref() else {
+                    continue;
+                };
+                if vehicle_inner_matches(inner, q_id, q_id_i64, q_id_u64, q_norm, true) {
+                    if matched_cached.is_none() {
+                        matched_cached = Some(res);
+                    }
+                    if !cached_is_blacklisted && is_vehicle_blacklisted(inner) {
+                        cached_is_blacklisted = true;
+                    }
+                    if matched_cached.is_some() && cached_is_blacklisted {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (resolved_inner, cache_update) = match (tqms_vehicle, matched_cached) {
+            (Some(mut fresh_inner), Some(cached)) => {
+                // Preserve local blacklist/custom metadata on the refreshed TQMS vehicle payload.
+                if let Some(cached_meta) = cached
+                    .inner_content
+                    .as_ref()
+                    .and_then(|c| c.get("metadata"))
+                    .filter(|m| !m.is_null())
+                {
+                    if let Value::Object(ref mut map) = fresh_inner {
+                        let has_fresh_meta = map.get("metadata").is_some_and(|m| !m.is_null());
+                        if !has_fresh_meta {
+                            map.insert("metadata".to_string(), cached_meta.clone());
+                        }
+                    }
+                }
+
+                let update = cached.id.and_then(|cache_id| {
+                    if cached.inner_content.as_ref() == Some(&fresh_inner) {
+                        None
+                    } else {
+                        Some((
+                            cache_id,
+                            DatabaseResource {
+                                id: Some(cache_id),
+                                resource_name: cached.resource_name,
+                                inner_content: Some(fresh_inner.clone()),
+                                external_content: cached.external_content.clone(),
+                            },
+                        ))
+                    }
+                });
+
+                (Some(fresh_inner), update)
+            }
+            (Some(fresh_inner), None) => (Some(fresh_inner), None),
+            (None, Some(cached)) => (cached.inner_content.clone(), None),
+            (None, None) => (None, None),
+        };
+
+        let outcome = resolved_inner.map(|inner| {
+            let actual_id = inner
+                .get("VehicleId")
+                .and_then(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .unwrap_or_else(|| q_id.to_string());
+
+            let actual_num = inner
+                .get("VehicleNumber")
+                .and_then(Value::as_str)
+                .unwrap_or(q_num)
+                .to_string();
+
+            let history = match cache.cache.get(&ResourceName::BillResource) {
+                Some(bm) => extract_payment_history_from_iter(&actual_id, &actual_num, bm.values()),
+                None => Vec::new(),
+            };
+
+            (inner, actual_id, actual_num, cached_is_blacklisted, history)
+        });
+
+        (outcome, cache_update)
+    };
+
+    if let Some((cache_id, updated_res)) = cache_update {
+        s_data
+            .cache
+            .write()
+            .await
+            .write(ResourceName::VehicleResource, cache_id, updated_res);
+    }
+
+    let Some((inner, actual_id, actual_num, cached_is_blacklisted, history)) = resolved_outcome
+    else {
+        return VehicleBillingDetails {
+            vehicle_id: q_id.to_string(),
+            vehicle_number: q_num.to_string(),
+            vehicle_status: "NOT_FOUND".to_string(),
+            owners: None,
+            fees: vec![],
+            payment_history: vec![],
+        };
+    };
+
+    let is_deregistered = inner
+        .get("Registration")
+        .and_then(|r| r.get("Status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("DEREGISTERED"));
+
+    let is_blacklisted = is_vehicle_blacklisted(&inner) || cached_is_blacklisted;
+    let owners = resolve_owners_from_inner(&inner);
+    let is_eligible = !is_deregistered && !is_blacklisted && owners.is_some();
+    let vehicle_status = if is_eligible {
+        "ELIGIBLE".to_string()
+    } else {
+        "INELIGIBLE".to_string()
+    };
+
+    let fees = if is_eligible {
+        let vtype = inner.get("VehicleType").cloned();
+        let v_details = Some(serde_json::json!({
+            "vehicleCategory": vtype.clone().unwrap_or_else(|| Value::String("Vehicle".to_string())),
+            "vehicleType": vtype.unwrap_or_else(|| Value::String("Commercial".to_string()))
+        }));
+        generate_applicable_fees(v_details, None, &history)
+    } else {
+        vec![]
+    };
+
+    VehicleBillingDetails {
+        vehicle_id: actual_id,
+        vehicle_number: actual_num,
+        vehicle_status,
+        owners,
+        fees,
+        payment_history: history,
+    }
+}
+
 /// API 1: Get vehicle billing details
 /// POST /api/integrations/lodbod/v1/vehicles/billing-details
 pub async fn get_vehicle_billing_details(
@@ -1329,105 +1563,50 @@ pub async fn get_vehicle_billing_details(
         });
     }
 
+    if body.vehicles.iter().any(|q| q.vehicle_id.trim().is_empty() || q.vehicle_number.trim().is_empty()) {
+        return HttpResponse::BadRequest().json(ApiErrorResponse {
+            success: false,
+            error: ApiErrorDetails {
+                code: "INVALID_REQUEST".to_string(),
+                message: "vehicleId and vehicleNumber are required for every vehicle query"
+                    .to_string(),
+                details: vec![
+                    "Every vehicle entry must include non-empty vehicleId and vehicleNumber"
+                        .to_string(),
+                ],
+            },
+            request_id: req_id,
+        });
+    }
+
     let mut results: Vec<VehicleBillingDetails> = Vec::with_capacity(body.vehicles.len());
 
-    {
-        let cache = s_data.cache.read().await;
-        let vehicles_map = cache.cache.get(&ResourceName::VehicleResource);
-        let bills_map = cache.cache.get(&ResourceName::BillResource);
+    for query in &body.vehicles {
+        let q_id = query.vehicle_id.trim();
+        let q_num = query.vehicle_number.trim();
+        let q_norm = normalize_vehicle_number(q_num);
 
-        for query in &body.vehicles {
-            let q_id = query.vehicle_id.as_deref().unwrap_or_default().trim();
-            let q_num = query.vehicle_number.as_deref().unwrap_or_default().trim();
+        // Fetch freshest vehicle data from TQMS without holding any cache lock across await.
+        let tqms_vehicle = match s_data
+            .tqms_client
+            .search_vehicles(VehicleSearchParameters {
+                page: Some(1),
+                page_size: Some(20),
+                vehicle_number: Some(q_num.to_string()),
+                owner_name: None,
+                sangh_branch: None,
+                status: None,
+            })
+            .await
+        {
+            Ok(mut resp) => take_matching_tqms_vehicle(&mut resp, q_id, &q_norm),
+            Err(_) => None,
+        };
 
-            if q_id.is_empty() && q_num.is_empty() {
-                results.push(VehicleBillingDetails {
-                    vehicle_id: String::new(),
-                    vehicle_number: String::new(),
-                    vehicle_status: "NOT_FOUND".to_string(),
-                    owners: None,
-                    fees: vec![],
-                    payment_history: vec![],
-                });
-                continue;
-            }
-
-            let q_norm = normalize_vehicle_number(q_num);
-            let matched_vehicle = vehicles_map
-                .and_then(|m| find_matching_vehicle(m.values(), q_id, &q_norm, true));
-
-            match matched_vehicle {
-                Some(v_res) => {
-                    let inner = v_res.inner_content.as_ref().unwrap();
-                    let actual_id = inner
-                        .get("VehicleId")
-                        .and_then(|v| {
-                            v.as_str()
-                                .map(String::from)
-                                .or_else(|| v.as_i64().map(|n| n.to_string()))
-                        })
-                        .unwrap_or_else(|| q_id.to_string());
-
-                    let actual_num = inner
-                        .get("VehicleNumber")
-                        .and_then(Value::as_str)
-                        .unwrap_or(q_num)
-                        .to_string();
-
-                    let is_deregistered = inner
-                        .get("Registration")
-                        .and_then(|r| r.get("Status"))
-                        .and_then(Value::as_str)
-                        .map(|s| s.eq_ignore_ascii_case("DEREGISTERED"))
-                        .unwrap_or(false);
-
-                    let owners = resolve_owners_from_inner(inner);
-                    let is_eligible = !is_deregistered && owners.is_some();
-                    let vehicle_status = if is_eligible {
-                        "ELIGIBLE".to_string()
-                    } else {
-                        "INELIGIBLE".to_string()
-                    };
-
-                    let history = match bills_map {
-                        Some(bm) => {
-                            extract_payment_history_from_iter(&actual_id, &actual_num, bm.values())
-                        }
-                        None => Vec::new(),
-                    };
-
-                    let fees = if is_eligible {
-                        let vtype = inner.get("VehicleType").cloned();
-                        let v_details = Some(serde_json::json!({
-                            "vehicleCategory": vtype.clone().unwrap_or_else(|| Value::String("Vehicle".to_string())),
-                            "vehicleType": vtype.unwrap_or_else(|| Value::String("Commercial".to_string()))
-                        }));
-                        generate_applicable_fees(v_details, None, &history)
-                    } else {
-                        vec![]
-                    };
-
-                    results.push(VehicleBillingDetails {
-                        vehicle_id: actual_id,
-                        vehicle_number: actual_num,
-                        vehicle_status,
-                        owners,
-                        fees,
-                        payment_history: history,
-                    });
-                }
-                None => {
-                    results.push(VehicleBillingDetails {
-                        vehicle_id: q_id.to_string(),
-                        vehicle_number: q_num.to_string(),
-                        vehicle_status: "NOT_FOUND".to_string(),
-                        owners: None,
-                        fees: vec![],
-                        payment_history: vec![],
-                    });
-                }
-            }
-        }
+        results.push(
+            resolve_single_vehicle_billing_details(q_id, q_num, &q_norm, tqms_vehicle, &s_data)
+                .await,
+        );
     }
 
     HttpResponse::Ok().json(ApiResponse {
@@ -2482,23 +2661,38 @@ mod tests {
 
     #[test]
     fn test_get_billing_details_request_deserialization() {
-        let json_data = r#"{
+        let valid_json = r#"{
             "vehicles": [
                 {
                     "vehicleId": "VH-101",
                     "vehicleNumber": "BA-00-PA-0000"
-                },
+                }
+            ]
+        }"#;
+
+        let parsed: GetVehicleBillingDetailsRequest =
+            serde_json::from_str(valid_json).expect("deserialization failed");
+        assert_eq!(parsed.vehicles.len(), 1);
+        assert_eq!(parsed.vehicles[0].vehicle_id, "VH-101");
+        assert_eq!(parsed.vehicles[0].vehicle_number, "BA-00-PA-0000");
+
+        let missing_id_json = r#"{
+            "vehicles": [
                 {
                     "vehicleNumber": "BA-01-PA-9999"
                 }
             ]
         }"#;
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(missing_id_json).is_err());
 
-        let parsed: GetVehicleBillingDetailsRequest = serde_json::from_str(json_data).expect("deserialization failed");
-        assert_eq!(parsed.vehicles.len(), 2);
-        assert_eq!(parsed.vehicles[0].vehicle_id, Some("VH-101".to_string()));
-        assert_eq!(parsed.vehicles[1].vehicle_id, None);
-        assert_eq!(parsed.vehicles[1].vehicle_number, Some("BA-01-PA-9999".to_string()));
+        let missing_num_json = r#"{
+            "vehicles": [
+                {
+                    "vehicleId": "VH-101"
+                }
+            ]
+        }"#;
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(missing_num_json).is_err());
     }
 
     #[test]
@@ -3846,12 +4040,12 @@ mod tests {
         let query_body = GetVehicleBillingDetailsRequest {
             vehicles: vec![
                 LodbodVehicleQuery {
-                    vehicle_id: Some("901".to_string()),
-                    vehicle_number: None,
+                    vehicle_id: "901".to_string(),
+                    vehicle_number: "NA-01-KHA-9001".to_string(),
                 },
                 LodbodVehicleQuery {
-                    vehicle_id: Some("UNKNOWN-VH".to_string()),
-                    vehicle_number: None,
+                    vehicle_id: "UNKNOWN-VH".to_string(),
+                    vehicle_number: "ZZ-99-ZZ-9999".to_string(),
                 },
             ],
         };
@@ -3865,6 +4059,511 @@ mod tests {
         assert_eq!(parsed.data[0].vehicle_status, "ELIGIBLE");
         assert_eq!(parsed.data[0].fees.len(), 2);
         assert_eq!(parsed.data[1].vehicle_status, "NOT_FOUND");
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_blacklisted_vehicle_is_ineligible() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            2450,
+            DatabaseResource {
+                id: Some(2450),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 35903,
+                    "VehicleNumber": "Ba Pra-53-01-0-2256",
+                    "NormalizedVehicleNumber": "Ba Pra-53-01-0-2256",
+                    "VehicleType": "22 dimensional",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Addidas vandari", "Phone": "9863000032" }],
+                    "metadata": {
+                        "tags": ["blacklisted"],
+                        "isBlacklisted": true,
+                        "blacklistSource": "tqms"
+                    }
+                })),
+                external_content: None,
+            },
+        );
+
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let query_body = GetVehicleBillingDetailsRequest {
+            vehicles: vec![LodbodVehicleQuery {
+                vehicle_id: "35903".to_string(),
+                vehicle_number: "Ba Pra-53-01-0-2256".to_string(),
+            }],
+        };
+
+        let resp = get_vehicle_billing_details(req, web::Json(query_body), s_data.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let parsed: ApiResponse<Vec<VehicleBillingDetails>> = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].vehicle_status, "INELIGIBLE");
+        assert!(parsed.data[0].fees.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_rejects_empty_vehicle_id_or_number() {
+        let s_data = create_mock_server_data().await;
+
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let query_body = GetVehicleBillingDetailsRequest {
+            vehicles: vec![LodbodVehicleQuery {
+                vehicle_id: "   ".to_string(),
+                vehicle_number: "BA-01-PA-1234".to_string(),
+            }],
+        };
+
+        let resp = get_vehicle_billing_details(req, web::Json(query_body), s_data).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_is_vehicle_blacklisted_and_find_matching_tqms_vehicle() {
+        let blacklisted_meta = serde_json::json!({
+            "VehicleId": 35903,
+            "VehicleNumber": "Ba Pra-53-01-0-2256",
+            "metadata": { "isBlacklisted": true }
+        });
+        assert!(is_vehicle_blacklisted(&blacklisted_meta));
+
+        let blacklisted_tag = serde_json::json!({
+            "VehicleId": 35904,
+            "VehicleNumber": "BA-01-PA-1111",
+            "metadata": { "tags": ["BLACKLISTED"] }
+        });
+        assert!(is_vehicle_blacklisted(&blacklisted_tag));
+
+        let clean_vehicle = serde_json::json!({
+            "VehicleId": 35905,
+            "VehicleNumber": "BA-01-PA-2222",
+            "Registration": { "Status": "ACTIVE" }
+        });
+        assert!(!is_vehicle_blacklisted(&clean_vehicle));
+
+        let tqms_resp = serde_json::json!({
+            "Code": 200,
+            "Data": {
+                "Data": [clean_vehicle.clone()]
+            }
+        });
+        let found = find_matching_tqms_vehicle(&tqms_resp, "35905", "BA01PA2222");
+        assert_eq!(found, Some(clean_vehicle));
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_validation_edge_cases() {
+        let s_data = create_mock_server_data().await;
+
+        let invalid_cases = vec![
+            vec![LodbodVehicleQuery {
+                vehicle_id: "".to_string(),
+                vehicle_number: "BA-01-PA-1234".to_string(),
+            }],
+            vec![LodbodVehicleQuery {
+                vehicle_id: "   \t\n ".to_string(),
+                vehicle_number: "BA-01-PA-1234".to_string(),
+            }],
+            vec![LodbodVehicleQuery {
+                vehicle_id: "35903".to_string(),
+                vehicle_number: "".to_string(),
+            }],
+            vec![LodbodVehicleQuery {
+                vehicle_id: "35903".to_string(),
+                vehicle_number: "   ".to_string(),
+            }],
+            vec![
+                LodbodVehicleQuery {
+                    vehicle_id: "35903".to_string(),
+                    vehicle_number: "BA-01-PA-1234".to_string(),
+                },
+                LodbodVehicleQuery {
+                    vehicle_id: "35904".to_string(),
+                    vehicle_number: "   ".to_string(),
+                },
+            ],
+        ];
+
+        for vehicles in invalid_cases {
+            let req = actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request();
+            let resp = get_vehicle_billing_details(
+                req,
+                web::Json(GetVehicleBillingDetailsRequest { vehicles }),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+            let err: ApiErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert!(!err.success);
+            assert_eq!(err.error.code, "INVALID_REQUEST");
+        }
+
+        // Null vehicleId or vehicleNumber must fail deserialization
+        let null_id_json = r#"{"vehicles":[{"vehicleId":null,"vehicleNumber":"BA-01-PA-1234"}]}"#;
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(null_id_json).is_err());
+
+        let null_num_json = r#"{"vehicles":[{"vehicleId":"101","vehicleNumber":null}]}"#;
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(null_num_json).is_err());
+    }
+
+    #[test]
+    fn test_is_vehicle_blacklisted_all_variants_and_edge_cases() {
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "isBlacklisted": true }
+        })));
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "isBlacklisted": false }
+        })));
+
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "tags": ["blacklisted"] }
+        })));
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "tags": ["  BLACKLISTED  "] }
+        })));
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "tags": [123, null, "BlackListed"] }
+        })));
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": { "tags": ["vip", "priority"] }
+        })));
+
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "isBlacklisted": true
+        })));
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "isBlacklisted": false
+        })));
+
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "Registration": { "Status": "BLACKLISTED" }
+        })));
+        assert!(is_vehicle_blacklisted(&serde_json::json!({
+            "Registration": { "Status": "  blacklisted  " }
+        })));
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "Registration": { "Status": "ACTIVE" }
+        })));
+
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "metadata": null
+        })));
+        assert!(!is_vehicle_blacklisted(&serde_json::json!({
+            "VehicleId": 100
+        })));
+    }
+
+    #[test]
+    fn test_find_and_take_matching_tqms_vehicle_edge_cases() {
+        let v_int_id = serde_json::json!({
+            "VehicleId": 35903,
+            "VehicleNumber": "Ba Pra-53-01-0-2256"
+        });
+        let v_str_id = serde_json::json!({
+            "VehicleId": "VH-777",
+            "VehicleNumber": "NA-02-KHA-7777"
+        });
+        let v_norm_only = serde_json::json!({
+            "VehicleId": 888,
+            "NormalizedVehicleNumber": "BA-09-PA-8888"
+        });
+
+        let resp = serde_json::json!({
+            "Code": 200,
+            "Data": {
+                "Data": [v_int_id.clone(), v_str_id.clone(), v_norm_only.clone()]
+            }
+        });
+
+        assert_eq!(find_matching_tqms_vehicle(&resp, "35903", ""), Some(v_int_id.clone()));
+        assert_eq!(find_matching_tqms_vehicle(&resp, "VH-777", ""), Some(v_str_id.clone()));
+        assert_eq!(
+            find_matching_tqms_vehicle(&resp, "999999", "BAPRA530102256"),
+            Some(v_int_id.clone())
+        );
+        assert_eq!(
+            find_matching_tqms_vehicle(&resp, "999999", "BA09PA8888"),
+            Some(v_norm_only.clone())
+        );
+        assert_eq!(find_matching_tqms_vehicle(&resp, "0", "NONEXISTENT"), None);
+
+        let mut mut_resp = resp.clone();
+        let taken = take_matching_tqms_vehicle(&mut mut_resp, "VH-777", "NA02KHA7777");
+        assert_eq!(taken, Some(v_str_id));
+        // Taken item is replaced by Null so a second take by the same criteria returns None
+        assert_eq!(
+            take_matching_tqms_vehicle(&mut mut_resp, "VH-777", "NA02KHA7777"),
+            None
+        );
+
+        let mut missing_data = serde_json::json!({ "Code": 200 });
+        assert_eq!(find_matching_tqms_vehicle(&missing_data, "1", "A"), None);
+        assert_eq!(take_matching_tqms_vehicle(&mut missing_data, "1", "A"), None);
+
+        let mut non_array = serde_json::json!({ "Code": 200, "Data": { "Data": "not-an-array" } });
+        assert_eq!(find_matching_tqms_vehicle(&non_array, "1", "A"), None);
+        assert_eq!(take_matching_tqms_vehicle(&mut non_array, "1", "A"), None);
+
+        let mut empty_array = serde_json::json!({ "Code": 200, "Data": { "Data": [] } });
+        assert_eq!(find_matching_tqms_vehicle(&empty_array, "1", "A"), None);
+        assert_eq!(take_matching_tqms_vehicle(&mut empty_array, "1", "A"), None);
+    }
+
+    #[actix_web::test]
+    async fn test_tqms_freshness_updates_cache_and_preserves_blacklist_metadata() {
+        let s_data = create_mock_server_data().await;
+
+        // Seed cache with stale owner/type and local blacklist metadata
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            2450,
+            DatabaseResource {
+                id: Some(2450),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 35903,
+                    "VehicleNumber": "Ba Pra-53-01-0-2256",
+                    "VehicleType": "Old Type",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Stale Owner", "Phone": "9800000001" }],
+                    "metadata": {
+                        "tags": ["blacklisted"],
+                        "isBlacklisted": true,
+                        "blacklistedReason": "Unpaid fine"
+                    }
+                })),
+                external_content: None,
+            },
+        );
+
+        // Fresh TQMS payload has updated owner/type and no metadata
+        let fresh_tqms = serde_json::json!({
+            "VehicleId": 35903,
+            "VehicleNumber": "Ba Pra-53-01-0-2256",
+            "VehicleType": "22 dimensional",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "Fresh TQMS Owner", "Phone": "9863000032" }]
+        });
+
+        let details = resolve_single_vehicle_billing_details(
+            "35903",
+            "Ba Pra-53-01-0-2256",
+            "BAPRA530102256",
+            Some(fresh_tqms),
+            &s_data,
+        )
+        .await;
+
+        // Must reflect fresh TQMS owner while staying INELIGIBLE due to preserved blacklist metadata
+        assert_eq!(details.vehicle_status, "INELIGIBLE");
+        assert!(details.fees.is_empty());
+        assert_eq!(
+            details
+                .owners
+                .as_ref()
+                .and_then(|o| o.main_owner.as_ref())
+                .map(|m| m.name.as_str()),
+            Some("Fresh TQMS Owner")
+        );
+
+        // Cache must be updated with fresh TQMS fields AND preserved metadata
+        let cached_after = s_data
+            .cache
+            .read()
+            .await
+            .read(ResourceName::VehicleResource, 2450)
+            .expect("cached vehicle should remain present");
+        let inner_after = cached_after.inner_content.unwrap();
+        assert_eq!(inner_after["VehicleType"], "22 dimensional");
+        assert_eq!(inner_after["Owners"][0]["Name"], "Fresh TQMS Owner");
+        assert_eq!(inner_after["metadata"]["isBlacklisted"], true);
+        assert_eq!(inner_after["metadata"]["blacklistedReason"], "Unpaid fine");
+    }
+
+    #[actix_web::test]
+    async fn test_tqms_freshness_eligible_vehicle_and_tqms_only_vehicle() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            50,
+            DatabaseResource {
+                id: Some(50),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 5001,
+                    "VehicleNumber": "BA-01-PA-5001",
+                    "VehicleType": "Old Bus",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Old Owner", "Phone": "9800000000" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        let fresh_cached_tqms = serde_json::json!({
+            "VehicleId": 5001,
+            "VehicleNumber": "BA-01-PA-5001",
+            "VehicleType": "Deluxe Bus",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "Fresh Owner", "Phone": "9811111111" }]
+        });
+
+        let details_updated = resolve_single_vehicle_billing_details(
+            "5001",
+            "BA-01-PA-5001",
+            "BA01PA5001",
+            Some(fresh_cached_tqms),
+            &s_data,
+        )
+        .await;
+        assert_eq!(details_updated.vehicle_status, "ELIGIBLE");
+        assert_eq!(details_updated.fees.len(), 2);
+        assert_eq!(
+            details_updated
+                .owners
+                .as_ref()
+                .and_then(|o| o.main_owner.as_ref())
+                .map(|m| m.name.as_str()),
+            Some("Fresh Owner")
+        );
+        let cached_inner = s_data
+            .cache
+            .read()
+            .await
+            .read(ResourceName::VehicleResource, 50)
+            .unwrap()
+            .inner_content
+            .unwrap();
+        assert_eq!(cached_inner["VehicleType"], "Deluxe Bus");
+
+        // Vehicle present in TQMS only (absent from cache) -> ELIGIBLE
+        let tqms_only_eligible = serde_json::json!({
+            "VehicleId": 6001,
+            "VehicleNumber": "BA-02-PA-6001",
+            "VehicleType": "Truck",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "TQMS Only Owner", "Phone": "9822222222" }]
+        });
+        let details_tqms_only = resolve_single_vehicle_billing_details(
+            "6001",
+            "BA-02-PA-6001",
+            "BA02PA6001",
+            Some(tqms_only_eligible),
+            &s_data,
+        )
+        .await;
+        assert_eq!(details_tqms_only.vehicle_status, "ELIGIBLE");
+        assert_eq!(details_tqms_only.fees.len(), 2);
+
+        // Vehicle present in TQMS only, deregistered -> INELIGIBLE
+        let tqms_only_deregistered = serde_json::json!({
+            "VehicleId": 6002,
+            "VehicleNumber": "BA-02-PA-6002",
+            "VehicleType": "Truck",
+            "Registration": { "Status": "DEREGISTERED" },
+            "Owners": [{ "Name": "Deregistered Owner", "Phone": "9833333333" }]
+        });
+        let details_deregistered = resolve_single_vehicle_billing_details(
+            "6002",
+            "BA-02-PA-6002",
+            "BA02PA6002",
+            Some(tqms_only_deregistered),
+            &s_data,
+        )
+        .await;
+        assert_eq!(details_deregistered.vehicle_status, "INELIGIBLE");
+        assert!(details_deregistered.fees.is_empty());
+
+        // Vehicle present in TQMS only, missing owners -> INELIGIBLE
+        let tqms_only_no_owners = serde_json::json!({
+            "VehicleId": 6003,
+            "VehicleNumber": "BA-02-PA-6003",
+            "VehicleType": "Truck",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": []
+        });
+        let details_no_owners = resolve_single_vehicle_billing_details(
+            "6003",
+            "BA-02-PA-6003",
+            "BA02PA6003",
+            Some(tqms_only_no_owners),
+            &s_data,
+        )
+        .await;
+        assert_eq!(details_no_owners.vehicle_status, "INELIGIBLE");
+        assert!(details_no_owners.fees.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn test_multiple_cached_entries_one_blacklisted_marks_ineligible() {
+        let s_data = create_mock_server_data().await;
+
+        // First cached entry appears clean
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            701,
+            DatabaseResource {
+                id: Some(701),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 7001,
+                    "VehicleNumber": "LU-01-KHA-7001",
+                    "VehicleType": "Tipper",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Clean Entry Owner", "Phone": "9844444444" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // Second cached entry for the same vehicle carries blacklist tag
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            702,
+            DatabaseResource {
+                id: Some(702),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 7001,
+                    "VehicleNumber": "LU-01-KHA-7001",
+                    "VehicleType": "Tipper",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Blacklisted Entry Owner", "Phone": "9844444444" }],
+                    "metadata": { "tags": ["blacklisted"] }
+                })),
+                external_content: None,
+            },
+        );
+
+        let req = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let query_body = GetVehicleBillingDetailsRequest {
+            vehicles: vec![LodbodVehicleQuery {
+                vehicle_id: "7001".to_string(),
+                vehicle_number: "LU-01-KHA-7001".to_string(),
+            }],
+        };
+
+        let resp = get_vehicle_billing_details(req, web::Json(query_body), s_data).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let parsed: ApiResponse<Vec<VehicleBillingDetails>> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].vehicle_status, "INELIGIBLE");
+        assert!(parsed.data[0].fees.is_empty());
     }
 
     #[actix_web::test]
