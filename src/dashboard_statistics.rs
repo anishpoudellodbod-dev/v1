@@ -31,7 +31,7 @@ pub struct DashboardQuery {
 }
 
 impl DashboardQuery {
-    fn requested_fiscal_year(&self) -> Option<&str> {
+    pub fn requested_fiscal_year(&self) -> Option<&str> {
         self.fiscal_year
             .as_deref()
             .or(self.fiscal_year_camel.as_deref())
@@ -41,14 +41,15 @@ impl DashboardQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum VehicleKey {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum VehicleKey {
     Canonical(usize),
     External(String),
 }
 
-struct VehicleIndex {
-    canonical_count: usize,
+pub(crate) struct VehicleIndex<'a> {
+    pub(crate) canonical_count: usize,
+    pub(crate) canonical_vehicles: Vec<&'a DatabaseResource>,
     by_db_id: HashMap<i32, usize>,
     by_vehicle_id: HashMap<String, usize>,
     by_vehicle_number: HashMap<String, usize>,
@@ -70,10 +71,13 @@ fn extract_vehicle_fields(
     (res.id, v_id, v_num)
 }
 
-impl VehicleIndex {
-    fn build(cached_vehicles: &[&DatabaseResource], db_vehicles: &[DatabaseResource]) -> Self {
+impl<'a> VehicleIndex<'a> {
+    pub(crate) fn build(
+        cached_vehicles: &[&'a DatabaseResource],
+        db_vehicles: &[DatabaseResource],
+    ) -> Self {
         let cap = cached_vehicles.len();
-        let mut canonical_count = 0usize;
+        let mut canonical_vehicles = Vec::with_capacity(cap);
         let mut by_db_id = HashMap::with_capacity(cap);
         let mut by_vehicle_id = HashMap::with_capacity(cap);
         let mut by_vehicle_number = HashMap::with_capacity(cap);
@@ -96,8 +100,8 @@ impl VehicleIndex {
                 break;
             }
 
-            let idx = canonical_count;
-            canonical_count += 1;
+            let idx = canonical_vehicles.len();
+            canonical_vehicles.push(res);
 
             if let Some(id) = db_id {
                 by_db_id.insert(id, idx);
@@ -111,12 +115,12 @@ impl VehicleIndex {
         }
 
         if has_duplicates {
-            canonical_count = 0;
+            canonical_vehicles.clear();
             by_db_id.clear();
             by_vehicle_id.clear();
             by_vehicle_number.clear();
 
-            let mut ranked: Vec<(Option<DateTime<Utc>>, Option<i32>, &DatabaseResource)> =
+            let mut ranked: Vec<(Option<DateTime<Utc>>, Option<i32>, &'a DatabaseResource)> =
                 cached_vehicles
                     .iter()
                     .map(|&res| (extract_vehicle_created_time(res), res.id, res))
@@ -135,8 +139,8 @@ impl VehicleIndex {
                 let idx = if let Some(idx) = existing_idx {
                     idx
                 } else {
-                    let new_idx = canonical_count;
-                    canonical_count += 1;
+                    let new_idx = canonical_vehicles.len();
+                    canonical_vehicles.push(res);
                     new_idx
                 };
 
@@ -175,7 +179,8 @@ impl VehicleIndex {
         }
 
         Self {
-            canonical_count,
+            canonical_count: canonical_vehicles.len(),
+            canonical_vehicles,
             by_db_id,
             by_vehicle_id,
             by_vehicle_number,
@@ -184,7 +189,11 @@ impl VehicleIndex {
         }
     }
 
-    fn register_bill_vehicle_with_norm(&mut self, vid_trimmed: Option<&str>, norm: Option<&str>) {
+    pub(crate) fn register_bill_vehicle_with_norm(
+        &mut self,
+        vid_trimmed: Option<&str>,
+        norm: Option<&str>,
+    ) {
         let canonical_idx = norm
             .and_then(|n| self.by_vehicle_number.get(n).copied())
             .or_else(|| {
@@ -248,13 +257,21 @@ impl VehicleIndex {
         }
     }
 
-    fn resolve(&self, vehicle_id: Option<&str>, vehicle_number: Option<&str>) -> Option<VehicleKey> {
+    pub(crate) fn resolve(
+        &self,
+        vehicle_id: Option<&str>,
+        vehicle_number: Option<&str>,
+    ) -> Option<VehicleKey> {
         let vid_trimmed = vehicle_id.map(str::trim).filter(|s| !s.is_empty());
         let norm = vehicle_number.and_then(normalize_vehicle_number);
         self.resolve_with_norm(vid_trimmed, norm.as_deref())
     }
 
-    fn resolve_with_norm(&self, vid_trimmed: Option<&str>, norm: Option<&str>) -> Option<VehicleKey> {
+    pub(crate) fn resolve_with_norm(
+        &self,
+        vid_trimmed: Option<&str>,
+        norm: Option<&str>,
+    ) -> Option<VehicleKey> {
         if let Some(n) = norm {
             if let Some(&idx) = self.by_vehicle_number.get(n) {
                 return Some(VehicleKey::Canonical(idx));
@@ -292,7 +309,7 @@ impl VehicleIndex {
     }
 }
 
-struct FiscalYearConfig {
+pub(crate) struct FiscalYearConfig {
     default_fiscal_year: Option<String>,
     fallback_fiscal_year: Option<String>,
     /// Maps any normalized fiscal year token (UUID, short label, full label) to a canonical group id.
@@ -301,11 +318,11 @@ struct FiscalYearConfig {
     group_display: Vec<String>,
     group_rank: Vec<Option<i64>>,
     /// Maps explicit BS start years from SettingResource to their explicit SettingResource id.
-    setting_year_to_id: HashMap<i32, String>,
+    pub(crate) setting_year_to_id: HashMap<i32, String>,
 }
 
 impl FiscalYearConfig {
-    fn from_settings(settings: &[&DatabaseResource]) -> Self {
+    pub(crate) fn from_settings(settings: &[&DatabaseResource]) -> Self {
         let mut config = Self {
             default_fiscal_year: None,
             fallback_fiscal_year: None,
@@ -476,7 +493,7 @@ impl FiscalYearConfig {
         }
     }
 
-    fn register_group(&mut self, display: &str, tokens: &[String]) {
+    pub(crate) fn register_group(&mut self, display: &str, tokens: &[String]) {
         let mut all_aliases = Vec::new();
         for token in tokens {
             all_aliases.extend(expand_fiscal_year_aliases(token));
@@ -556,12 +573,12 @@ impl FiscalYearConfig {
             .find_map(|a| self.alias_to_group.get(a).copied())
     }
 
-    fn has_ranked_group(&self, raw: &str) -> bool {
+    pub(crate) fn has_ranked_group(&self, raw: &str) -> bool {
         self.lookup_group_id(raw.trim())
             .is_some_and(|gid| self.group_rank.get(gid).copied().flatten().is_some())
     }
 
-    fn canonicalize(&mut self, raw: &str) -> (usize, Option<i64>) {
+    pub(crate) fn canonicalize(&mut self, raw: &str) -> (usize, Option<i64>) {
         let trimmed = raw.trim();
         if let Some(gid) = self.lookup_group_id(trimmed) {
             return (gid, self.group_rank[gid]);
@@ -578,7 +595,7 @@ impl FiscalYearConfig {
         (gid, rank)
     }
 
-    fn resolve_target_fiscal_year(&self, requested: Option<&str>) -> String {
+    pub(crate) fn resolve_target_fiscal_year(&self, requested: Option<&str>) -> String {
         if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
             if let Some(gid) = self.lookup_group_id(req) {
                 if let Some(label) = self.group_display.get(gid) {
@@ -626,7 +643,7 @@ fn parse_fiscal_year_start_ascii(raw: &str) -> Option<i32> {
     }
 }
 
-fn parse_fiscal_year_start(raw: &str) -> Option<i32> {
+pub(crate) fn parse_fiscal_year_start(raw: &str) -> Option<i32> {
     if raw.is_ascii() {
         parse_fiscal_year_start_ascii(raw)
     } else {
@@ -780,14 +797,14 @@ fn infer_bs_fiscal_year_from_date_str(raw: &str) -> Option<String> {
     Some(format!("{bs_start}/{:02}", (bs_start + 1) % 100))
 }
 
-fn extract_bill_period_start_fiscal_year(inner: &Value) -> Option<String> {
+pub(crate) fn extract_bill_period_start_fiscal_year(inner: &Value) -> Option<String> {
     inner
         .get("periodStart")
         .and_then(Value::as_str)
         .and_then(infer_bs_fiscal_year_from_date_str)
 }
 
-fn extract_bill_inferred_fiscal_year(inner: &Value) -> Option<String> {
+pub(crate) fn extract_bill_inferred_fiscal_year(inner: &Value) -> Option<String> {
     ["periodStart", "billingDate", "paidAt", "periodEnd"]
         .into_iter()
         .find_map(|key| {
@@ -798,7 +815,7 @@ fn extract_bill_inferred_fiscal_year(inner: &Value) -> Option<String> {
         })
 }
 
-fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
+pub(crate) fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
     let val = val?;
     val.as_str()
         .map(str::trim)
@@ -808,7 +825,7 @@ fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
         .or_else(|| val.as_u64().map(|n| n.to_string()))
 }
 
-fn normalize_vehicle_number(raw: &str) -> Option<String> {
+pub(crate) fn normalize_vehicle_number(raw: &str) -> Option<String> {
     let normalized: String = if raw.is_ascii() {
         let mut out = String::with_capacity(raw.len());
         for &b in raw.as_bytes() {
@@ -857,7 +874,7 @@ fn extract_vehicle_created_time(resource: &DatabaseResource) -> Option<DateTime<
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn extract_member_timestamp(resource: &DatabaseResource) -> Option<DateTime<Utc>> {
+pub(crate) fn extract_member_timestamp(resource: &DatabaseResource) -> Option<DateTime<Utc>> {
     let ext_raw = resource
         .external_content
         .as_ref()
@@ -878,7 +895,7 @@ fn extract_member_timestamp(resource: &DatabaseResource) -> Option<DateTime<Utc>
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn is_bill_ignored(inner: &Value) -> bool {
+pub(crate) fn is_bill_ignored(inner: &Value) -> bool {
     if let Some(status) = inner.get("status").and_then(Value::as_str) {
         let s = status.trim();
         if s.eq_ignore_ascii_case("DELETED")
@@ -909,7 +926,7 @@ fn is_bill_ignored(inner: &Value) -> bool {
     false
 }
 
-fn extract_bill_vehicle<'a>(inner: &'a Value) -> (Option<String>, Option<&'a str>) {
+pub(crate) fn extract_bill_vehicle<'a>(inner: &'a Value) -> (Option<String>, Option<&'a str>) {
     let vehicle_obj = inner.get("vehicle");
     let v_id = vehicle_obj
         .and_then(|v| {
@@ -931,7 +948,7 @@ fn extract_bill_vehicle<'a>(inner: &'a Value) -> (Option<String>, Option<&'a str
 }
 
 #[inline]
-fn is_member_displaced(inner: &Value) -> bool {
+pub(crate) fn is_member_displaced(inner: &Value) -> bool {
     inner
         .get("isDisplaced")
         .and_then(Value::as_bool)
@@ -942,7 +959,7 @@ fn is_member_displaced(inner: &Value) -> bool {
             .is_some_and(|s| s.trim().eq_ignore_ascii_case("DISPLACED"))
 }
 
-fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleIndex) -> usize {
+fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleIndex<'_>) -> usize {
     if members.is_empty() {
         return 0;
     }
@@ -1177,7 +1194,7 @@ fn compact_db_vehicle(resource: DatabaseResource) -> Option<DatabaseResource> {
     })
 }
 
-async fn get_cached_db_vehicles(s_data: &Arc<ServerData>) -> Arc<Vec<DatabaseResource>> {
+pub(crate) async fn get_cached_db_vehicles(s_data: &Arc<ServerData>) -> Arc<Vec<DatabaseResource>> {
     let db_key = Arc::as_ptr(&s_data.db) as usize;
     let cache_lock = DB_VEHICLES_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     if let Some(hit) = cache_lock.read().ok().and_then(|g| g.get(&db_key).cloned()) {

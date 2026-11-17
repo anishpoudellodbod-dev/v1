@@ -1,5 +1,5 @@
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash, Copy)]
-pub enum ResourceName{
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Hash, Copy)]
+pub enum ResourceName {
     VehicleResource,
     UserResource,
     BillResource,
@@ -12,6 +12,67 @@ pub enum ResourceName{
     BillingRuleResource,
     BillingEntityResource,
     BranchResource,
+}
+
+impl ResourceName {
+    #[inline]
+    pub fn from_str_case_insensitive(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("VehicleResource") {
+            Some(Self::VehicleResource)
+        } else if trimmed.eq_ignore_ascii_case("UserResource") {
+            Some(Self::UserResource)
+        } else if trimmed.eq_ignore_ascii_case("BillResource") {
+            Some(Self::BillResource)
+        } else if trimmed.eq_ignore_ascii_case("MemberResource") {
+            Some(Self::MemberResource)
+        } else if trimmed.eq_ignore_ascii_case("ReportResource") {
+            Some(Self::ReportResource)
+        } else if trimmed.eq_ignore_ascii_case("SettingResource") {
+            Some(Self::SettingResource)
+        } else if trimmed.eq_ignore_ascii_case("PermissionResource") {
+            Some(Self::PermissionResource)
+        } else if trimmed.eq_ignore_ascii_case("CacheResource") {
+            Some(Self::CacheResource)
+        } else if trimmed.eq_ignore_ascii_case("VehicleCategoryResource") {
+            Some(Self::VehicleCategoryResource)
+        } else if trimmed.eq_ignore_ascii_case("BillingRuleResource") {
+            Some(Self::BillingRuleResource)
+        } else if trimmed.eq_ignore_ascii_case("BillingEntityResource") {
+            Some(Self::BillingEntityResource)
+        } else if trimmed.eq_ignore_ascii_case("BranchResource") {
+            Some(Self::BranchResource)
+        } else {
+            None
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResourceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ResourceNameVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ResourceNameVisitor {
+            type Value = ResourceName;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a valid ResourceName string (case-insensitive)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<ResourceName, E>
+            where
+                E: serde::de::Error,
+            {
+                ResourceName::from_str_case_insensitive(value)
+                    .ok_or_else(|| E::custom(format!("Unknown resource name: {}", value)))
+            }
+        }
+
+        deserializer.deserialize_str(ResourceNameVisitor)
+    }
 }
 
 impl ToString for ResourceName {
@@ -33,24 +94,15 @@ impl ToString for ResourceName {
     }
 }
 
+impl From<&str> for ResourceName {
+    fn from(s: &str) -> Self {
+        Self::from_str_case_insensitive(s).unwrap_or_else(|| panic!("Unknown resource name: {}", s))
+    }
+}
+
 impl From<std::string::String> for ResourceName {
     fn from(s: std::string::String) -> Self {
-        match s.as_str() {
-            "vehicleresource" => ResourceName::VehicleResource,
-            "VehicleResource" => ResourceName::VehicleResource,
-            "UserResource" => ResourceName::UserResource,
-            "BillResource" => ResourceName::BillResource,
-            "MemberResource" => ResourceName::MemberResource,
-            "ReportResource" => ResourceName::ReportResource,
-            "SettingResource" => ResourceName::SettingResource,
-            "CacheResource" => ResourceName::CacheResource,
-            "VehicleCategoryResource" => ResourceName::VehicleCategoryResource,
-            "PermissionResource" => ResourceName::PermissionResource,
-            "BillingRuleResource" => ResourceName::BillingRuleResource,
-            "BillingEntityResource" => ResourceName::BillingEntityResource,
-            "BranchResource" => ResourceName::BranchResource,
-            _ => panic!("Unknown resource name: {}", s),
-        }
+        Self::from(s.as_str())
     }
 }
 
@@ -98,6 +150,40 @@ mod tests {
         assert_eq!(ResourceName::from("BillingRuleResource".to_string()), ResourceName::BillingRuleResource);
         assert_eq!(ResourceName::from("BillingEntityResource".to_string()), ResourceName::BillingEntityResource);
         assert_eq!(ResourceName::from("BranchResource".to_string()), ResourceName::BranchResource);
+    }
+
+    #[test]
+    fn test_resource_name_case_insensitive_from_and_serde() {
+        let variants = [
+            ("VehicleResource", ResourceName::VehicleResource),
+            ("UserResource", ResourceName::UserResource),
+            ("BillResource", ResourceName::BillResource),
+            ("MemberResource", ResourceName::MemberResource),
+            ("ReportResource", ResourceName::ReportResource),
+            ("SettingResource", ResourceName::SettingResource),
+            ("PermissionResource", ResourceName::PermissionResource),
+            ("CacheResource", ResourceName::CacheResource),
+            ("VehicleCategoryResource", ResourceName::VehicleCategoryResource),
+            ("BillingRuleResource", ResourceName::BillingRuleResource),
+            ("BillingEntityResource", ResourceName::BillingEntityResource),
+            ("BranchResource", ResourceName::BranchResource),
+        ];
+
+        for (pascal, expected) in variants {
+            let lower = pascal.to_lowercase();
+            let upper = pascal.to_uppercase();
+
+            assert_eq!(ResourceName::from(pascal.to_string()), expected);
+            assert_eq!(ResourceName::from(lower.clone()), expected);
+            assert_eq!(ResourceName::from(upper.clone()), expected);
+            assert_eq!(ResourceName::from(lower.as_str()), expected);
+            assert_eq!(ResourceName::from(upper.as_str()), expected);
+
+            let lower_json = format!("\"{}\"", lower);
+            let upper_json = format!("\"{}\"", upper);
+            assert_eq!(serde_json::from_str::<ResourceName>(&lower_json).unwrap(), expected);
+            assert_eq!(serde_json::from_str::<ResourceName>(&upper_json).unwrap(), expected);
+        }
     }
 
     #[test]

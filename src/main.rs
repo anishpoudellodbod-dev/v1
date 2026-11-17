@@ -20,6 +20,7 @@ mod roles;
 mod tqms_integration;
 pub mod billing_actions;
 pub mod dashboard_statistics;
+pub mod members;
 mod api_stream;
 pub mod date;
 pub mod log;
@@ -34,22 +35,85 @@ pub struct ServerData {
 
 pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
     let resource_name = s_data.db.resource_name.clone();
-    let actions = vec![
+    let actions = [
         "method: POST,      api/v1/create/{}",
         "method: GET,       api/v1/read/{}/{id} supports id set as all",
         "method: PUT,       api/v1/update/{}/{id}",
         "method: DELETE,    api/v1/delete/{}/{id}",
         "method: GET,       api/v1/search/{}/{search_query}/{search_item}/{limit}",
+        "method: GET,       api/v1/streams/search/{}/{search_query}/{search_item}/{limit}/{offset}",
     ];
-    let mut routes = vec![];
+    let mut routes = vec![
+        "method: GET,       /".to_string(),
+        "method: POST,      api/v1/auth/login".to_string(),
+        "method: GET,       api/v1/dashboard/statistics".to_string(),
+        "method: GET,       api/v1/dashboard/statistics/{fiscal_year}".to_string(),
+    ];
+
+    let member_suffixes = [
+        "",
+        "/{fiscal_year}",
+        "/total_users",
+        "/total_users/{fiscal_year}",
+        "/total",
+        "/total/{fiscal_year}",
+        "/total_active_users",
+        "/total_active_users/{fiscal_year}",
+        "/active",
+        "/active/{fiscal_year}",
+        "/new_users",
+        "/new_users/{fiscal_year}",
+        "/new",
+        "/new/{fiscal_year}",
+        "/displaced_users",
+        "/displaced_users/{fiscal_year}",
+        "/displaced",
+        "/displaced/{fiscal_year}",
+        "/inactive_year",
+        "/inactive_year/{fiscal_year}",
+        "/total_inactive_users",
+        "/total_inactive_users/{fiscal_year}",
+        "/inactive",
+        "/inactive/{fiscal_year}",
+    ];
+    for prefix in ["api/v1/dashboard/members", "api/v1/members"] {
+        for suffix in member_suffixes {
+            routes.push(format!("method: GET,       {}{}", prefix, suffix));
+        }
+    }
+
+    routes.extend(
+        [
+            "method: POST,      api/v1/tqms/search",
+            "method: GET,       api/v1/tqms/validate/{vehicle_number}",
+            "method: GET,       api/v1/tqms/vehicle_details/{vehicle_number}",
+            "method: GET,       api/v1/tqms/sync",
+            "method: GET,       api/v1/tqms/sync/{concurency}",
+            "method: GET,       api/v1/read_all/VehicleTypes",
+            "method: GET,       api/v1/get_vehicles_tqms",
+            "method: GET,       api/v1/streams/search/{resource_name}/{search_query}/{search_item}/{limit}/{offset}",
+            "method: POST,      api/integrations/lodbod/v1/vehicles/billing-details",
+            "method: POST,      api/integrations/lodbod/v1/payments/vehicle-receipts",
+            "method: GET,       api/integrations/lodbod/v1/payments/{lodbodPaymentReferenceId}/vehicle-receipts supports lodbodPaymentReferenceId set as all",
+            "method: POST,      api/v1/bills/create",
+            "method: PUT,       api/v1/bills/modify/{id}",
+            "method: DELETE,    api/v1/bills/delete/{id}",
+            "method: POST,      api/v1/bills/rollback/{id}",
+            "method: GET,       api/v1/bills/logs",
+            "method: GET,       api/v1/bills/logs/{bill_id}",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+
     for resource in resource_name {
         for action in &actions {
-            //Replace {} with resource name
+            // Replace {} with resource name
             let route = action.replace("{}", &resource.to_string());
             routes.push(route);
         }
     }
-    //
+
     HttpResponse::Ok().json(routes)
 }
 
@@ -214,8 +278,10 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/statistics/{fiscal_year}",
                         web::get().to(dashboard_statistics::get_dashboard_statistics_by_fy),
-                    ),
+                    )
+                    .service(web::scope("/members").configure(members::configure_routes)),
             )
+            .service(web::scope("/api/v1/members").configure(members::configure_routes))
             .service(
                 web::scope("/api/v1/tqms")
                     .route("/search", web::post().to(tqms_integration::search_vehicles))

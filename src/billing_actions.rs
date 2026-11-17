@@ -5730,4 +5730,839 @@ mod tests {
             assert_eq!(recon_item.vehicles.len(), 1);
         }
     }
+
+    #[test]
+    fn test_extract_bill_sangh_branch_all_locations_and_precedence() {
+        // 1. Top-level sanghBranch & SanghBranch trimmed
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({ "sanghBranch": "  Main Branch  " })),
+            Some("Main Branch".to_string())
+        );
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({ "SanghBranch": "  Birgunj Branch " })),
+            Some("Birgunj Branch".to_string())
+        );
+
+        // 2. Top-level overrides nested vehicle / branch / items
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({
+                "sanghBranch": "Top Branch",
+                "vehicle": { "sanghBranch": "Vehicle Branch" },
+                "branch": { "sanghBranch": "BranchObj Branch" },
+                "items": [{ "sanghBranch": "Item Branch" }]
+            })),
+            Some("Top Branch".to_string())
+        );
+
+        // 3. Fallback to nested vehicle.sanghBranch / vehicle.SanghBranch
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({
+                "sanghBranch": "   ",
+                "vehicle": { "SanghBranch": "Hetauda Branch" },
+                "branch": { "sanghBranch": "Other Branch" }
+            })),
+            Some("Hetauda Branch".to_string())
+        );
+
+        // 4. Fallback to branch.sanghBranch / branch.SanghBranch
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({
+                "vehicle": { "id": "101" },
+                "branch": { "SanghBranch": "Pathlaiya Branch" }
+            })),
+            Some("Pathlaiya Branch".to_string())
+        );
+
+        // 5. Fallback to first non-empty items[*].sanghBranch / SanghBranch
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({
+                "items": [
+                    { "title": "Fee 1", "sanghBranch": "" },
+                    { "title": "Fee 2", "SanghBranch": "  Narayangadh Branch  " }
+                ]
+            })),
+            Some("Narayangadh Branch".to_string())
+        );
+
+        // 6. Missing / empty / non-string returns None
+        assert_eq!(
+            extract_bill_sangh_branch(&serde_json::json!({
+                "sanghBranch": null,
+                "vehicle": { "sanghBranch": "   " },
+                "branch": { "id": "1", "name": "Main Branch" },
+                "items": [{ "title": "Fee", "sanghBranch": 123 }]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_and_validate_vehicle_sangh_branches_comprehensive() {
+        // 1. Top-level string + array + Owners + owners with case-insensitive deduplication
+        let multi_branch_vehicle = serde_json::json!({
+            "SanghBranch": "  Loadboard sthaniya  ",
+            "sanghBranch": ["LOADBOARD STHANIYA", "Hetauda Branch"],
+            "Owners": [
+                { "Name": "Owner 1", "SanghBranch": "hetauda branch" },
+                { "Name": "Owner 2", "sanghBranch": ["Birgunj Branch", "नारायणी शाखा"] }
+            ]
+        });
+        let extracted = extract_vehicle_sangh_branches(&multi_branch_vehicle);
+        assert_eq!(
+            extracted,
+            vec![
+                "Loadboard sthaniya".to_string(),
+                "Hetauda Branch".to_string(),
+                "Birgunj Branch".to_string(),
+                "नारायणी शाखा".to_string(),
+            ]
+        );
+
+        // Lowercase `owners` array key also supported
+        let lowercase_owners = serde_json::json!({
+            "owners": [{ "Name": "Owner 3", "sanghBranch": "Kathmandu Branch" }]
+        });
+        assert_eq!(
+            extract_vehicle_sangh_branches(&lowercase_owners),
+            vec!["Kathmandu Branch".to_string()]
+        );
+
+        // 2. validate_vehicle_sangh_branch case-insensitive & Unicode match returns stored canonical casing
+        assert_eq!(
+            validate_vehicle_sangh_branch(&multi_branch_vehicle, Some("  hetauda branch ")),
+            Ok(Some("Hetauda Branch".to_string()))
+        );
+        assert_eq!(
+            validate_vehicle_sangh_branch(&multi_branch_vehicle, Some("नारायणी शाखा")),
+            Ok(Some("नारायणी शाखा".to_string()))
+        );
+        // None / whitespace request picks first available branch
+        assert_eq!(
+            validate_vehicle_sangh_branch(&multi_branch_vehicle, None),
+            Ok(Some("Loadboard sthaniya".to_string()))
+        );
+        assert_eq!(
+            validate_vehicle_sangh_branch(&multi_branch_vehicle, Some("   ")),
+            Ok(Some("Loadboard sthaniya".to_string()))
+        );
+        // Non-existent requested branch returns Err("branch unavailable")
+        assert_eq!(
+            validate_vehicle_sangh_branch(&multi_branch_vehicle, Some("Pokhara Branch")),
+            Err("branch unavailable".to_string())
+        );
+
+        // 3. Explicit null / empty string / empty array SanghBranch fields return "branch unavailable"
+        for explicit_empty in [
+            serde_json::json!({ "SanghBranch": null }),
+            serde_json::json!({ "sanghBranch": "   " }),
+            serde_json::json!({ "SanghBranch": [] }),
+            serde_json::json!({ "Owners": [{ "Name": "A", "SanghBranch": null }] }),
+            serde_json::json!({ "owners": [{ "Name": "B", "sanghBranch": "" }] }),
+        ] {
+            assert_eq!(
+                validate_vehicle_sangh_branch(&explicit_empty, None),
+                Err("branch unavailable".to_string())
+            );
+            assert_eq!(
+                validate_vehicle_sangh_branch(&explicit_empty, Some("Any Branch")),
+                Err("branch unavailable".to_string())
+            );
+        }
+
+        // 4. Legacy vehicle omitting SanghBranch keys altogether: None ok, explicit request fails
+        let legacy_vehicle = serde_json::json!({
+            "VehicleId": 100,
+            "VehicleNumber": "BA-01-PA-0100",
+            "Owners": [{ "Name": "Legacy Owner", "Phone": "9800000000" }]
+        });
+        assert_eq!(validate_vehicle_sangh_branch(&legacy_vehicle, None), Ok(None));
+        assert_eq!(
+            validate_vehicle_sangh_branch(&legacy_vehicle, Some("Any Branch")),
+            Err("branch unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn test_internal_helpers_rule_id_dates_vehicle_identity_and_totals() {
+        // normalize_rule_id
+        assert_eq!(normalize_rule_id("FEE-01"), "1");
+        assert_eq!(normalize_rule_id(" fee-00023 "), "23");
+        assert_eq!(normalize_rule_id("000"), "0");
+        assert_eq!(normalize_rule_id("FEE-00"), "0");
+        assert_eq!(normalize_rule_id("39"), "39");
+        assert_eq!(normalize_rule_id(""), "");
+
+        // extract_bill_vehicle_identity: integer and string IDs across nested & top-level fields
+        assert_eq!(
+            extract_bill_vehicle_identity(&serde_json::json!({
+                "vehicle": { "id": 36017, "vehicleNumber": "lu-548-ga-6236" }
+            })),
+            ("36017".to_string(), "LU548GA6236".to_string())
+        );
+        assert_eq!(
+            extract_bill_vehicle_identity(&serde_json::json!({
+                "vehicle": { "VehicleId": "  VH-90 ", "VehicleNumber": "Ba 01 Pa 0090" }
+            })),
+            ("VH-90".to_string(), "BA01PA0090".to_string())
+        );
+        assert_eq!(
+            extract_bill_vehicle_identity(&serde_json::json!({
+                "vehicleId": 42,
+                "VehicleNumber": "NA-02-KHA-4242"
+            })),
+            ("42".to_string(), "NA02KHA4242".to_string())
+        );
+
+        // extract_bill_dates: multiple keys deduplicated + paidAt fallback
+        assert_eq!(
+            extract_bill_dates(&serde_json::json!({
+                "billingDate": "2026-11-16",
+                "paymentVerifiedAt": "2026-11-16T14:30:00+05:45",
+                "paymentDate": "2026-11-17 09:00:00",
+                "paidAt": "2026-11-18T00:00:00Z"
+            })),
+            vec!["2026-11-16".to_string(), "2026-11-17".to_string()]
+        );
+        assert_eq!(
+            extract_bill_dates(&serde_json::json!({ "paidAt": "2026-11-18T10:05:18Z" })),
+            vec!["2026-11-18".to_string()]
+        );
+        assert!(extract_bill_dates(&serde_json::json!({})).is_empty());
+
+        // extract_bill_total_cents: total / paidAmount string / subtotal / items sum
+        assert_eq!(
+            extract_bill_total_cents(&serde_json::json!({ "total": 904.5 })),
+            Some(90450)
+        );
+        assert_eq!(
+            extract_bill_total_cents(&serde_json::json!({ "paidAmount": "2000.25" })),
+            Some(200025)
+        );
+        assert_eq!(
+            extract_bill_total_cents(&serde_json::json!({ "subtotal": 800 })),
+            Some(80000)
+        );
+        assert_eq!(
+            extract_bill_total_cents(&serde_json::json!({
+                "items": [{ "amount": 500.0 }, { "amount": "300.50" }]
+            })),
+            Some(80050)
+        );
+        assert_eq!(extract_bill_total_cents(&serde_json::json!({ "items": [] })), None);
+    }
+
+    #[test]
+    fn test_items_and_bill_duplicate_detection_exhaustive_edge_cases() {
+        // 1. Integer vs string vs padded feeHeadId ("3" == 3 == "003" == "FEE-03")
+        assert!(items_represent_same_payment(
+            &[serde_json::json!({ "feeHeadId": 3, "ruleId": 39, "amount": 800 })],
+            &[serde_json::json!({ "feeHeadId": "03", "ruleId": 999, "amount": 904 })]
+        ));
+        assert!(items_represent_same_payment(
+            &[serde_json::json!({ "fee_head_id": "FEE-03", "title": "A" })],
+            &[serde_json::json!({ "feeHeadId": "3", "title": "B" })]
+        ));
+
+        // 2. Different feeHeadId does not fall back to matching ruleId or title
+        assert!(!items_represent_same_payment(
+            &[serde_json::json!({ "feeHeadId": "1", "ruleId": "39", "title": "Same" })],
+            &[serde_json::json!({ "feeHeadId": "3", "ruleId": "39", "title": "Same" })]
+        ));
+
+        // 3. Title fallback & amount-only fallback when ids are absent
+        assert!(items_represent_same_payment(
+            &[serde_json::json!({ "title": "  Entry Fee  ", "amount": 500 })],
+            &[serde_json::json!({ "feeTitle": "entry fee", "amount": 750 })]
+        ));
+        assert!(items_represent_same_payment(
+            &[serde_json::json!({ "amount": 1200.0 })],
+            &[serde_json::json!({ "amount": "1200.00" })]
+        ));
+        assert!(!items_represent_same_payment(
+            &[serde_json::json!({ "amount": 1200.0 })],
+            &[serde_json::json!({ "amount": 1300.0 })]
+        ));
+
+        // 4. Multi-item partial overlap blocks re-billing the overlapping fee head
+        assert!(items_represent_same_payment(
+            &[serde_json::json!({ "feeHeadId": "1", "periodId": "2083-07" })],
+            &[
+                serde_json::json!({ "feeHeadId": "2", "periodId": "2083-07" }),
+                serde_json::json!({ "feeHeadId": "1", "periodId": "2083-07" })
+            ]
+        ));
+
+        // 5. Explicit lodbodPaymentReferenceId / esewaTransactionId respects sanghBranch
+        let ref_exist = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "Main Branch",
+            "lodbodPaymentReferenceId": "LB-REF-X",
+            "vehicle": { "id": "100", "vehicleNumber": "BA-01-PA-0100" },
+            "total": 1000.0,
+            "items": [{ "feeHeadId": "1", "amount": 1000.0 }]
+        });
+        let ref_same_branch = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "main branch",
+            "lodbodPaymentReferenceId": "LB-REF-X",
+            "vehicle": { "id": "100", "vehicleNumber": "BA-01-PA-0100" },
+            "total": 1000.0,
+            "items": [{ "feeHeadId": "9", "amount": 1000.0 }]
+        });
+        assert!(is_same_bill_date_vehicle_payment(&ref_same_branch, &ref_exist));
+
+        let mut ref_diff_branch = ref_same_branch.clone();
+        ref_diff_branch["sanghBranch"] = serde_json::json!("Other Branch");
+        assert!(!is_same_bill_date_vehicle_payment(&ref_diff_branch, &ref_exist));
+
+        // 6. Itemless fallback compares total, paymentMethod, periodStart/periodEnd/billingType
+        let no_items_exist = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "Main Branch",
+            "vehicle": { "id": "200", "vehicleNumber": "BA-02-PA-0200" },
+            "total": 1500.0,
+            "paymentMethod": "CASH",
+            "periodStart": "2026-11-01",
+            "billingType": "MEMBERSHIP"
+        });
+        let no_items_dup = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "MAIN BRANCH",
+            "vehicle": { "id": "200", "vehicleNumber": "BA-02-PA-0200" },
+            "total": 1500.0,
+            "paymentMethod": "cash",
+            "periodStart": "2026-11-01",
+            "billingType": "membership"
+        });
+        assert!(is_same_bill_date_vehicle_payment(&no_items_dup, &no_items_exist));
+
+        let mut no_items_diff_pm = no_items_dup.clone();
+        no_items_diff_pm["paymentMethod"] = serde_json::json!("eSewa");
+        assert!(!is_same_bill_date_vehicle_payment(&no_items_diff_pm, &no_items_exist));
+
+        let mut no_items_diff_type = no_items_dup;
+        no_items_diff_type["billingType"] = serde_json::json!("FINE");
+        assert!(!is_same_bill_date_vehicle_payment(&no_items_diff_type, &no_items_exist));
+    }
+
+    #[actix_web::test]
+    async fn test_create_and_modify_bill_auto_branch_inheritance_and_error_paths() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            7100,
+            DatabaseResource {
+                id: Some(7100),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 71001,
+                    "VehicleNumber": "BA-07-PA-7100",
+                    "Owners": [{ "Name": "Auto Branch Owner", "SanghBranch": "Auto Branch One" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. create_bill omitting sanghBranch auto-inherits "Auto Branch One" from cached vehicle
+        let omit_branch_bill = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-17",
+                "total": 500.0,
+                "vehicle": { "id": "71001", "vehicleNumber": "BA-07-PA-7100" },
+                "items": [{ "title": "Entry", "amount": 500.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp1 = create_bill(
+            web::Json(omit_branch_bill.clone()),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+        let created1: DatabaseResource = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp1.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        let created_id = created1.id.unwrap();
+        assert_eq!(
+            created1.inner_content.as_ref().unwrap()["sanghBranch"],
+            serde_json::json!("Auto Branch One")
+        );
+
+        // 2. Subsequent bill explicitly naming "auto branch one" with same fee head is blocked as duplicate
+        let explicit_same_bill = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-17",
+                "sanghBranch": "auto branch one",
+                "total": 565.0,
+                "vehicle": { "id": "71001", "vehicleNumber": "BA-07-PA-7100" },
+                "items": [{ "title": "Entry", "amount": 500.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp_dup = create_bill(
+            web::Json(explicit_same_bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_dup.status(), StatusCode::CONFLICT);
+
+        // 3. modify_bill with invalid sanghBranch fails with 400 BRANCH_UNAVAILABLE and does NOT amend original
+        let invalid_mod_bill = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-17",
+                "sanghBranch": "Invalid Branch",
+                "total": 600.0,
+                "vehicle": { "id": "71001", "vehicleNumber": "BA-07-PA-7100" },
+                "items": [{ "title": "Entry", "amount": 600.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp_mod_bad = modify_bill(
+            web::Path::from(created_id),
+            web::Json(invalid_mod_bill),
+            actix_web::test::TestRequest::put().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_mod_bad.status(), StatusCode::BAD_REQUEST);
+        let err_mod: ApiErrorResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_mod_bad.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(err_mod.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_mod.error.message, "branch unavailable");
+
+        // Confirm original cached bill was NOT marked AMENDED
+        let unchanged = s_data
+            .cache
+            .read()
+            .await
+            .read(ResourceName::BillResource, created_id)
+            .unwrap();
+        assert_ne!(
+            unchanged
+                .inner_content
+                .as_ref()
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("AMENDED")
+        );
+
+        // 4. Uncached vehicle specifying sanghBranch returns 400 BRANCH_UNAVAILABLE
+        let uncached_with_branch = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-17",
+                "sanghBranch": "Some Branch",
+                "total": 500.0,
+                "vehicle": { "id": "UNSEEN-999", "vehicleNumber": "ZZ-01-PA-9999" },
+                "items": [{ "title": "Entry", "amount": 500.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp_uncached = create_bill(
+            web::Json(uncached_with_branch),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_uncached.status(), StatusCode::BAD_REQUEST);
+
+        // 5. modify_bill & delete_bill on non-existent bill ID return 404 Not Found
+        let resp_mod_404 = modify_bill(
+            web::Path::from(999_999),
+            web::Json(omit_branch_bill),
+            actix_web::test::TestRequest::put().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_mod_404.status(), StatusCode::NOT_FOUND);
+
+        let resp_del_404 = delete_bill(
+            web::Path::from(999_999),
+            actix_web::test::TestRequest::delete().to_http_request(),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_del_404.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_delete_rollback_restores_duplicate_protection_and_invalid_rollback() {
+        let s_data = create_mock_server_data().await;
+        let uniq_date = "2026-12-01";
+        let bill = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": uniq_date,
+                "total": 900.0,
+                "vehicle": { "id": "VH-DEL-RB-991", "vehicleNumber": "BA-09-PA-9911" },
+                "items": [{ "title": "Special Fee", "amount": 900.0, "feeHeadId": "15" }]
+            })),
+            external_content: None,
+        };
+
+        let resp_create = create_bill(
+            web::Json(bill.clone()),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_create.status(), StatusCode::CREATED);
+        let created: DatabaseResource = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_create.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        let bill_id = created.id.unwrap();
+
+        let resp_del = delete_bill(
+            web::Path::from(bill_id),
+            actix_web::test::TestRequest::delete().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_del.status(), StatusCode::OK);
+
+        // Locate the exact Delete log entry for our unique vehicle to isolate from parallel tests
+        let delete_log_id = crate::log::get_logs_for_bill(bill_id)
+            .into_iter()
+            .rev()
+            .find(|l| {
+                l.action == crate::log::ActionType::Delete
+                    && !l.is_rolled_back
+                    && l.previous_state
+                        .as_ref()
+                        .and_then(|s| s.pointer("/vehicle/id"))
+                        .and_then(Value::as_str)
+                        == Some("VH-DEL-RB-991")
+            })
+            .expect("expected delete log entry")
+            .id;
+
+        // Rollback the Delete action -> restores bill status to ACTIVE
+        let resp_rb = rollback_bill(
+            web::Path::from(delete_log_id.clone()),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_rb.status(), StatusCode::OK);
+
+        // Attempting to re-create the restored active bill is now blocked with 409 DUPLICATE_BILL
+        let resp_dup_after_restore = create_bill(
+            web::Json(bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_dup_after_restore.status(), StatusCode::CONFLICT);
+
+        // Rolling back an already-rolled-back log ID or unknown ID returns 400 Bad Request
+        let resp_rb_twice = rollback_bill(
+            web::Path::from(delete_log_id),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_rb_twice.status(), StatusCode::BAD_REQUEST);
+
+        let resp_rb_unknown = rollback_bill(
+            web::Path::from("NON-EXISTENT-LOG-ID".to_string()),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_rb_unknown.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_submit_vehicle_payment_idempotency_conflict_and_branch_edge_cases() {
+        let s_data = create_mock_server_data().await;
+        let uniq = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let custom_idemp_key = format!("custom-idemp-key-{}", uniq);
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            7200,
+            DatabaseResource {
+                id: Some(7200),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": "VH-IDEMP-7200",
+                    "VehicleNumber": "BA-08-PA-7200",
+                    "VehicleType": "Truck",
+                    "Owners": [{ "Name": "Sita Gurung", "SanghBranch": "Butwal Branch" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        let req_payload = SubmitVehiclePaymentRequest {
+            lodbod_payment_reference_id: format!("LB-IDEMP-EP-{}", uniq),
+            esewa_transaction_id: format!("ESEWA-IDEMP-{}", uniq),
+            payment_verified_by: "LODBOD".to_string(),
+            payment_verified_at: "2026-11-17T10:00:00+05:45".to_string(),
+            vehicle_id: "VH-IDEMP-7200".to_string(),
+            vehicle_number: "BA-08-PA-7200".to_string(),
+            paid_amount: "2000.00".to_string(),
+            currency: "NPR".to_string(),
+            selected_fees: vec![SelectedFee {
+                fee_id: "FEE-01".to_string(),
+                fee_title: "Sadahitkosh Sulka".to_string(),
+                fiscal_year: "2083/2084".to_string(),
+                billing_period_type: "MONTH".to_string(),
+                periods: vec![SelectedFeePeriod {
+                    period_id: "2083-08".to_string(),
+                    amount: "2000.00".to_string(),
+                }],
+            }],
+            sangh_branch: None, // auto-inherits "Butwal Branch" from cached vehicle
+        };
+
+        // 1. First call succeeds with 201 Created
+        let resp1 = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .insert_header(("Idempotency-Key", custom_idemp_key.as_str()))
+                .to_http_request(),
+            web::Json(req_payload.clone()),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        // 2. Identical replay with same Idempotency-Key -> 409 DUPLICATE_BILL
+        let resp_replay = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .insert_header(("Idempotency-Key", custom_idemp_key.as_str()))
+                .to_http_request(),
+            web::Json(req_payload.clone()),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_replay.status(), StatusCode::CONFLICT);
+        let err_replay: ApiErrorResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_replay.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(err_replay.error.code, "DUPLICATE_BILL");
+
+        // 3. Reusing same Idempotency-Key with a conflicting payload -> 409 IDEMPOTENCY_CONFLICT
+        let mut conflicting_payload = req_payload.clone();
+        conflicting_payload.paid_amount = "2500.00".to_string();
+        let resp_conflict = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .insert_header(("Idempotency-Key", custom_idemp_key.as_str()))
+                .to_http_request(),
+            web::Json(conflicting_payload),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_conflict.status(), StatusCode::CONFLICT);
+        let err_conflict: ApiErrorResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_conflict.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(err_conflict.error.code, "IDEMPOTENCY_CONFLICT");
+
+        // 4. Unknown vehicle WITH explicit sangh_branch -> 400 BRANCH_UNAVAILABLE (not reconciliation)
+        let unknown_with_branch = SubmitVehiclePaymentRequest {
+            lodbod_payment_reference_id: format!("LB-UNK-BR-{}", uniq),
+            esewa_transaction_id: "ESEWA-UNK-BR".to_string(),
+            payment_verified_by: "LODBOD".to_string(),
+            payment_verified_at: "2026-11-17T10:00:00Z".to_string(),
+            vehicle_id: "VH-MISSING-BRANCH".to_string(),
+            vehicle_number: "ZZ-99-PA-9999".to_string(),
+            paid_amount: "2000.00".to_string(),
+            currency: "NPR".to_string(),
+            selected_fees: req_payload.selected_fees,
+            sangh_branch: Some("NonExistent Branch".to_string()),
+        };
+        let resp_unk_br = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Json(unknown_with_branch),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_unk_br.status(), StatusCode::BAD_REQUEST);
+        let err_unk_br: ApiErrorResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_unk_br.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(err_unk_br.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_unk_br.error.message, "branch unavailable");
+    }
+
+    #[actix_web::test]
+    async fn test_get_payment_receipt_status_partially_reconciled_single_ref_and_unauthorized() {
+        let s_data = create_mock_server_data().await;
+        let uniq = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let partial_ref = format!("LB-SINGLE-PARTIAL-{}", uniq);
+
+        // Unauthorized when Authorization header is missing
+        let unauth_resp = get_payment_receipt_status(
+            actix_web::test::TestRequest::get().to_http_request(),
+            web::Path::from("all".to_string()),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Seed 1 cached bill + 1 reconciliation record under the SAME reference ID
+        s_data.cache.write().await.write(
+            ResourceName::BillResource,
+            9201,
+            DatabaseResource {
+                id: Some(9201),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(serde_json::json!({
+                    "lodbodPaymentReferenceId": partial_ref,
+                    "esewaTransactionId": "ESEWA-SINGLE-PARTIAL",
+                    "receiptNumber": "ONL-9201",
+                    "vehicle": { "id": "VH-SP-1" }
+                })),
+                external_content: None,
+            },
+        );
+        get_reconciliation_store()
+            .write()
+            .unwrap()
+            .entry(partial_ref.clone())
+            .or_default()
+            .push(VehiclePaymentResult {
+                lodbod_payment_reference_id: partial_ref.clone(),
+                esewa_transaction_id: "ESEWA-SINGLE-PARTIAL".to_string(),
+                vehicle_id: "VH-SP-2".to_string(),
+                status: "RECONCILIATION_REQUIRED".to_string(),
+                billing_id: None,
+                receipt_number: None,
+                receipt_status: Some("NOT_CREATED".to_string()),
+                receipt_url: None,
+                processed_at: None,
+                reason_code: Some("VEHICLE_NOT_FOUND".to_string()),
+                message: Some("Vehicle not found".to_string()),
+                duplicate: false,
+            });
+
+        // Specific reference lookup returns single PARTIALLY_RECONCILED object
+        let resp_single = get_payment_receipt_status(
+            actix_web::test::TestRequest::get()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Path::from(partial_ref.clone()),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_single.status(), StatusCode::OK);
+        let parsed_single: ApiResponse<PaymentStatusResponseData> = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_single.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed_single.data.overall_status, "PARTIALLY_RECONCILED");
+        assert_eq!(parsed_single.data.vehicles.len(), 2);
+
+        // Whitespace-padded "  all  " returns list including `partial_ref`
+        let resp_all = get_payment_receipt_status(
+            actix_web::test::TestRequest::get()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Path::from("  all  ".to_string()),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_all.status(), StatusCode::OK);
+        let parsed_all: ApiResponse<Vec<PaymentStatusResponseData>> = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_all.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(parsed_all
+            .data
+            .iter()
+            .any(|d| d.lodbod_payment_reference_id == partial_ref
+                && d.overall_status == "PARTIALLY_RECONCILED"));
+    }
+
+    #[actix_web::test]
+    async fn test_send_payment_update_to_lodbod_webhook_success_and_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_mock_webhook(status_line: &'static str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "{}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        status_line
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+            });
+            format!("http://{}/webhook", addr)
+        }
+
+        let payload = LodbodPaymentUpdatePayload {
+            event_id: "EVT-WEBHOOK-1".to_string(),
+            event_type: "BILLING_PAYMENT_RECORDED".to_string(),
+            occurred_at: "2026-11-17T10:00:00+05:45".to_string(),
+            organization_code: "NARAYANI".to_string(),
+            vehicle_id: "36017".to_string(),
+            vehicle_number: "LU-548-GA-6236".to_string(),
+            billing_id: "BILL-100".to_string(),
+            fee_id: "FEE-01".to_string(),
+            fee_title: "Sadahitkosh Sulka".to_string(),
+            fiscal_year: "2083/84".to_string(),
+            billing_period: "2083-08".to_string(),
+            amount: "2000.00".to_string(),
+            currency: "NPR".to_string(),
+            payment_status: "PAID".to_string(),
+            payment_method: "eSewa".to_string(),
+            payment_date: "2026-11-17".to_string(),
+            receipt_number: "ONL-000100".to_string(),
+            due_date: Some("2026-11-30".to_string()),
+            lodbod_payment_reference_id: Some("LB-WH-1".to_string()),
+            esewa_transaction_id: Some("ESEWA-WH-1".to_string()),
+        };
+
+        let ok_url = spawn_mock_webhook("HTTP/1.1 200 OK").await;
+        assert!(send_payment_update_to_lodbod(&payload, &ok_url)
+            .await
+            .is_ok());
+
+        let err_url = spawn_mock_webhook("HTTP/1.1 500 Internal Server Error").await;
+        assert!(send_payment_update_to_lodbod(&payload, &err_url)
+            .await
+            .is_err());
+    }
 }

@@ -282,6 +282,7 @@ pub async fn delete(
     s_data: web::Data<Arc<ServerData>>,
     req: actix_web::HttpRequest,
 ) -> HttpResponse {
+
     let (resource_name, id) = path.into_inner();
 
     if !is_admin(req) {
