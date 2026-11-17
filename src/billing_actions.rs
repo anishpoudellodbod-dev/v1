@@ -55,6 +55,8 @@ pub struct BillResource {
     pub lodbod_payment_reference_id: Option<String>,
     #[serde(rename = "esewaTransactionId")]
     pub esewa_transaction_id: Option<String>,
+    #[serde(rename = "sanghBranch", alias = "SanghBranch", default, skip_serializing_if = "Option::is_none")]
+    pub sangh_branch: Option<String>,
     pub status: Option<String>,
 }
 
@@ -97,6 +99,8 @@ pub struct BillVehicleInfo {
     pub vehicle_type: Option<String>,
     #[serde(rename = "vehicleNumber", default)]
     pub vehicle_number: Option<String>,
+    #[serde(rename = "sanghBranch", alias = "SanghBranch", default, skip_serializing_if = "Option::is_none")]
+    pub sangh_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -259,6 +263,8 @@ pub struct SubmitVehiclePaymentRequest {
     pub currency: String,
     #[serde(rename = "selectedFees")]
     pub selected_fees: Vec<SelectedFee>,
+    #[serde(rename = "sanghBranch", alias = "SanghBranch", default, skip_serializing_if = "Option::is_none")]
+    pub sangh_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1179,89 +1185,238 @@ fn extract_bill_total_cents(inner: &Value) -> Option<i64> {
     None
 }
 
-fn items_represent_same_payment(cand_items: &[Value], exist_items: &[Value]) -> bool {
-    if cand_items.len() != exist_items.len() {
-        return false;
+#[inline]
+fn branch_matches(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+        || (!(a.is_ascii() && b.is_ascii()) && a.to_lowercase() == b.to_lowercase())
+}
+
+fn extract_trimmed_branch_str(val: Option<&Value>) -> Option<String> {
+    val.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn push_unique_branch(branches: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !branches.iter().any(|existing| branch_matches(existing, trimmed)) {
+        branches.push(trimmed.to_string());
+    }
+}
+
+fn collect_branch_values(val: Option<&Value>, out: &mut Vec<String>) {
+    let Some(v) = val else {
+        return;
+    };
+    match v {
+        Value::String(s) => push_unique_branch(out, s),
+        Value::Array(arr) => {
+            for entry in arr {
+                if let Some(s) = entry.as_str() {
+                    push_unique_branch(out, s);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extracts `sanghBranch` / `SanghBranch` from a bill's top-level object, `vehicle`, `branch`, or `items`.
+pub fn extract_bill_sangh_branch(inner: &Value) -> Option<String> {
+    if let Some(b) = extract_trimmed_branch_str(
+        inner
+            .get("sanghBranch")
+            .or_else(|| inner.get("SanghBranch")),
+    ) {
+        return Some(b);
     }
 
-    let mut matched = vec![false; exist_items.len()];
-    for c_item in cand_items {
-        let c_amt = c_item
-            .get("amount")
-            .and_then(parse_json_amount_cents)
-            .unwrap_or(0);
-        let c_rule = c_item
-            .get("ruleId")
-            .or_else(|| c_item.get("feeId"))
-            .and_then(Value::as_str)
-            .map(normalize_rule_id)
-            .unwrap_or_default();
-        let c_title = c_item
-            .get("title")
-            .or_else(|| c_item.get("feeTitle"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        let c_period = c_item
-            .get("periodId")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-
-        let found = exist_items.iter().enumerate().position(|(idx, e_item)| {
-            if matched[idx] {
-                return false;
+    for nested_key in ["vehicle", "branch"] {
+        if let Some(nested) = inner.get(nested_key) {
+            if let Some(b) = extract_trimmed_branch_str(
+                nested
+                    .get("sanghBranch")
+                    .or_else(|| nested.get("SanghBranch")),
+            ) {
+                return Some(b);
             }
-            let e_amt = e_item
-                .get("amount")
-                .and_then(parse_json_amount_cents)
-                .unwrap_or(0);
-            if c_amt != e_amt {
-                return false;
-            }
-
-            let e_period = e_item
-                .get("periodId")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            if !c_period.is_empty() && !e_period.is_empty() && !c_period.eq_ignore_ascii_case(e_period) {
-                return false;
-            }
-
-            let e_rule = e_item
-                .get("ruleId")
-                .or_else(|| e_item.get("feeId"))
-                .and_then(Value::as_str)
-                .map(normalize_rule_id)
-                .unwrap_or_default();
-            let e_title = e_item
-                .get("title")
-                .or_else(|| e_item.get("feeTitle"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-
-            if !c_rule.is_empty() && !e_rule.is_empty() {
-                c_rule == e_rule
-            } else if !c_title.is_empty() && !e_title.is_empty() {
-                c_title.eq_ignore_ascii_case(e_title)
-            } else {
-                c_rule == e_rule && c_title.eq_ignore_ascii_case(e_title)
-            }
-        });
-
-        match found {
-            Some(idx) => matched[idx] = true,
-            None => return false,
         }
     }
 
-    true
+    if let Some(items) = inner.get("items").and_then(Value::as_array) {
+        for item in items {
+            if let Some(b) = extract_trimmed_branch_str(
+                item.get("sanghBranch")
+                    .or_else(|| item.get("SanghBranch")),
+            ) {
+                return Some(b);
+            }
+        }
+    }
+
+    None
 }
 
-/// Checks whether two bill JSON payloads represent the same date, same vehicle,
-/// and same payment (ignoring soft-deleted, amended, or rolled-back existing bills).
+/// Collects all unique non-empty `SanghBranch` / `sanghBranch` strings from top-level and `Owners`.
+pub fn extract_vehicle_sangh_branches(vehicle_inner: &Value) -> Vec<String> {
+    let mut branches = Vec::new();
+    collect_branch_values(vehicle_inner.get("SanghBranch"), &mut branches);
+    collect_branch_values(vehicle_inner.get("sanghBranch"), &mut branches);
+
+    if let Some(owners) = vehicle_inner
+        .get("Owners")
+        .or_else(|| vehicle_inner.get("owners"))
+        .and_then(Value::as_array)
+    {
+        for owner in owners {
+            collect_branch_values(owner.get("SanghBranch"), &mut branches);
+            collect_branch_values(owner.get("sanghBranch"), &mut branches);
+        }
+    }
+
+    branches
+}
+
+fn vehicle_has_explicit_sangh_branch_field(vehicle_inner: &Value) -> bool {
+    if vehicle_inner.get("SanghBranch").is_some() || vehicle_inner.get("sanghBranch").is_some() {
+        return true;
+    }
+
+    vehicle_inner
+        .get("Owners")
+        .or_else(|| vehicle_inner.get("owners"))
+        .and_then(Value::as_array)
+        .is_some_and(|owners| {
+            owners
+                .iter()
+                .any(|o| o.get("SanghBranch").is_some() || o.get("sanghBranch").is_some())
+        })
+}
+
+/// Validates that `requested_branch` exists on the vehicle's `SanghBranch`/`sanghBranch`.
+pub fn validate_vehicle_sangh_branch(
+    vehicle_inner: &Value,
+    requested_branch: Option<&str>,
+) -> Result<Option<String>, String> {
+    let available = extract_vehicle_sangh_branches(vehicle_inner);
+
+    if let Some(req_trimmed) = requested_branch.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(matched) = available
+            .into_iter()
+            .find(|b| branch_matches(b, req_trimmed))
+        {
+            return Ok(Some(matched));
+        }
+        return Err("branch unavailable".to_string());
+    }
+
+    if let Some(first) = available.into_iter().next() {
+        return Ok(Some(first));
+    }
+
+    if vehicle_has_explicit_sangh_branch_field(vehicle_inner) {
+        return Err("branch unavailable".to_string());
+    }
+
+    Ok(None)
+}
+
+fn branch_unavailable_response(request_id: String) -> HttpResponse {
+    HttpResponse::BadRequest().json(ApiErrorResponse {
+        success: false,
+        error: ApiErrorDetails {
+            code: "BRANCH_UNAVAILABLE".to_string(),
+            message: "branch unavailable".to_string(),
+            details: vec!["branch unavailable".to_string()],
+        },
+        request_id,
+    })
+}
+
+fn extract_item_fee_head(item: &Value) -> String {
+    item.get("feeHeadId")
+        .or_else(|| item.get("fee_head_id"))
+        .map(extract_value_str_or_int)
+        .filter(|s| !s.is_empty())
+        .map(|s| normalize_rule_id(&s))
+        .unwrap_or_default()
+}
+
+fn extract_item_rule_id(item: &Value) -> String {
+    item.get("ruleId")
+        .or_else(|| item.get("feeId"))
+        .map(extract_value_str_or_int)
+        .filter(|s| !s.is_empty())
+        .map(|s| normalize_rule_id(&s))
+        .unwrap_or_default()
+}
+
+fn items_represent_same_fee_head(c_item: &Value, e_item: &Value) -> bool {
+    let c_period = c_item
+        .get("periodId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let e_period = e_item
+        .get("periodId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !c_period.is_empty() && !e_period.is_empty() && !c_period.eq_ignore_ascii_case(e_period) {
+        return false;
+    }
+
+    let c_fee_head = extract_item_fee_head(c_item);
+    let e_fee_head = extract_item_fee_head(e_item);
+    if !c_fee_head.is_empty() && !e_fee_head.is_empty() {
+        return c_fee_head == e_fee_head;
+    }
+
+    let c_rule = extract_item_rule_id(c_item);
+    let e_rule = extract_item_rule_id(e_item);
+    if !c_rule.is_empty() && !e_rule.is_empty() {
+        return c_rule == e_rule;
+    }
+
+    let c_title = c_item
+        .get("title")
+        .or_else(|| c_item.get("feeTitle"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let e_title = e_item
+        .get("title")
+        .or_else(|| e_item.get("feeTitle"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !c_title.is_empty() && !e_title.is_empty() {
+        return branch_matches(c_title, e_title);
+    }
+
+    let c_amt = c_item
+        .get("amount")
+        .and_then(parse_json_amount_cents)
+        .unwrap_or(0);
+    let e_amt = e_item
+        .get("amount")
+        .and_then(parse_json_amount_cents)
+        .unwrap_or(0);
+    c_amt == e_amt
+}
+
+fn items_represent_same_payment(cand_items: &[Value], exist_items: &[Value]) -> bool {
+    cand_items
+        .iter()
+        .any(|c_item| exist_items.iter().any(|e_item| items_represent_same_fee_head(c_item, e_item)))
+}
+
+/// Checks whether two bill JSON payloads represent the same vehicle, same time (date),
+/// same `sanghBranch`, and same fee head (ignoring soft-deleted, amended, or rolled-back existing bills).
 pub fn is_same_bill_date_vehicle_payment(candidate: &Value, existing: &Value) -> bool {
     if let Some(status) = existing.get("status").and_then(Value::as_str) {
         let st = status.trim();
@@ -1303,8 +1458,20 @@ pub fn is_same_bill_date_vehicle_payment(candidate: &Value, existing: &Value) ->
         return false;
     }
 
-    // 3. Same Payment check
-    // 3a. Explicit transaction / payment reference ID match
+    // 3. Same sanghBranch check
+    let cand_branch = extract_bill_sangh_branch(candidate);
+    let exist_branch = extract_bill_sangh_branch(existing);
+    let same_branch = match (cand_branch.as_deref(), exist_branch.as_deref()) {
+        (Some(cb), Some(eb)) => branch_matches(cb, eb),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_branch {
+        return false;
+    }
+
+    // 4. Same Fee Head / Payment check
+    // 4a. Explicit transaction / payment reference ID match
     for ref_key in ["lodbodPaymentReferenceId", "esewaTransactionId"] {
         if let (Some(c_ref), Some(e_ref)) = (
             candidate.get(ref_key).and_then(Value::as_str).map(str::trim),
@@ -1316,7 +1483,16 @@ pub fn is_same_bill_date_vehicle_payment(candidate: &Value, existing: &Value) ->
         }
     }
 
-    // 3b. Total amount + items / payment details match
+    // 4b. Items fee head check when both contain non-empty items
+    let cand_items = candidate.get("items").and_then(Value::as_array);
+    let exist_items = existing.get("items").and_then(Value::as_array);
+    if let (Some(ci), Some(ei)) = (cand_items, exist_items) {
+        if !ci.is_empty() && !ei.is_empty() {
+            return items_represent_same_payment(ci, ei);
+        }
+    }
+
+    // 4c. Fallback total/period/billingType comparison when items are absent
     let (Some(cand_cents), Some(exist_cents)) = (
         extract_bill_total_cents(candidate),
         extract_bill_total_cents(existing),
@@ -1337,27 +1513,17 @@ pub fn is_same_bill_date_vehicle_payment(candidate: &Value, existing: &Value) ->
         }
     }
 
-    let cand_items = candidate.get("items").and_then(Value::as_array);
-    let exist_items = existing.get("items").and_then(Value::as_array);
-
-    match (cand_items, exist_items) {
-        (Some(ci), Some(ei)) if !ci.is_empty() || !ei.is_empty() => {
-            items_represent_same_payment(ci, ei)
-        }
-        _ => {
-            for key in ["periodStart", "periodEnd", "billingType"] {
-                if let (Some(cv), Some(ev)) = (
-                    candidate.get(key).and_then(Value::as_str).map(str::trim),
-                    existing.get(key).and_then(Value::as_str).map(str::trim),
-                ) {
-                    if !cv.is_empty() && !ev.is_empty() && !cv.eq_ignore_ascii_case(ev) {
-                        return false;
-                    }
-                }
+    for key in ["periodStart", "periodEnd", "billingType"] {
+        if let (Some(cv), Some(ev)) = (
+            candidate.get(key).and_then(Value::as_str).map(str::trim),
+            existing.get(key).and_then(Value::as_str).map(str::trim),
+        ) {
+            if !cv.is_empty() && !ev.is_empty() && !cv.eq_ignore_ascii_case(ev) {
+                return false;
             }
-            true
         }
     }
+    true
 }
 
 /// Searches `existing_bills` for an active bill with the same date, vehicle, and payment.
@@ -1652,6 +1818,36 @@ fn record_reconciliation_and_idempotency(
     recon_result
 }
 
+fn resolve_and_validate_cached_vehicle_branch<'a>(
+    cache: &'a crate::cache::Cache,
+    v_id: &str,
+    v_norm: &str,
+    req_branch: Option<&str>,
+) -> Result<(Option<&'a DatabaseResource>, Option<String>), String> {
+    let matched_vehicle = if !v_id.is_empty() || !v_norm.is_empty() {
+        cache
+            .cache
+            .get(&ResourceName::VehicleResource)
+            .and_then(|m| find_matching_vehicle(m.values(), v_id, v_norm, true))
+    } else {
+        None
+    };
+
+    match matched_vehicle.and_then(|v| v.inner_content.as_ref()) {
+        Some(v_inner) => {
+            let resolved = validate_vehicle_sangh_branch(v_inner, req_branch)?;
+            Ok((matched_vehicle, resolved))
+        }
+        None => {
+            if req_branch.is_some_and(|b| !b.trim().is_empty()) {
+                Err("branch unavailable".to_string())
+            } else {
+                Ok((matched_vehicle, None))
+            }
+        }
+    }
+}
+
 /// API 2: Submit verified vehicle payment
 /// POST /api/integrations/lodbod/v1/payments/vehicle-receipts
 pub async fn submit_vehicle_payment(
@@ -1776,54 +1972,69 @@ pub async fn submit_vehicle_payment(
         .map(|f| f.fiscal_year.as_str())
         .unwrap_or("2083/84");
 
-    // Attempt to resolve vehicle and check for duplicate bill in a single scoped cache read lock
-    let (resolved_vehicle_meta, duplicate_bill_id) = {
+    // Attempt to resolve vehicle, validate sanghBranch, and check for duplicate bill in a single scoped lock
+    let req_branch = payload
+        .sangh_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let (branch_unavailable, resolved_branch, resolved_vehicle_meta, duplicate_bill_id) = {
         let cache = s_data.cache.read().await;
-        let resolved_meta = cache
-            .cache
-            .get(&ResourceName::VehicleResource)
-            .and_then(|m| find_matching_vehicle(m.values(), q_id, &q_norm, false))
-            .and_then(|v_res| v_res.inner_content.as_ref())
-            .map(|v_inner| {
-                let owner_name = v_inner
-                    .get("Owners")
-                    .and_then(Value::as_array)
-                    .and_then(|arr| arr.first())
-                    .and_then(|o| o.get("Name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Vehicle Owner")
-                    .to_string();
-                let vehicle_type = v_inner
-                    .get("VehicleType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Vehicle")
-                    .to_string();
-                (owner_name, vehicle_type)
-            });
+        match resolve_and_validate_cached_vehicle_branch(&cache, q_id, &q_norm, req_branch) {
+            Err(_) => (true, None, None, None),
+            Ok((matched_vehicle, resolved_branch)) => {
+                let resolved_meta = matched_vehicle
+                    .and_then(|v_res| v_res.inner_content.as_ref())
+                    .map(|v_inner| {
+                        let owner_name = v_inner
+                            .get("Owners")
+                            .and_then(Value::as_array)
+                            .and_then(|arr| arr.first())
+                            .and_then(|o| o.get("Name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Vehicle Owner")
+                            .to_string();
+                        let vehicle_type = v_inner
+                            .get("VehicleType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Vehicle")
+                            .to_string();
+                        (owner_name, vehicle_type)
+                    });
 
-        let probe_bill = serde_json::json!({
-            "billingDate": billing_date,
-            "paymentVerifiedAt": payload.payment_verified_at,
-            "paidAt": processed_at,
-            "total": total_amount,
-            "items": bill_items,
-            "paymentMethod": "eSewa",
-            "lodbodPaymentReferenceId": payload.lodbod_payment_reference_id,
-            "esewaTransactionId": payload.esewa_transaction_id,
-            "vehicle": {
-                "id": payload.vehicle_id,
-                "vehicleNumber": payload.vehicle_number,
+                let mut probe_bill = serde_json::json!({
+                    "billingDate": billing_date,
+                    "paymentVerifiedAt": payload.payment_verified_at,
+                    "paidAt": processed_at,
+                    "total": total_amount,
+                    "items": bill_items,
+                    "paymentMethod": "eSewa",
+                    "lodbodPaymentReferenceId": payload.lodbod_payment_reference_id,
+                    "esewaTransactionId": payload.esewa_transaction_id,
+                    "vehicle": {
+                        "id": payload.vehicle_id,
+                        "vehicleNumber": payload.vehicle_number,
+                    }
+                });
+                if let Some(ref b) = resolved_branch {
+                    probe_bill["sanghBranch"] = Value::String(b.clone());
+                }
+
+                let dup_id = cache
+                    .cache
+                    .get(&ResourceName::BillResource)
+                    .and_then(|bm| find_duplicate_bill(&probe_bill, bm.values()))
+                    .map(|b| b.id.unwrap_or(0));
+
+                (false, resolved_branch, resolved_meta, dup_id)
             }
-        });
-
-        let dup_id = cache
-            .cache
-            .get(&ResourceName::BillResource)
-            .and_then(|bm| find_duplicate_bill(&probe_bill, bm.values()))
-            .map(|b| b.id.unwrap_or(0));
-
-        (resolved_meta, dup_id)
+        }
     };
+
+    if branch_unavailable {
+        return branch_unavailable_response(req_id);
+    }
 
     if let Some(existing_id) = duplicate_bill_id {
         return HttpResponse::Conflict().json(ApiErrorResponse {
@@ -1854,7 +2065,7 @@ pub async fn submit_vehicle_payment(
         });
     };
 
-    let new_bill_content = serde_json::json!({
+    let mut new_bill_content = serde_json::json!({
         "note": "Online payment via LODBOD eSewa",
         "items": bill_items,
         "total": total_amount,
@@ -1883,6 +2094,9 @@ pub async fn submit_vehicle_payment(
         "fiscalYearId": fiscal_year_id,
         "status": "PAID"
     });
+    if let Some(branch) = resolved_branch {
+        new_bill_content["sanghBranch"] = Value::String(branch);
+    }
 
     let db_res = DatabaseResource {
         id: None,
@@ -1963,8 +2177,71 @@ pub async fn submit_vehicle_payment(
     })
 }
 
+fn compute_overall_payment_status(vehicles: &[PaymentStatusVehicleItem]) -> &'static str {
+    let mut has_success = false;
+    let mut has_recon = false;
+    for v in vehicles {
+        if v.status == "SUCCESS" {
+            has_success = true;
+        } else if v.status == "RECONCILIATION_REQUIRED" {
+            has_recon = true;
+        }
+        if has_success && has_recon {
+            break;
+        }
+    }
+
+    if has_success && has_recon {
+        "PARTIALLY_RECONCILED"
+    } else if has_recon {
+        "RECONCILIATION_REQUIRED"
+    } else {
+        "SUCCESS"
+    }
+}
+
+fn extract_bill_status_item(bill: &DatabaseResource, inner: &Value) -> PaymentStatusVehicleItem {
+    let vehicle_id = inner
+        .get("vehicle")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let billing_id = bill.id.map(|id| format!("BILL-{}", id));
+    let receipt_number = inner
+        .get("receiptNumber")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    PaymentStatusVehicleItem {
+        vehicle_id,
+        status: "SUCCESS".to_string(),
+        billing_id,
+        receipt_number,
+        receipt_status: Some("GENERATED".to_string()),
+    }
+}
+
+fn push_recon_status_item(
+    esewa_id: &mut String,
+    vehicles: &mut Vec<PaymentStatusVehicleItem>,
+    item: &VehiclePaymentResult,
+) {
+    if esewa_id.is_empty() {
+        esewa_id.clone_from(&item.esewa_transaction_id);
+    }
+    vehicles.push(PaymentStatusVehicleItem {
+        vehicle_id: item.vehicle_id.clone(),
+        status: item.status.clone(),
+        billing_id: item.billing_id.clone(),
+        receipt_number: item.receipt_number.clone(),
+        receipt_status: item.receipt_status.clone(),
+    });
+}
+
 /// API 3: Get payment/receipt status
 /// GET /api/integrations/lodbod/v1/payments/{lodbodPaymentReferenceId}/vehicle-receipts
+///
 pub async fn get_payment_receipt_status(
     req: HttpRequest,
     path: web::Path<String>,
@@ -1977,6 +2254,74 @@ pub async fn get_payment_receipt_status(
 
     let lodbod_payment_reference_id = path.into_inner();
 
+    if lodbod_payment_reference_id.trim().eq_ignore_ascii_case("all") {
+        let mut grouped: HashMap<String, (String, Vec<PaymentStatusVehicleItem>)> = HashMap::new();
+
+        {
+            let cache = s_data.cache.read().await;
+            if let Some(bills_map) = cache.cache.get(&ResourceName::BillResource) {
+                for bill in bills_map.values() {
+                    let Some(inner) = &bill.inner_content else {
+                        continue;
+                    };
+                    let Some(ref_id) = inner
+                        .get("lodbodPaymentReferenceId")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+
+                    let entry = grouped
+                        .entry(ref_id.to_string())
+                        .or_insert_with(|| (String::new(), Vec::new()));
+                    if entry.0.is_empty() {
+                        if let Some(esewa) = inner.get("esewaTransactionId").and_then(Value::as_str) {
+                            entry.0 = esewa.to_string();
+                        }
+                    }
+                    entry.1.push(extract_bill_status_item(bill, inner));
+                }
+            }
+        }
+
+        {
+            let recon_store = get_reconciliation_store().read().unwrap();
+            for (ref_id, recons) in recon_store.iter() {
+                if ref_id.trim().is_empty() {
+                    continue;
+                }
+                let entry = grouped
+                    .entry(ref_id.clone())
+                    .or_insert_with(|| (String::new(), Vec::with_capacity(recons.len())));
+                for item in recons {
+                    push_recon_status_item(&mut entry.0, &mut entry.1, item);
+                }
+            }
+        }
+
+        let mut all_statuses: Vec<PaymentStatusResponseData> = grouped
+            .into_iter()
+            .map(|(ref_id, (esewa_transaction_id, vehicles))| {
+                let overall_status = compute_overall_payment_status(&vehicles).to_string();
+                PaymentStatusResponseData {
+                    lodbod_payment_reference_id: ref_id,
+                    esewa_transaction_id,
+                    overall_status,
+                    vehicles,
+                }
+            })
+            .collect();
+        all_statuses.sort_by(|a, b| a.lodbod_payment_reference_id.cmp(&b.lodbod_payment_reference_id));
+
+        return HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            data: all_statuses,
+            request_id: req_id,
+        });
+    }
+
     let mut found_vehicles = Vec::new();
     let mut esewa_id = String::new();
 
@@ -1988,32 +2333,12 @@ pub async fn get_payment_receipt_status(
                 if let Some(inner) = &bill.inner_content {
                     if let Some(ref_id) = inner.get("lodbodPaymentReferenceId").and_then(Value::as_str) {
                         if ref_id == lodbod_payment_reference_id {
-                            let vehicle_id = inner
-                                .get("vehicle")
-                                .and_then(|v| v.get("id"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-
                             if esewa_id.is_empty() {
                                 if let Some(esewa) = inner.get("esewaTransactionId").and_then(Value::as_str) {
                                     esewa_id = esewa.to_string();
                                 }
                             }
-
-                            let billing_id = bill.id.map(|id| format!("BILL-{}", id));
-                            let receipt_number = inner
-                                .get("receiptNumber")
-                                .and_then(Value::as_str)
-                                .map(String::from);
-
-                            found_vehicles.push(PaymentStatusVehicleItem {
-                                vehicle_id,
-                                status: "SUCCESS".to_string(),
-                                billing_id,
-                                receipt_number,
-                                receipt_status: Some("GENERATED".to_string()),
-                            });
+                            found_vehicles.push(extract_bill_status_item(bill, inner));
                         }
                     }
                 }
@@ -2027,16 +2352,7 @@ pub async fn get_payment_receipt_status(
         if let Some(recons) = recon_store.get(&lodbod_payment_reference_id) {
             found_vehicles.reserve(recons.len());
             for item in recons {
-                if esewa_id.is_empty() {
-                    esewa_id = item.esewa_transaction_id.clone();
-                }
-                found_vehicles.push(PaymentStatusVehicleItem {
-                    vehicle_id: item.vehicle_id.clone(),
-                    status: item.status.clone(),
-                    billing_id: item.billing_id.clone(),
-                    receipt_number: item.receipt_number.clone(),
-                    receipt_status: item.receipt_status.clone(),
-                });
+                push_recon_status_item(&mut esewa_id, &mut found_vehicles, item);
             }
         }
     }
@@ -2053,26 +2369,7 @@ pub async fn get_payment_receipt_status(
         });
     }
 
-    let mut has_success = false;
-    let mut has_recon = false;
-    for v in &found_vehicles {
-        if v.status == "SUCCESS" {
-            has_success = true;
-        } else if v.status == "RECONCILIATION_REQUIRED" {
-            has_recon = true;
-        }
-        if has_success && has_recon {
-            break;
-        }
-    }
-
-    let overall_status = if has_success && has_recon {
-        "PARTIALLY_RECONCILED"
-    } else if has_recon {
-        "RECONCILIATION_REQUIRED"
-    } else {
-        "SUCCESS"
-    };
+    let overall_status = compute_overall_payment_status(&found_vehicles);
 
     HttpResponse::Ok().json(ApiResponse {
         success: true,
@@ -2100,15 +2397,38 @@ pub async fn create_bill(
     let mut resource = db_resource.into_inner();
     resource.resource_name = Some(ResourceName::BillResource);
 
-    if let Some(ref candidate_inner) = resource.inner_content {
-        let duplicate_bill_id = {
+    if let Some(ref mut candidate_inner) = resource.inner_content {
+        let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(candidate_inner);
+        let req_branch = extract_bill_sangh_branch(candidate_inner);
+
+        let (branch_unavailable, duplicate_bill_id) = {
             let cache = s_data.cache.read().await;
-            cache
-                .cache
-                .get(&ResourceName::BillResource)
-                .and_then(|bills_map| find_duplicate_bill(candidate_inner, bills_map.values()))
-                .map(|b| b.id.unwrap_or(0))
+            match resolve_and_validate_cached_vehicle_branch(
+                &cache,
+                &cand_vid,
+                &cand_vnum,
+                req_branch.as_deref(),
+            ) {
+                Err(_) => (true, None),
+                Ok((_, resolved_branch)) => {
+                    if req_branch.is_none() {
+                        if let Some(branch) = resolved_branch {
+                            candidate_inner["sanghBranch"] = Value::String(branch);
+                        }
+                    }
+                    let dup_id = cache
+                        .cache
+                        .get(&ResourceName::BillResource)
+                        .and_then(|bills_map| find_duplicate_bill(candidate_inner, bills_map.values()))
+                        .map(|b| b.id.unwrap_or(0));
+                    (false, dup_id)
+                }
+            }
         };
+
+        if branch_unavailable {
+            return branch_unavailable_response(extract_request_id(&req));
+        }
 
         if let Some(existing_id) = duplicate_bill_id {
             return HttpResponse::Conflict().json(ApiErrorResponse {
@@ -2170,6 +2490,30 @@ pub async fn modify_bill(
     let old_id = path.into_inner();
     let mut new_resource = updated_resource.into_inner();
     new_resource.resource_name = Some(ResourceName::BillResource);
+
+    if let Some(ref mut new_inner) = new_resource.inner_content {
+        let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(new_inner);
+        let req_branch = extract_bill_sangh_branch(new_inner);
+        let branch_res = {
+            let cache = s_data.cache.read().await;
+            resolve_and_validate_cached_vehicle_branch(
+                &cache,
+                &cand_vid,
+                &cand_vnum,
+                req_branch.as_deref(),
+            )
+            .map(|(_, b)| b)
+        };
+        match branch_res {
+            Ok(Some(branch)) => {
+                if req_branch.is_none() {
+                    new_inner["sanghBranch"] = Value::String(branch);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return branch_unavailable_response(extract_request_id(&req)),
+        }
+    }
 
     // Read original bill
     let original = {
@@ -3382,6 +3726,7 @@ mod tests {
             paid_amount: "2000.00".to_string(),
             currency: "NPR".to_string(),
             selected_fees: vec![],
+            sangh_branch: None,
         };
 
         let res1 = VehiclePaymentResult {
@@ -3484,6 +3829,7 @@ mod tests {
             owner_name: Some("Ram".to_string()),
             vehicle_type: Some("Truck".to_string()),
             vehicle_number: Some("BA-01-PA-0001".to_string()),
+            sangh_branch: None,
         };
         let json = serde_json::to_string(&v_info).unwrap();
         assert!(json.contains("ownerName"));
@@ -3966,6 +4312,7 @@ mod tests {
                     amount: "2000.00".to_string(),
                 }],
             }],
+            sangh_branch: None,
         };
 
         // 1. First payment submission succeeds with 201 Created
@@ -4682,6 +5029,7 @@ mod tests {
                     amount: "2000.00".to_string(),
                 }],
             }],
+            sangh_branch: None,
         };
 
         let http_req = actix_web::test::TestRequest::post()
@@ -4790,6 +5138,7 @@ mod tests {
             paid_amount: "2000.00".to_string(),
             currency: "NPR".to_string(),
             selected_fees: vec![],
+            sangh_branch: None,
         };
         let req1 = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
@@ -4820,6 +5169,7 @@ mod tests {
                     amount: "2000.00".to_string(),
                 }],
             }],
+            sangh_branch: None,
         };
         let req2 = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
@@ -4851,6 +5201,7 @@ mod tests {
                     amount: "2000.00".to_string(),
                 }],
             }],
+            sangh_branch: None,
         };
         let req3 = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
@@ -4884,5 +5235,499 @@ mod tests {
         )
         .await;
         assert_eq!(resp_404.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_duplicate_bill_requires_same_sangh_branch_and_same_fee_head() {
+        let existing = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "Loadboard sthaniya",
+            "total": 904,
+            "paymentMethod": "CASH",
+            "vehicle": {
+                "id": "36048",
+                "vehicleNumber": "KA-02-GHA-0006"
+            },
+            "items": [
+                {
+                    "title": "सदस्यता नविकरण शूल्क",
+                    "amount": 800,
+                    "ruleId": "39",
+                    "feeHeadId": "3"
+                }
+            ],
+            "status": "PAID"
+        });
+
+        // 1. Same vehicle + same date + same feeHeadId + same sanghBranch (case-insensitive)
+        //    even with different ruleId / amount / paymentMethod -> DUPLICATE
+        let dup_same_branch = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "loadboard sthaniya",
+            "total": 800,
+            "paymentMethod": "eSewa",
+            "vehicle": {
+                "id": "36048",
+                "vehicleNumber": "KA-02-GHA-0006"
+            },
+            "items": [
+                {
+                    "title": "सदस्यता नविकरण शूल्क",
+                    "amount": 800,
+                    "ruleId": "99",
+                    "feeHeadId": "3"
+                }
+            ]
+        });
+        assert!(is_same_bill_date_vehicle_payment(&dup_same_branch, &existing));
+
+        // 2. Same vehicle + same date + same feeHeadId + DIFFERENT sanghBranch -> NOT duplicate
+        let diff_branch = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "Hetauda Branch",
+            "total": 904,
+            "paymentMethod": "CASH",
+            "vehicle": {
+                "id": "36048",
+                "vehicleNumber": "KA-02-GHA-0006"
+            },
+            "items": [
+                {
+                    "title": "सदस्यता नविकरण शूल्क",
+                    "amount": 800,
+                    "ruleId": "39",
+                    "feeHeadId": "3"
+                }
+            ]
+        });
+        assert!(!is_same_bill_date_vehicle_payment(&diff_branch, &existing));
+
+        // 3. Same vehicle + same date + same sanghBranch + DIFFERENT feeHeadId -> NOT duplicate
+        let diff_fee_head = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "sanghBranch": "Loadboard sthaniya",
+            "total": 904,
+            "paymentMethod": "CASH",
+            "vehicle": {
+                "id": "36048",
+                "vehicleNumber": "KA-02-GHA-0006"
+            },
+            "items": [
+                {
+                    "title": "Sadahitkosh Sulka",
+                    "amount": 800,
+                    "ruleId": "39",
+                    "feeHeadId": "1"
+                }
+            ]
+        });
+        assert!(!is_same_bill_date_vehicle_payment(&diff_fee_head, &existing));
+
+        // 4. sanghBranch omitted vs present -> NOT duplicate
+        let missing_branch = serde_json::json!({
+            "billingDate": "2026-11-16",
+            "total": 904,
+            "vehicle": {
+                "id": "36048",
+                "vehicleNumber": "KA-02-GHA-0006"
+            },
+            "items": [
+                {
+                    "title": "सदस्यता नविकरण शूल्क",
+                    "amount": 800,
+                    "ruleId": "39",
+                    "feeHeadId": "3"
+                }
+            ]
+        });
+        assert!(!is_same_bill_date_vehicle_payment(&missing_branch, &existing));
+    }
+
+    #[actix_web::test]
+    async fn test_create_bill_and_submit_payment_sangh_branch_validation_and_unavailable() {
+        let s_data = create_mock_server_data().await;
+
+        // Seed vehicle with two owner SanghBranch values
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            6390,
+            DatabaseResource {
+                id: Some(6390),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 36017,
+                    "VehicleNumber": "LU-548-GA-6236",
+                    "VehicleType": "Container 10 Wheeler 17 Ton",
+                    "Owners": [
+                        {
+                            "Name": "Brennan Walker",
+                            "Phone": "9867926116",
+                            "SanghBranch": "Loadboard sthaniya"
+                        },
+                        {
+                            "Name": "Aayusha Sharma",
+                            "Phone": "9865155296",
+                            "SanghBranch": "Hetauda Branch"
+                        }
+                    ]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. Create bill for first valid SanghBranch -> 201 Created
+        let bill_branch_1 = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-16",
+                "sanghBranch": "Loadboard sthaniya",
+                "total": 1000.0,
+                "paymentMethod": "CASH",
+                "vehicle": {
+                    "id": "36017",
+                    "vehicleNumber": "LU-548-GA-6236"
+                },
+                "items": [
+                    {
+                        "title": "सदस्यता नविकरण शूल्क",
+                        "amount": 1000.0,
+                        "ruleId": "2",
+                        "feeHeadId": "3"
+                    }
+                ]
+            })),
+            external_content: None,
+        };
+        let resp1 = create_bill(
+            web::Json(bill_branch_1.clone()),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        // 2. Repeat on same vehicle, same date, same feeHeadId, same sanghBranch -> 409 DUPLICATE_BILL
+        let resp_dup = create_bill(
+            web::Json(bill_branch_1),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_dup.status(), StatusCode::CONFLICT);
+        let err_dup: ApiErrorResponse =
+            serde_json::from_slice(&actix_web::body::to_bytes(resp_dup.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(err_dup.error.code, "DUPLICATE_BILL");
+
+        // 3. Same vehicle, same date, same feeHeadId, but SECOND valid SanghBranch -> 201 Created
+        let bill_branch_2 = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-16",
+                "sanghBranch": "Hetauda Branch",
+                "total": 1000.0,
+                "paymentMethod": "CASH",
+                "vehicle": {
+                    "id": "36017",
+                    "vehicleNumber": "LU-548-GA-6236"
+                },
+                "items": [
+                    {
+                        "title": "सदस्यता नविकरण शूल्क",
+                        "amount": 1000.0,
+                        "ruleId": "2",
+                        "feeHeadId": "3"
+                    }
+                ]
+            })),
+            external_content: None,
+        };
+        let resp_branch_2 = create_bill(
+            web::Json(bill_branch_2),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_branch_2.status(), StatusCode::CREATED);
+
+        // 4. Create bill with non-existent sanghBranch on vehicle -> 400 BRANCH_UNAVAILABLE ("branch unavailable")
+        let bill_bad_branch = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-16",
+                "sanghBranch": "Birgunj NonExistent",
+                "total": 1000.0,
+                "vehicle": {
+                    "id": "36017",
+                    "vehicleNumber": "LU-548-GA-6236"
+                },
+                "items": [{ "title": "Entry", "amount": 500.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp_bad = create_bill(
+            web::Json(bill_bad_branch),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_bad.status(), StatusCode::BAD_REQUEST);
+        let err_bad: ApiErrorResponse =
+            serde_json::from_slice(&actix_web::body::to_bytes(resp_bad.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(err_bad.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_bad.error.message, "branch unavailable");
+
+        // 5. submit_vehicle_payment with invalid sanghBranch -> 400 BRANCH_UNAVAILABLE ("branch unavailable")
+        let pay_bad_branch = SubmitVehiclePaymentRequest {
+            lodbod_payment_reference_id: format!(
+                "LB-BAD-BR-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ),
+            esewa_transaction_id: "ESEWA-BAD-BR".to_string(),
+            payment_verified_by: "LODBOD".to_string(),
+            payment_verified_at: "2026-11-16T10:00:00+05:45".to_string(),
+            vehicle_id: "36017".to_string(),
+            vehicle_number: "LU-548-GA-6236".to_string(),
+            paid_amount: "2000.00".to_string(),
+            currency: "NPR".to_string(),
+            selected_fees: vec![SelectedFee {
+                fee_id: "FEE-01".to_string(),
+                fee_title: "Sadahitkosh Sulka".to_string(),
+                fiscal_year: "2083/2084".to_string(),
+                billing_period_type: "MONTH".to_string(),
+                periods: vec![SelectedFeePeriod {
+                    period_id: "2083-08".to_string(),
+                    amount: "2000.00".to_string(),
+                }],
+            }],
+            sangh_branch: Some("NonExistent Branch".to_string()),
+        };
+        let resp_pay_bad = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Json(pay_bad_branch),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_pay_bad.status(), StatusCode::BAD_REQUEST);
+        let err_pay_bad: ApiErrorResponse = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_pay_bad.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(err_pay_bad.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_pay_bad.error.message, "branch unavailable");
+
+        // 6. submit_vehicle_payment with valid sanghBranch succeeds with 201 Created
+        let pay_good_branch = SubmitVehiclePaymentRequest {
+            lodbod_payment_reference_id: format!(
+                "LB-GOOD-BR-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ),
+            esewa_transaction_id: "ESEWA-GOOD-BR".to_string(),
+            payment_verified_by: "LODBOD".to_string(),
+            payment_verified_at: "2026-11-16T10:05:00+05:45".to_string(),
+            vehicle_id: "36017".to_string(),
+            vehicle_number: "LU-548-GA-6236".to_string(),
+            paid_amount: "2000.00".to_string(),
+            currency: "NPR".to_string(),
+            selected_fees: vec![SelectedFee {
+                fee_id: "FEE-01".to_string(),
+                fee_title: "Sadahitkosh Sulka".to_string(),
+                fiscal_year: "2083/2084".to_string(),
+                billing_period_type: "MONTH".to_string(),
+                periods: vec![SelectedFeePeriod {
+                    period_id: "2083-08".to_string(),
+                    amount: "2000.00".to_string(),
+                }],
+            }],
+            sangh_branch: Some("Hetauda Branch".to_string()),
+        };
+        let resp_pay_good = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Json(pay_good_branch),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_pay_good.status(), StatusCode::CREATED);
+
+        // 7. Vehicle with explicit empty/null SanghBranch returns "branch unavailable" even when request omits sanghBranch
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            6391,
+            DatabaseResource {
+                id: Some(6391),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 36018,
+                    "VehicleNumber": "BA-01-PA-36018",
+                    "Owners": [{ "Name": "No Branch Owner", "SanghBranch": null }]
+                })),
+                external_content: None,
+            },
+        );
+        let bill_null_vehicle_branch = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillResource),
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-16",
+                "total": 500.0,
+                "vehicle": {
+                    "id": "36018",
+                    "vehicleNumber": "BA-01-PA-36018"
+                },
+                "items": [{ "title": "Entry", "amount": 500.0, "feeHeadId": "29" }]
+            })),
+            external_content: None,
+        };
+        let resp_null = create_bill(
+            web::Json(bill_null_vehicle_branch),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_null.status(), StatusCode::BAD_REQUEST);
+        let err_null: ApiErrorResponse =
+            serde_json::from_slice(&actix_web::body::to_bytes(resp_null.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(err_null.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_null.error.message, "branch unavailable");
+    }
+
+    #[actix_web::test]
+    async fn test_get_payment_receipt_status_all_returns_all_payment_references() {
+        let s_data = create_mock_server_data().await;
+        let uniq = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ref_success = format!("LB-ALL-SUCC-{}", uniq);
+        let ref_partial = format!("LB-ALL-PART-{}", uniq);
+        let ref_recon = format!("LB-ALL-RECON-{}", uniq);
+
+        // Cached bills: one full SUCCESS ref and one SUCCESS leg of a PARTIALLY_RECONCILED ref
+        {
+            let mut cache = s_data.cache.write().await;
+            cache.write(
+                ResourceName::BillResource,
+                9101,
+                DatabaseResource {
+                    id: Some(9101),
+                    resource_name: Some(ResourceName::BillResource),
+                    inner_content: Some(serde_json::json!({
+                        "lodbodPaymentReferenceId": ref_success,
+                        "esewaTransactionId": "ESEWA-ALL-1",
+                        "receiptNumber": "ONL-9101",
+                        "vehicle": { "id": "VH-9101" }
+                    })),
+                    external_content: None,
+                },
+            );
+            cache.write(
+                ResourceName::BillResource,
+                9102,
+                DatabaseResource {
+                    id: Some(9102),
+                    resource_name: Some(ResourceName::BillResource),
+                    inner_content: Some(serde_json::json!({
+                        "lodbodPaymentReferenceId": ref_partial,
+                        "esewaTransactionId": "ESEWA-ALL-2",
+                        "receiptNumber": "ONL-9102",
+                        "vehicle": { "id": "VH-9102" }
+                    })),
+                    external_content: None,
+                },
+            );
+        }
+
+        // Reconciliation entries: one paired with ref_partial and one standalone recon ref
+        {
+            let mut store = get_reconciliation_store().write().unwrap();
+            store.entry(ref_partial.clone()).or_default().push(VehiclePaymentResult {
+                lodbod_payment_reference_id: ref_partial.clone(),
+                esewa_transaction_id: "ESEWA-ALL-2".to_string(),
+                vehicle_id: "VH-9103".to_string(),
+                status: "RECONCILIATION_REQUIRED".to_string(),
+                billing_id: None,
+                receipt_number: None,
+                receipt_status: Some("NOT_CREATED".to_string()),
+                receipt_url: None,
+                processed_at: None,
+                reason_code: Some("VEHICLE_NOT_FOUND".to_string()),
+                message: Some("Needs reconciliation".to_string()),
+                duplicate: false,
+            });
+            store.entry(ref_recon.clone()).or_default().push(VehiclePaymentResult {
+                lodbod_payment_reference_id: ref_recon.clone(),
+                esewa_transaction_id: "ESEWA-ALL-3".to_string(),
+                vehicle_id: "VH-9104".to_string(),
+                status: "RECONCILIATION_REQUIRED".to_string(),
+                billing_id: None,
+                receipt_number: None,
+                receipt_status: Some("NOT_CREATED".to_string()),
+                receipt_url: None,
+                processed_at: None,
+                reason_code: Some("VEHICLE_NOT_FOUND".to_string()),
+                message: Some("Needs reconciliation".to_string()),
+                duplicate: false,
+            });
+        }
+
+        for path_param in ["all", "ALL"] {
+            let req = actix_web::test::TestRequest::get()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request();
+            let resp = get_payment_receipt_status(
+                req,
+                web::Path::from(path_param.to_string()),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let parsed: ApiResponse<Vec<PaymentStatusResponseData>> = serde_json::from_slice(
+                &actix_web::body::to_bytes(resp.into_body()).await.unwrap(),
+            )
+            .unwrap();
+            assert!(parsed.success);
+
+            let keys: Vec<&str> = parsed
+                .data
+                .iter()
+                .map(|d| d.lodbod_payment_reference_id.as_str())
+                .collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted);
+
+            let succ_item = parsed
+                .data
+                .iter()
+                .find(|d| d.lodbod_payment_reference_id == ref_success)
+                .expect("missing SUCCESS item");
+            assert_eq!(succ_item.overall_status, "SUCCESS");
+            assert_eq!(succ_item.vehicles.len(), 1);
+            assert_eq!(succ_item.vehicles[0].billing_id.as_deref(), Some("BILL-9101"));
+
+            let part_item = parsed
+                .data
+                .iter()
+                .find(|d| d.lodbod_payment_reference_id == ref_partial)
+                .expect("missing PARTIALLY_RECONCILED item");
+            assert_eq!(part_item.overall_status, "PARTIALLY_RECONCILED");
+            assert_eq!(part_item.vehicles.len(), 2);
+
+            let recon_item = parsed
+                .data
+                .iter()
+                .find(|d| d.lodbod_payment_reference_id == ref_recon)
+                .expect("missing RECONCILIATION_REQUIRED item");
+            assert_eq!(recon_item.overall_status, "RECONCILIATION_REQUIRED");
+            assert_eq!(recon_item.vehicles.len(), 1);
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::cache::Cache;
-use crate::date::{Date, DateParams};
+use crate::date::{Date, DateMapper, DateParams};
 use crate::resource::{DatabaseResource, ResourceName};
 use crate::ServerData;
 use actix_web::{web, HttpResponse};
@@ -7,7 +7,8 @@ use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashBoardStatistics {
@@ -51,41 +52,109 @@ struct VehicleIndex {
     by_db_id: HashMap<i32, usize>,
     by_vehicle_id: HashMap<String, usize>,
     by_vehicle_number: HashMap<String, usize>,
+    by_external_id: HashMap<String, String>,
+    by_external_number: HashMap<String, String>,
+}
+
+fn extract_vehicle_fields(
+    res: &DatabaseResource,
+) -> (Option<i32>, Option<String>, Option<String>) {
+    let v_id = res
+        .inner_content
+        .as_ref()
+        .and_then(|inner| extract_string_or_int(inner.get("VehicleId")));
+    let v_num = res
+        .inner_content
+        .as_ref()
+        .and_then(extract_normalized_number_from_vehicle);
+    (res.id, v_id, v_num)
 }
 
 impl VehicleIndex {
-    fn build(cached_vehicles: Vec<DatabaseResource>, db_vehicles: &[DatabaseResource]) -> Self {
-        let canonical = Cache::deduplicate_vehicle_resources(cached_vehicles);
-        let canonical_count = canonical.len();
-        let mut by_db_id = HashMap::with_capacity(canonical_count);
-        let mut by_vehicle_id = HashMap::with_capacity(canonical_count);
-        let mut by_vehicle_number = HashMap::with_capacity(canonical_count);
+    fn build(cached_vehicles: &[&DatabaseResource], db_vehicles: &[DatabaseResource]) -> Self {
+        let cap = cached_vehicles.len();
+        let mut canonical_count = 0usize;
+        let mut by_db_id = HashMap::with_capacity(cap);
+        let mut by_vehicle_id = HashMap::with_capacity(cap);
+        let mut by_vehicle_number = HashMap::with_capacity(cap);
+        let mut has_duplicates = false;
 
-        for (idx, res) in canonical.iter().enumerate() {
-            if let Some(db_id) = res.id {
-                by_db_id.entry(db_id).or_insert(idx);
+        // Fast linear pass: when cache already contains unique vehicles, avoid parsing timestamps or sorting.
+        for &res in cached_vehicles {
+            let (db_id, v_id, v_num) = extract_vehicle_fields(res);
+
+            let is_duplicate = v_id
+                .as_ref()
+                .is_some_and(|id| by_vehicle_id.contains_key(id))
+                || v_num
+                    .as_ref()
+                    .is_some_and(|num| by_vehicle_number.contains_key(num))
+                || db_id.is_some_and(|id| by_db_id.contains_key(&id));
+
+            if is_duplicate {
+                has_duplicates = true;
+                break;
             }
-            if let Some(inner) = &res.inner_content {
-                if let Some(v_id) = extract_string_or_int(inner.get("VehicleId")) {
-                    by_vehicle_id.entry(v_id).or_insert(idx);
+
+            let idx = canonical_count;
+            canonical_count += 1;
+
+            if let Some(id) = db_id {
+                by_db_id.insert(id, idx);
+            }
+            if let Some(id) = v_id {
+                by_vehicle_id.insert(id, idx);
+            }
+            if let Some(num) = v_num {
+                by_vehicle_number.insert(num, idx);
+            }
+        }
+
+        if has_duplicates {
+            canonical_count = 0;
+            by_db_id.clear();
+            by_vehicle_id.clear();
+            by_vehicle_number.clear();
+
+            let mut ranked: Vec<(Option<DateTime<Utc>>, Option<i32>, &DatabaseResource)> =
+                cached_vehicles
+                    .iter()
+                    .map(|&res| (extract_vehicle_created_time(res), res.id, res))
+                    .collect();
+            ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+            for (_, _, res) in ranked {
+                let (db_id, v_id, v_num) = extract_vehicle_fields(res);
+
+                let existing_idx = v_id
+                    .as_ref()
+                    .and_then(|id| by_vehicle_id.get(id).copied())
+                    .or_else(|| v_num.as_ref().and_then(|num| by_vehicle_number.get(num).copied()))
+                    .or_else(|| db_id.and_then(|id| by_db_id.get(&id).copied()));
+
+                let idx = if let Some(idx) = existing_idx {
+                    idx
+                } else {
+                    let new_idx = canonical_count;
+                    canonical_count += 1;
+                    new_idx
+                };
+
+                if let Some(id) = db_id {
+                    by_db_id.entry(id).or_insert(idx);
                 }
-                if let Some(v_num) = extract_normalized_number_from_vehicle(inner) {
-                    by_vehicle_number.entry(v_num).or_insert(idx);
+                if let Some(id) = v_id {
+                    by_vehicle_id.entry(id).or_insert(idx);
+                }
+                if let Some(num) = v_num {
+                    by_vehicle_number.entry(num).or_insert(idx);
                 }
             }
         }
 
         // Link previous DB vehicle configurations back to their canonical latest vehicle.
         for db_v in db_vehicles {
-            let db_id = db_v.id;
-            let v_id = db_v
-                .inner_content
-                .as_ref()
-                .and_then(|inner| extract_string_or_int(inner.get("VehicleId")));
-            let v_num = db_v
-                .inner_content
-                .as_ref()
-                .and_then(extract_normalized_number_from_vehicle);
+            let (db_id, v_id, v_num) = extract_vehicle_fields(db_v);
 
             let matched_idx = db_id
                 .and_then(|id| by_db_id.get(&id).copied())
@@ -110,11 +179,89 @@ impl VehicleIndex {
             by_db_id,
             by_vehicle_id,
             by_vehicle_number,
+            by_external_id: HashMap::new(),
+            by_external_number: HashMap::new(),
+        }
+    }
+
+    fn register_bill_vehicle_with_norm(&mut self, vid_trimmed: Option<&str>, norm: Option<&str>) {
+        let canonical_idx = norm
+            .and_then(|n| self.by_vehicle_number.get(n).copied())
+            .or_else(|| {
+                vid_trimmed.and_then(|vid| {
+                    self.by_vehicle_id
+                        .get(vid)
+                        .copied()
+                        .or_else(|| vid.parse::<i32>().ok().and_then(|id| self.by_db_id.get(&id).copied()))
+                })
+            });
+
+        if let Some(idx) = canonical_idx {
+            if let Some(vid) = vid_trimmed {
+                if !self.by_vehicle_id.contains_key(vid) {
+                    self.by_vehicle_id.insert(vid.to_string(), idx);
+                }
+            }
+            if let Some(n) = norm {
+                if !self.by_vehicle_number.contains_key(n) {
+                    self.by_vehicle_number.insert(n.to_string(), idx);
+                }
+            }
+            return;
+        }
+
+        let key_from_num = norm.and_then(|n| self.by_external_number.get(n).cloned());
+        let key_from_id = vid_trimmed.and_then(|vid| self.by_external_id.get(vid).cloned());
+
+        let ext_key = match (key_from_num, key_from_id) {
+            (Some(kn), Some(ki)) if kn != ki => {
+                for v in self.by_external_number.values_mut() {
+                    if *v == ki {
+                        *v = kn.clone();
+                    }
+                }
+                for v in self.by_external_id.values_mut() {
+                    if *v == ki {
+                        *v = kn.clone();
+                    }
+                }
+                Some(kn)
+            }
+            (Some(kn), _) => Some(kn),
+            (None, Some(ki)) => Some(ki),
+            (None, None) => norm
+                .map(|n| format!("num:{n}"))
+                .or_else(|| vid_trimmed.map(|vid| format!("id:{vid}"))),
+        };
+
+        if let Some(key) = ext_key {
+            if let Some(vid) = vid_trimmed {
+                if !self.by_external_id.contains_key(vid) {
+                    self.by_external_id.insert(vid.to_string(), key.clone());
+                }
+            }
+            if let Some(n) = norm {
+                if !self.by_external_number.contains_key(n) {
+                    self.by_external_number.insert(n.to_string(), key);
+                }
+            }
         }
     }
 
     fn resolve(&self, vehicle_id: Option<&str>, vehicle_number: Option<&str>) -> Option<VehicleKey> {
-        if let Some(vid) = vehicle_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let vid_trimmed = vehicle_id.map(str::trim).filter(|s| !s.is_empty());
+        let norm = vehicle_number.and_then(normalize_vehicle_number);
+        self.resolve_with_norm(vid_trimmed, norm.as_deref())
+    }
+
+    fn resolve_with_norm(&self, vid_trimmed: Option<&str>, norm: Option<&str>) -> Option<VehicleKey> {
+        if let Some(n) = norm {
+            if let Some(&idx) = self.by_vehicle_number.get(n) {
+                return Some(VehicleKey::Canonical(idx));
+            }
+        }
+
+        if let Some(vid) = vid_trimmed {
             if let Some(&idx) = self.by_vehicle_id.get(vid) {
                 return Some(VehicleKey::Canonical(idx));
             }
@@ -125,36 +272,47 @@ impl VehicleIndex {
             }
         }
 
-        if let Some(norm) = vehicle_number.and_then(normalize_vehicle_number) {
-            if let Some(&idx) = self.by_vehicle_number.get(&norm) {
-                return Some(VehicleKey::Canonical(idx));
+        if let Some(n) = norm {
+            if let Some(ext) = self.by_external_number.get(n) {
+                return Some(VehicleKey::External(ext.clone()));
             }
-            return Some(VehicleKey::External(format!("num:{norm}")));
         }
 
-        vehicle_id
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|vid| VehicleKey::External(format!("id:{vid}")))
+        if let Some(vid) = vid_trimmed {
+            if let Some(ext) = self.by_external_id.get(vid) {
+                return Some(VehicleKey::External(ext.clone()));
+            }
+        }
+
+        if let Some(n) = norm {
+            return Some(VehicleKey::External(format!("num:{n}")));
+        }
+
+        vid_trimmed.map(|vid| VehicleKey::External(format!("id:{vid}")))
     }
 }
 
 struct FiscalYearConfig {
     default_fiscal_year: Option<String>,
+    fallback_fiscal_year: Option<String>,
     /// Maps any normalized fiscal year token (UUID, short label, full label) to a canonical group id.
     alias_to_group: HashMap<String, usize>,
     /// Maps a canonical group id to its display string and optional chronological order rank.
     group_display: Vec<String>,
     group_rank: Vec<Option<i64>>,
+    /// Maps explicit BS start years from SettingResource to their explicit SettingResource id.
+    setting_year_to_id: HashMap<i32, String>,
 }
 
 impl FiscalYearConfig {
     fn from_settings(settings: &[&DatabaseResource]) -> Self {
         let mut config = Self {
             default_fiscal_year: None,
+            fallback_fiscal_year: None,
             alias_to_group: HashMap::new(),
             group_display: Vec::new(),
             group_rank: Vec::new(),
+            setting_year_to_id: HashMap::new(),
         };
 
         for setting in settings {
@@ -169,6 +327,59 @@ impl FiscalYearConfig {
     fn collect_from_value(&mut self, value: &Value) {
         match value {
             Value::Object(map) => {
+                if let Some(setting_key) = map.get("key").and_then(Value::as_str).map(str::trim) {
+                    match setting_key {
+                        "organization-vat"
+                        | "billing-sms-phone"
+                        | "fiscal-year-selector"
+                        | "tqms-sangh-branch-filter" => return,
+                        "arrears-list-rules" => {
+                            if let Some(monthly_paid) =
+                                map.get("monthlyPaid").and_then(Value::as_object)
+                            {
+                                let enabled = monthly_paid
+                                    .get("enabled")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if enabled && self.fallback_fiscal_year.is_none() {
+                                    if let Some(fy_id) =
+                                        extract_string_or_int(monthly_paid.get("fiscalYearId"))
+                                    {
+                                        self.fallback_fiscal_year = Some(fy_id);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        "linked-fee-rules" => {
+                            let enabled = map
+                                .get("enabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            if enabled && self.fallback_fiscal_year.is_none() {
+                                if let Some(rules) = map.get("rules").and_then(Value::as_array) {
+                                    for rule in rules {
+                                        let active = rule
+                                            .get("active")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        if active {
+                                            if let Some(fy_id) =
+                                                extract_string_or_int(rule.get("fiscalYearId"))
+                                            {
+                                                self.fallback_fiscal_year = Some(fy_id);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 for key in ["currentFiscalYear", "currentFiscalYearId", "activeFiscalYear"] {
                     if let Some(val) = map.get(key).and_then(Value::as_str).map(str::trim) {
                         if !val.is_empty() && self.default_fiscal_year.is_none() {
@@ -177,14 +388,30 @@ impl FiscalYearConfig {
                     }
                 }
 
-                // Detect a fiscal year entry object containing id and/or label fields.
+                // Detect a fiscal year entry object containing id and/or label/date fields.
                 let id_str = extract_string_or_int(map.get("id"))
                     .or_else(|| extract_string_or_int(map.get("fiscalYearId")));
-                let label_str = extract_string_or_int(map.get("name"))
+                let mut label_str = extract_string_or_int(map.get("name"))
+                    .or_else(|| extract_string_or_int(map.get("code")))
                     .or_else(|| extract_string_or_int(map.get("label")))
                     .or_else(|| extract_string_or_int(map.get("title")))
                     .or_else(|| extract_string_or_int(map.get("fiscalYear")))
                     .or_else(|| extract_string_or_int(map.get("year")));
+                let start_inferred = map
+                    .get("startDate")
+                    .or_else(|| map.get("start_date"))
+                    .or_else(|| map.get("from"))
+                    .and_then(Value::as_str)
+                    .and_then(infer_bs_fiscal_year_from_date_str);
+
+                if label_str
+                    .as_deref()
+                    .is_none_or(|l| parse_fiscal_year_start(l).is_none())
+                {
+                    if let Some(inferred) = start_inferred {
+                        label_str = Some(inferred);
+                    }
+                }
 
                 let is_fy_object = label_str
                     .as_deref()
@@ -194,9 +421,19 @@ impl FiscalYearConfig {
                         .and_then(Value::as_str)
                         .is_some_and(|t| t.eq_ignore_ascii_case("FISCAL_YEAR"))
                     || (id_str.is_some()
-                        && (map.contains_key("startDate") || map.contains_key("endDate")));
+                        && (map.contains_key("startDate")
+                            || map.contains_key("start_date")
+                            || map.contains_key("endDate")
+                            || map.contains_key("end_date")));
 
                 if is_fy_object {
+                    if let (Some(id), Some(y)) = (
+                        id_str.as_ref(),
+                        label_str.as_deref().and_then(parse_fiscal_year_start),
+                    ) {
+                        self.setting_year_to_id.entry(y).or_insert_with(|| id.clone());
+                    }
+
                     let mut tokens = Vec::new();
                     if let Some(ref id) = id_str {
                         tokens.push(id.clone());
@@ -210,7 +447,11 @@ impl FiscalYearConfig {
                             .get("isCurrent")
                             .or_else(|| map.get("isActive"))
                             .and_then(Value::as_bool)
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                            || map
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| s.trim().eq_ignore_ascii_case("ACTIVE"));
 
                         if is_current && self.default_fiscal_year.is_none() {
                             self.default_fiscal_year = Some(display_val.clone());
@@ -241,22 +482,55 @@ impl FiscalYearConfig {
             all_aliases.extend(expand_fiscal_year_aliases(token));
         }
 
-        let existing_group = all_aliases
+        let mut matching_groups: Vec<usize> = all_aliases
             .iter()
-            .find_map(|a| self.alias_to_group.get(a).copied());
+            .filter_map(|a| self.alias_to_group.get(a).copied())
+            .collect();
+        matching_groups.sort_unstable();
+        matching_groups.dedup();
 
-        let group_id = match existing_group {
-            Some(gid) => gid,
-            None => {
-                let gid = self.group_display.len();
-                let rank = tokens
-                    .iter()
-                    .find_map(|t| parse_fiscal_year_start(t))
-                    .map(|y| (y as i64) * 1000 + gid as i64);
-                self.group_display.push(display.to_string());
-                self.group_rank.push(rank);
-                gid
+        let parsed_rank = tokens.iter().find_map(|t| parse_fiscal_year_start(t));
+
+        let group_id = if matching_groups.is_empty() {
+            let gid = self.group_display.len();
+            let rank = parsed_rank.map(|y| (y as i64) * 1000 + gid as i64);
+            self.group_display.push(display.to_string());
+            self.group_rank.push(rank);
+            gid
+        } else {
+            let primary_gid = matching_groups[0];
+
+            // Merge any secondary groups that share aliases with primary_gid.
+            if matching_groups.len() > 1 {
+                for mapped_gid in self.alias_to_group.values_mut() {
+                    if matching_groups[1..].contains(mapped_gid) {
+                        *mapped_gid = primary_gid;
+                    }
+                }
+                for &sec_gid in &matching_groups[1..] {
+                    if self.group_rank[primary_gid].is_none() {
+                        self.group_rank[primary_gid] = self.group_rank[sec_gid];
+                    }
+                    if parse_fiscal_year_start(&self.group_display[primary_gid]).is_none()
+                        && parse_fiscal_year_start(&self.group_display[sec_gid]).is_some()
+                    {
+                        self.group_display[primary_gid] = self.group_display[sec_gid].clone();
+                    }
+                }
             }
+
+            if self.group_rank[primary_gid].is_none() {
+                if let Some(y) = parsed_rank {
+                    self.group_rank[primary_gid] = Some((y as i64) * 1000 + primary_gid as i64);
+                }
+            }
+            if parse_fiscal_year_start(&self.group_display[primary_gid]).is_none()
+                && parse_fiscal_year_start(display).is_some()
+            {
+                self.group_display[primary_gid] = display.to_string();
+            }
+
+            primary_gid
         };
 
         for alias in all_aliases {
@@ -264,13 +538,36 @@ impl FiscalYearConfig {
         }
     }
 
+    fn lookup_group_id(&self, trimmed: &str) -> Option<usize> {
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(&gid) = self.alias_to_group.get(trimmed) {
+            return Some(gid);
+        }
+        if trimmed.is_ascii() && trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(&gid) = self.alias_to_group.get(&lower) {
+                return Some(gid);
+            }
+        }
+        expand_fiscal_year_aliases(trimmed)
+            .iter()
+            .find_map(|a| self.alias_to_group.get(a).copied())
+    }
+
+    fn has_ranked_group(&self, raw: &str) -> bool {
+        self.lookup_group_id(raw.trim())
+            .is_some_and(|gid| self.group_rank.get(gid).copied().flatten().is_some())
+    }
+
     fn canonicalize(&mut self, raw: &str) -> (usize, Option<i64>) {
         let trimmed = raw.trim();
-        let aliases = expand_fiscal_year_aliases(trimmed);
-        if let Some(&gid) = aliases.iter().find_map(|a| self.alias_to_group.get(a)) {
+        if let Some(gid) = self.lookup_group_id(trimmed) {
             return (gid, self.group_rank[gid]);
         }
 
+        let aliases = expand_fiscal_year_aliases(trimmed);
         let gid = self.group_display.len();
         let rank = parse_fiscal_year_start(trimmed).map(|y| (y as i64) * 1000);
         self.group_display.push(trimmed.to_string());
@@ -283,8 +580,7 @@ impl FiscalYearConfig {
 
     fn resolve_target_fiscal_year(&self, requested: Option<&str>) -> String {
         if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-            let aliases = expand_fiscal_year_aliases(req);
-            if let Some(&gid) = aliases.iter().find_map(|a| self.alias_to_group.get(a)) {
+            if let Some(gid) = self.lookup_group_id(req) {
                 if let Some(label) = self.group_display.get(gid) {
                     if parse_fiscal_year_start(req).is_some() {
                         return req.to_string();
@@ -295,9 +591,12 @@ impl FiscalYearConfig {
             return req.to_string();
         }
 
-        if let Some(ref def) = self.default_fiscal_year {
-            let aliases = expand_fiscal_year_aliases(def);
-            if let Some(&gid) = aliases.iter().find_map(|a| self.alias_to_group.get(a)) {
+        if let Some(def) = self
+            .default_fiscal_year
+            .as_ref()
+            .or(self.fallback_fiscal_year.as_ref())
+        {
+            if let Some(gid) = self.lookup_group_id(def.trim()) {
                 if let Some(label) = self.group_display.get(gid) {
                     return label.clone();
                 }
@@ -309,12 +608,30 @@ impl FiscalYearConfig {
     }
 }
 
-fn parse_fiscal_year_start(raw: &str) -> Option<i32> {
-    let first = raw.trim().split('/').next()?.trim();
-    if first.len() == 4 && first.chars().all(|c| c.is_ascii_digit()) {
+fn normalize_ascii_digits(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            '०'..='९' => char::from(b'0' + (c as u32 - '०' as u32) as u8),
+            _ => c,
+        })
+        .collect()
+}
+
+fn parse_fiscal_year_start_ascii(raw: &str) -> Option<i32> {
+    let first = raw.trim().split(&['/', '-'][..]).next()?.trim();
+    if first.len() == 4 && first.bytes().all(|b| b.is_ascii_digit()) {
         first.parse::<i32>().ok()
     } else {
         None
+    }
+}
+
+fn parse_fiscal_year_start(raw: &str) -> Option<i32> {
+    if raw.is_ascii() {
+        parse_fiscal_year_start_ascii(raw)
+    } else {
+        let ascii = normalize_ascii_digits(raw);
+        parse_fiscal_year_start_ascii(&ascii)
     }
 }
 
@@ -324,17 +641,23 @@ fn expand_fiscal_year_aliases(raw: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut aliases = vec![trimmed.to_lowercase()];
-    if let Some((start_str, end_str)) = trimmed.split_once('/') {
+    let ascii = normalize_ascii_digits(trimmed);
+    let mut aliases = vec![trimmed.to_lowercase(), ascii.to_lowercase()];
+    if let Some((start_str, end_str)) = ascii.split_once(&['/', '-'][..]) {
         let start = start_str.trim();
         let end = end_str.trim();
         if start.len() == 4 && start.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(start_num) = start.parse::<i32>() {
                 let next_year = start_num + 1;
                 let expected_short = format!("{:02}", next_year % 100);
+                let expected_three = format!("{:03}", next_year % 1000);
                 let expected_full = format!("{:04}", next_year);
-                if end == expected_short || end == expected_full {
+                if end == expected_short || end == expected_three || end == expected_full {
+                    if (2000..=2099).contains(&start_num) {
+                        aliases.push(start.to_string());
+                    }
                     aliases.push(format!("{start}/{expected_short}"));
+                    aliases.push(format!("{start}/{expected_three}"));
                     aliases.push(format!("{start}/{expected_full}"));
                 }
             }
@@ -344,6 +667,135 @@ fn expand_fiscal_year_aliases(raw: &str) -> Vec<String> {
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+#[inline]
+fn parse_ascii_digits_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(val)
+}
+
+fn parse_ymd_parts_from_ascii(s: &str) -> Option<(i32, u32, u32)> {
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 10
+        && (bytes[4] == b'-' || bytes[4] == b'/')
+        && (bytes[7] == b'-' || bytes[7] == b'/')
+        && (bytes.len() == 10 || bytes[10] == b'T' || bytes[10] == b' ')
+    {
+        let year = parse_ascii_digits_u32(&bytes[0..4])? as i32;
+        let month = parse_ascii_digits_u32(&bytes[5..7])?;
+        let day = parse_ascii_digits_u32(&bytes[8..10])?;
+        if (1..=12).contains(&month) && (1..=32).contains(&day) {
+            return Some((year, month, day));
+        }
+        return None;
+    }
+
+    let date_part = trimmed.split(&['T', ' '][..]).next()?;
+    let mut parts = date_part.split(&['-', '/'][..]);
+    let year: i32 = parts.next()?.trim().parse().ok()?;
+    let month: u32 = parts.next()?.trim().parse().ok()?;
+    let day: u32 = parts.next()?.trim().parse().ok()?;
+
+    if !(1..=12).contains(&month) || !(1..=32).contains(&day) {
+        return None;
+    }
+
+    Some((year, month, day))
+}
+
+fn parse_ymd_parts(raw: &str) -> Option<(i32, u32, u32)> {
+    if raw.is_ascii() {
+        parse_ymd_parts_from_ascii(raw)
+    } else {
+        let ascii = normalize_ascii_digits(raw);
+        parse_ymd_parts_from_ascii(&ascii)
+    }
+}
+
+fn get_bs_ymd_table() -> &'static HashMap<u32, (i32, u32, u32)> {
+    static BS_YMD_TABLE: OnceLock<HashMap<u32, (i32, u32, u32)>> = OnceLock::new();
+    BS_YMD_TABLE.get_or_init(|| {
+        let mut mapper = DateMapper::empty();
+        if mapper.load_from_json_file("date_range.json").is_err() {
+            let _ = mapper.load_from_json_file("date_mappings.json");
+        }
+        let mut table = HashMap::with_capacity(mapper.ad_to_bs.len());
+        for (ad_str, bs_str) in &mapper.ad_to_bs {
+            if let (Some((ay, am, ad)), Some(bs_ymd)) =
+                (parse_ymd_parts(ad_str), parse_ymd_parts(bs_str))
+            {
+                if ay >= 0 {
+                    let key = (ay as u32) * 10_000 + am * 100 + ad;
+                    table.insert(key, bs_ymd);
+                }
+            }
+        }
+        table
+    })
+}
+
+fn ad_date_str_to_bs_ymd(raw: &str) -> Option<(i32, u32, u32)> {
+    let (year, month, day) = parse_ymd_parts(raw)?;
+
+    if (2051..=2095).contains(&year) {
+        return Some((year, month, day));
+    }
+
+    if (1970..=2050).contains(&year) {
+        let key = (year as u32) * 10_000 + month * 100 + day;
+        if let Some(&bs_ymd) = get_bs_ymd_table().get(&key) {
+            return Some(bs_ymd);
+        }
+        // Fallback arithmetic conversion when date_range.json is not present
+        let (bs_year, bs_month, bs_day) = if month > 4 || (month == 4 && day >= 14) {
+            (year + 57, month - 3, day)
+        } else {
+            (year + 56, month + 9, day)
+        };
+        return Some((bs_year, bs_month, bs_day));
+    }
+
+    None
+}
+
+fn infer_bs_fiscal_year_from_date_str(raw: &str) -> Option<String> {
+    let (bs_year, bs_month, _bs_day) = ad_date_str_to_bs_ymd(raw)?;
+    let bs_start = if bs_month >= 4 {
+        bs_year
+    } else {
+        bs_year - 1
+    };
+
+    Some(format!("{bs_start}/{:02}", (bs_start + 1) % 100))
+}
+
+fn extract_bill_period_start_fiscal_year(inner: &Value) -> Option<String> {
+    inner
+        .get("periodStart")
+        .and_then(Value::as_str)
+        .and_then(infer_bs_fiscal_year_from_date_str)
+}
+
+fn extract_bill_inferred_fiscal_year(inner: &Value) -> Option<String> {
+    ["periodStart", "billingDate", "paidAt", "periodEnd"]
+        .into_iter()
+        .find_map(|key| {
+            inner
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(infer_bs_fiscal_year_from_date_str)
+        })
 }
 
 fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
@@ -357,11 +809,21 @@ fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
 }
 
 fn normalize_vehicle_number(raw: &str) -> Option<String> {
-    let normalized: String = raw
-        .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
-        .flat_map(char::to_uppercase)
-        .collect();
+    let normalized: String = if raw.is_ascii() {
+        let mut out = String::with_capacity(raw.len());
+        for &b in raw.as_bytes() {
+            if !b.is_ascii_whitespace() && !b.is_ascii_punctuation() {
+                out.push(b.to_ascii_uppercase() as char);
+            }
+        }
+        out
+    } else {
+        raw.chars()
+            .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+            .flat_map(char::to_uppercase)
+            .collect()
+    };
+
     if normalized.is_empty() {
         None
     } else {
@@ -380,6 +842,19 @@ fn extract_normalized_number_from_vehicle(inner: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .and_then(normalize_vehicle_number)
         })
+}
+
+fn extract_vehicle_created_time(resource: &DatabaseResource) -> Option<DateTime<Utc>> {
+    let raw = resource
+        .external_content
+        .as_ref()
+        .and_then(|ext| ext.get("createdTime"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn extract_member_timestamp(resource: &DatabaseResource) -> Option<DateTime<Utc>> {
@@ -404,13 +879,34 @@ fn extract_member_timestamp(resource: &DatabaseResource) -> Option<DateTime<Utc>
 }
 
 fn is_bill_ignored(inner: &Value) -> bool {
-    let Some(status) = inner.get("status").and_then(Value::as_str) else {
-        return false;
-    };
-    let s = status.trim();
-    s.eq_ignore_ascii_case("DELETED")
-        || s.eq_ignore_ascii_case("AMENDED")
-        || s.eq_ignore_ascii_case("ROLLED_BACK")
+    if let Some(status) = inner.get("status").and_then(Value::as_str) {
+        let s = status.trim();
+        if s.eq_ignore_ascii_case("DELETED")
+            || s.eq_ignore_ascii_case("AMENDED")
+            || s.eq_ignore_ascii_case("ROLLED_BACK")
+            || s.eq_ignore_ascii_case("CANCELLED")
+            || s.eq_ignore_ascii_case("CANCELED")
+        {
+            return true;
+        }
+    }
+
+    if let Some(history) = inner.get("auditHistory").and_then(Value::as_array) {
+        if history.iter().any(|entry| {
+            entry
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|a| {
+                    let action = a.trim();
+                    action.eq_ignore_ascii_case("CANCELLED")
+                        || action.eq_ignore_ascii_case("CANCELED")
+                })
+        }) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn extract_bill_vehicle<'a>(inner: &'a Value) -> (Option<String>, Option<&'a str>) {
@@ -434,18 +930,30 @@ fn extract_bill_vehicle<'a>(inner: &'a Value) -> (Option<String>, Option<&'a str
     (v_id, v_num)
 }
 
-fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleIndex) -> usize {
-    let mut member_records: Vec<&DatabaseResource> = members;
-    member_records.sort_by(|a, b| {
-        let time_a = extract_member_timestamp(a);
-        let time_b = extract_member_timestamp(b);
-        time_b.cmp(&time_a).then_with(|| b.id.cmp(&a.id))
-    });
+#[inline]
+fn is_member_displaced(inner: &Value) -> bool {
+    inner
+        .get("isDisplaced")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || inner
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("DISPLACED"))
+}
 
-    let mut seen_vehicles: HashSet<VehicleKey> = HashSet::new();
+fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleIndex) -> usize {
+    if members.is_empty() {
+        return 0;
+    }
+
+    let mut latest_by_vehicle: HashMap<
+        VehicleKey,
+        (&DatabaseResource, Option<Option<DateTime<Utc>>>, bool),
+    > = HashMap::with_capacity(members.len());
     let mut displaced_count = 0usize;
 
-    for member in member_records {
+    for member in members {
         let Some(inner) = &member.inner_content else {
             continue;
         };
@@ -461,21 +969,31 @@ fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleInde
             continue;
         };
 
-        if !seen_vehicles.insert(key) {
-            continue;
-        }
-
-        let is_displaced_flag = inner
-            .get("isDisplaced")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_displaced_status = inner
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.trim().eq_ignore_ascii_case("DISPLACED"));
-
-        if is_displaced_flag || is_displaced_status {
-            displaced_count += 1;
+        let displaced = is_member_displaced(inner);
+        match latest_by_vehicle.get_mut(&key) {
+            None => {
+                if displaced {
+                    displaced_count += 1;
+                }
+                latest_by_vehicle.insert(key, (member, None, displaced));
+            }
+            Some((prev_member, prev_ts_opt, prev_displaced)) => {
+                let prev_ts =
+                    *prev_ts_opt.get_or_insert_with(|| extract_member_timestamp(prev_member));
+                let new_ts = extract_member_timestamp(member);
+                if (new_ts, member.id) > (prev_ts, prev_member.id) {
+                    if displaced != *prev_displaced {
+                        if displaced {
+                            displaced_count += 1;
+                        } else {
+                            displaced_count -= 1;
+                        }
+                    }
+                    *prev_member = member;
+                    *prev_ts_opt = Some(new_ts);
+                    *prev_displaced = displaced;
+                }
+            }
         }
     }
 
@@ -498,27 +1016,25 @@ pub fn compute_statistics(
     db_vehicles: &[DatabaseResource],
     current_date: Date,
 ) -> DashBoardStatistics {
-    let cached_vehicles: Vec<DatabaseResource> = cache
+    let cached_vehicles: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::VehicleResource)
-        .map(|v| v.into_iter().cloned().collect())
         .unwrap_or_default();
 
-    let index = VehicleIndex::build(cached_vehicles, db_vehicles);
+    let mut index = VehicleIndex::build(&cached_vehicles, db_vehicles);
 
     let settings: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::SettingResource)
         .unwrap_or_default();
     let mut fy_config = FiscalYearConfig::from_settings(&settings);
 
-    let target_fiscal_year = fy_config.resolve_target_fiscal_year(fiscal_year);
-    let (target_group_id, target_rank) = fy_config.canonicalize(&target_fiscal_year);
-
     let bills: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::BillResource)
         .unwrap_or_default();
 
-    let mut active_in_target: HashSet<VehicleKey> = HashSet::new();
-    let mut billed_in_prior_fy: HashSet<VehicleKey> = HashSet::new();
+    // Single pass over bills: filter ignored entries once, normalize vehicle keys once, resolve
+    // fiscal year groupings, and prepare compact tuples for metric counting.
+    let mut prepared_bills: Vec<(Option<String>, Option<String>, String)> =
+        Vec::with_capacity(bills.len());
 
     for bill in bills {
         let Some(inner) = &bill.inner_content else {
@@ -528,14 +1044,65 @@ pub fn compute_statistics(
             continue;
         }
 
-        let Some(bill_fy) = extract_string_or_int(inner.get("fiscalYearId"))
-            .or_else(|| extract_string_or_int(inner.get("fiscalYear")))
-        else {
-            continue;
+        let (v_id, v_num) = extract_bill_vehicle(inner);
+        let norm_num = v_num.and_then(normalize_vehicle_number);
+        index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
+
+        let bill_fy_raw = extract_string_or_int(inner.get("fiscalYearId"))
+            .or_else(|| extract_string_or_int(inner.get("fiscalYear")));
+
+        let resolved_bill_fy = if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
+            if let Some(fy) = bill_fy_raw {
+                let conflicting_setting = parse_fiscal_year_start(&period_fy).is_some_and(|y| {
+                    fy_config
+                        .setting_year_to_id
+                        .get(&y)
+                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(&fy))
+                });
+                if !conflicting_setting {
+                    fy_config.register_group(&period_fy, &[fy, period_fy.clone()]);
+                } else {
+                    fy_config.register_group(&period_fy, &[period_fy.clone()]);
+                }
+            } else {
+                fy_config.register_group(&period_fy, &[period_fy.clone()]);
+            }
+            period_fy
+        } else if let Some(bill_fy) = bill_fy_raw {
+            if parse_fiscal_year_start(&bill_fy).is_none() && !fy_config.has_ranked_group(&bill_fy) {
+                if let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) {
+                    let conflicting_setting = parse_fiscal_year_start(&inferred_fy).is_some_and(|y| {
+                        fy_config
+                            .setting_year_to_id
+                            .get(&y)
+                            .is_some_and(|sid| !sid.eq_ignore_ascii_case(&bill_fy))
+                    });
+                    if !conflicting_setting {
+                        fy_config.register_group(&inferred_fy, &[bill_fy.clone(), inferred_fy.clone()]);
+                    }
+                }
+            }
+            bill_fy
+        } else {
+            let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) else {
+                continue;
+            };
+            inferred_fy
         };
 
-        let (v_id, v_num) = extract_bill_vehicle(inner);
-        let Some(vehicle_key) = index.resolve(v_id.as_deref(), v_num) else {
+        if v_id.is_some() || norm_num.is_some() {
+            prepared_bills.push((v_id, norm_num, resolved_bill_fy));
+        }
+    }
+
+    let target_fiscal_year = fy_config.resolve_target_fiscal_year(fiscal_year);
+    let (target_group_id, target_rank) = fy_config.canonicalize(&target_fiscal_year);
+
+    let mut active_in_target: HashSet<VehicleKey> = HashSet::with_capacity(prepared_bills.len());
+    let mut billed_in_prior_fy: HashSet<VehicleKey> = HashSet::new();
+
+    for (v_id, norm_num, bill_fy) in prepared_bills {
+        let Some(vehicle_key) = index.resolve_with_norm(v_id.as_deref(), norm_num.as_deref()) else {
             continue;
         };
 
@@ -582,21 +1149,102 @@ pub fn compute_statistics(
     }
 }
 
+static DB_VEHICLES_CACHE: OnceLock<RwLock<HashMap<usize, Arc<Vec<DatabaseResource>>>>> =
+    OnceLock::new();
+static DB_VEHICLES_INFLIGHT: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+fn compact_db_vehicle(resource: DatabaseResource) -> Option<DatabaseResource> {
+    let inner = resource.inner_content.as_ref()?;
+    let v_id = extract_string_or_int(inner.get("VehicleId"));
+    let v_num = extract_normalized_number_from_vehicle(inner);
+    if resource.id.is_none() && v_id.is_none() && v_num.is_none() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::with_capacity(2);
+    if let Some(id_val) = v_id {
+        map.insert("VehicleId".to_string(), Value::String(id_val));
+    }
+    if let Some(num_val) = v_num {
+        map.insert("NormalizedVehicleNumber".to_string(), Value::String(num_val));
+    }
+
+    Some(DatabaseResource {
+        id: resource.id,
+        resource_name: resource.resource_name,
+        inner_content: Some(Value::Object(map)),
+        external_content: None,
+    })
+}
+
+async fn get_cached_db_vehicles(s_data: &Arc<ServerData>) -> Arc<Vec<DatabaseResource>> {
+    let db_key = Arc::as_ptr(&s_data.db) as usize;
+    let cache_lock = DB_VEHICLES_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(hit) = cache_lock.read().ok().and_then(|g| g.get(&db_key).cloned()) {
+        return hit;
+    }
+
+    let inflight = DB_VEHICLES_INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
+    let should_spawn = inflight
+        .lock()
+        .map(|mut guard| guard.insert(db_key))
+        .unwrap_or(false);
+
+    if !should_spawn {
+        return cache_lock
+            .read()
+            .ok()
+            .and_then(|g| g.get(&db_key).cloned())
+            .unwrap_or_else(|| Arc::new(Vec::new()));
+    }
+
+    let db = Arc::clone(&s_data.db);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let loaded = match db.read_all_resource(ResourceName::VehicleResource).await {
+            Ok(vehicles) => {
+                let compact: Vec<DatabaseResource> =
+                    vehicles.into_iter().filter_map(compact_db_vehicle).collect();
+                let arc = Arc::new(compact);
+                if let Ok(mut guard) = DB_VEHICLES_CACHE
+                    .get_or_init(|| RwLock::new(HashMap::new()))
+                    .write()
+                {
+                    guard.insert(db_key, Arc::clone(&arc));
+                }
+                arc
+            }
+            Err(err) => {
+                eprintln!("Warning: failed to read historical vehicles from DB: {err}");
+                Arc::new(Vec::new())
+            }
+        };
+
+        if let Ok(mut guard) = DB_VEHICLES_INFLIGHT
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+        {
+            guard.remove(&db_key);
+        }
+
+        let _ = tx.send(loaded);
+    });
+
+    match tokio::time::timeout(Duration::from_millis(20), rx).await {
+        Ok(Ok(arc)) => arc,
+        _ => cache_lock
+            .read()
+            .ok()
+            .and_then(|g| g.get(&db_key).cloned())
+            .unwrap_or_else(|| Arc::new(Vec::new())),
+    }
+}
+
 pub async fn get_dashboard_statistics(
     query: web::Query<DashboardQuery>,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
-    let db_vehicles = match s_data
-        .db
-        .read_all_resource(ResourceName::VehicleResource)
-        .await
-    {
-        Ok(vehicles) => vehicles,
-        Err(err) => {
-            eprintln!("Warning: failed to read historical vehicles from DB: {err}");
-            Vec::new()
-        }
-    };
+    let db_vehicles = get_cached_db_vehicles(&s_data).await;
 
     let cache = s_data.cache.read().await;
     let stats = compute_statistics(
@@ -619,17 +1267,7 @@ pub async fn get_dashboard_statistics_by_fy(
         Some(fy.as_str())
     };
 
-    let db_vehicles = match s_data
-        .db
-        .read_all_resource(ResourceName::VehicleResource)
-        .await
-    {
-        Ok(vehicles) => vehicles,
-        Err(err) => {
-            eprintln!("Warning: failed to read historical vehicles from DB: {err}");
-            Vec::new()
-        }
-    };
+    let db_vehicles = get_cached_db_vehicles(&s_data).await;
 
     let cache = s_data.cache.read().await;
     let stats = compute_statistics(requested, &cache, &db_vehicles, current_date());
@@ -938,8 +1576,7 @@ mod tests {
         assert_eq!(stats.displaced_users_year, 1);
     }
 
-    #[actix_web::test]
-    async fn test_get_dashboard_statistics_endpoint_returns_ok() {
+    async fn create_mock_server_data_for_tests(cache: Cache) -> web::Data<Arc<ServerData>> {
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -953,7 +1590,6 @@ mod tests {
             let _ = server_io.flush().await;
             let mut buf = [0u8; 256];
             while server_io.read(&mut buf).await.unwrap_or(0) > 0 {
-                // Close or respond with error so endpoint exercises fallback cleanly
                 let _ = server_io
                     .write_all(b"E\x00\x00\x00\x16SERROR\x00Mmock\x00\x00Z\x00\x00\x00\x05I")
                     .await;
@@ -969,6 +1605,15 @@ mod tests {
             let _ = connection.await;
         });
 
+        web::Data::new(Arc::new(ServerData {
+            db: Arc::new(crate::db::Database::new(Arc::new(client))),
+            tqms_client: Arc::new(crate::tqms_integration::TQMSClient::new().await),
+            cache: Arc::new(tokio::sync::RwLock::new(cache)),
+        }))
+    }
+
+    #[actix_web::test]
+    async fn test_get_dashboard_statistics_endpoint_returns_ok() {
         let mut cache = Cache::new();
         cache.write(
             ResourceName::VehicleResource,
@@ -981,11 +1626,7 @@ mod tests {
             make_bill(1, "36017", "LU-548-GA-6236", "2083/84", "Membership", "1", None),
         );
 
-        let s_data = web::Data::new(Arc::new(ServerData {
-            db: Arc::new(crate::db::Database::new(Arc::new(client))),
-            tqms_client: Arc::new(crate::tqms_integration::TQMSClient::new().await),
-            cache: Arc::new(tokio::sync::RwLock::new(cache)),
-        }));
+        let s_data = create_mock_server_data_for_tests(cache).await;
 
         let resp = get_dashboard_statistics(
             web::Query(DashboardQuery {
@@ -1004,5 +1645,766 @@ mod tests {
         assert_eq!(parsed.total_active_users_year, 1);
         assert_eq!(parsed.new_users_year, 1);
         assert_eq!(parsed.total_inactive_users_year, 0);
+    }
+
+    #[test]
+    fn test_uuid_fiscal_year_bills_without_setting_resource_match_target_fiscal_year_via_bill_dates() {
+        let mut cache = Cache::new();
+
+        // 5 vehicles: 2 billed with "2083/84", 3 billed with UUID fiscalYearId and 2026-10-29 billingDate
+        for i in 1..=5 {
+            cache.write(
+                ResourceName::VehicleResource,
+                i,
+                make_vehicle(
+                    i,
+                    36000 + i as i64,
+                    &format!("BA-01-PA-{:04}", 1000 + i),
+                    Some("2026-11-05T11:09:07Z"),
+                ),
+            );
+        }
+
+        // 2 bills with explicit "2083/84"
+        cache.write(
+            ResourceName::BillResource,
+            1,
+            make_bill(1, "36001", "BA-01-PA-1001", "2083/84", "Membership", "1", None),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            2,
+            make_bill(2, "36002", "BA-01-PA-1002", "2083/84", "Membership", "1", None),
+        );
+
+        // 3 bills with UUID fiscalYearId and no SettingResource mapping
+        let uuid_fy = "15f21721-50e8-41af-9596-9d8cdb8d6a16";
+        for i in 3..=5 {
+            cache.write(
+                ResourceName::BillResource,
+                i,
+                make_bill(
+                    i,
+                    &(36000 + i).to_string(),
+                    &format!("BA-01-PA-{:04}", 1000 + i),
+                    uuid_fy,
+                    "Membership",
+                    "1",
+                    None,
+                ),
+            );
+        }
+
+        // Also ensure DB id collision is avoided: a 6th vehicle has DB id 1 (same as Bill 1's vehicle.id
+        // if someone used DB id), and a bill with DB id 6 has vehicle.id="1" + distinct vehicleNumber
+        cache.write(
+            ResourceName::VehicleResource,
+            6,
+            make_vehicle(6, 99999, "NA-09-KHA-9999", Some("2026-11-05T11:09:07Z")),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            6,
+            make_bill(6, "1", "NA-09-KHA-9999", uuid_fy, "Membership", "1", None),
+        );
+
+        // Querying with None (defaults to 2083/2084), "2083/84", and UUID must all count all 6
+        for requested in [None, Some("2083/84"), Some(uuid_fy)] {
+            let stats = compute_statistics(requested, &cache, &[], test_date());
+            assert_eq!(stats.total_users_year, 6);
+            assert_eq!(
+                stats.total_active_users_year, 6,
+                "failed for requested fiscal year {:?}",
+                requested
+            );
+            assert_eq!(stats.new_users_year, 6);
+            assert_eq!(stats.total_inactive_users_year, 0);
+        }
+    }
+
+    #[test]
+    fn test_infer_bs_fiscal_year_and_devanagari_aliases_edge_cases() {
+        // Exact AD -> BS conversion via DateMapper (date_range.json)
+        assert_eq!(ad_date_str_to_bs_ymd("2026-11-16"), Some((2083, 8, 1)));
+        assert_eq!(ad_date_str_to_bs_ymd("2026-10-29"), Some((2083, 7, 13)));
+
+        // AD boundary around Shrawan 1 (2083-04-01 = 2026-07-17, 2084-04-01 = 2027-07-17)
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-07-15"), Some("2082/83".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-07-16"), Some("2082/83".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-07-17"), Some("2083/84".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2027-01-15T10:20:30Z"), Some("2083/84".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2027-07-16"), Some("2083/84".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2027-07-17"), Some("2084/85".to_string()));
+
+        // BS boundary around Shrawan 1 (month 4)
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2083-03-31"), Some("2082/83".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2083-04-01"), Some("2083/84".to_string()));
+
+        // Devanagari digits in dates and fiscal year strings
+        assert_eq!(infer_bs_fiscal_year_from_date_str("२०८३-०४-०१"), Some("2083/84".to_string()));
+        assert_eq!(infer_bs_fiscal_year_from_date_str("२०२६-१०-२९"), Some("2083/84".to_string()));
+        assert_eq!(parse_fiscal_year_start("२०८३/८४"), Some(2083));
+        assert_eq!(parse_fiscal_year_start("2083-2084"), Some(2083));
+
+        let devanagari_aliases = expand_fiscal_year_aliases("२०८३/८४");
+        assert!(devanagari_aliases.contains(&"2083".to_string()));
+        assert!(devanagari_aliases.contains(&"2083/84".to_string()));
+        assert!(devanagari_aliases.contains(&"2083/084".to_string()));
+        assert!(devanagari_aliases.contains(&"2083/2084".to_string()));
+
+        let hyphen_aliases = expand_fiscal_year_aliases("2083-2084");
+        assert!(hyphen_aliases.contains(&"2083".to_string()));
+        assert!(hyphen_aliases.contains(&"2083/84".to_string()));
+        assert!(hyphen_aliases.contains(&"2083/2084".to_string()));
+
+        // Invalid / out-of-range dates
+        assert_eq!(infer_bs_fiscal_year_from_date_str("1969-12-31"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2096-01-01"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-13-01"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-00-10"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str("2026-10-33"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str("not-a-date"), None);
+        assert_eq!(infer_bs_fiscal_year_from_date_str(""), None);
+    }
+
+    #[test]
+    fn test_setting_resource_variations_and_future_fy_bills() {
+        let mut cache = Cache::new();
+        cache.write(
+            ResourceName::SettingResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "currentFiscalYearId": "fy-uuid-2083",
+                    "fiscal_years": [
+                        { "id": "fy-uuid-2083", "startDate": "2026-07-17", "isActive": true },
+                        { "id": "fy-uuid-2084", "from": "2027-07-17", "isActive": false }
+                    ]
+                })),
+                external_content: None,
+            },
+        );
+
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 501, "BA-01-PA-5001", Some("2026-11-01T00:00:00Z")),
+        );
+        cache.write(
+            ResourceName::VehicleResource,
+            2,
+            make_vehicle(2, 502, "BA-01-PA-5002", Some("2026-11-01T00:00:00Z")),
+        );
+
+        // Vehicle 501 billed in 2083/84 AND future 2084/85 -> still counts as NEW in 2083/84
+        cache.write(
+            ResourceName::BillResource,
+            1,
+            make_bill(1, "501", "BA-01-PA-5001", "fy-uuid-2083", "Membership", "1", None),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            2,
+            make_bill(2, "501", "BA-01-PA-5001", "fy-uuid-2084", "Advance", "1", None),
+        );
+
+        // Vehicle 502 has a bill missing fiscalYearId/fiscalYear, falling back to paidAt/periodStart/periodEnd
+        cache.write(
+            ResourceName::BillResource,
+            3,
+            DatabaseResource {
+                id: Some(3),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "vehicle": { "id": "502", "vehicleNumber": "BA-01-PA-5002" },
+                    "paidAt": "2026-08-01T12:00:00Z",
+                    "items": [{ "title": "Fee", "amount": 500 }]
+                })),
+                external_content: None,
+            },
+        );
+
+        let stats = compute_statistics(None, &cache, &[], test_date());
+        assert_eq!(stats.fiscal_year, "2083/84");
+        assert_eq!(stats.total_users_year, 2);
+        assert_eq!(stats.total_active_users_year, 2);
+        assert_eq!(stats.new_users_year, 2);
+        assert_eq!(stats.total_inactive_users_year, 0);
+    }
+
+    #[test]
+    fn test_bill_status_variants_and_vehicle_field_fallbacks() {
+        // Empty cache & DB returns zeroes
+        let empty_cache = Cache::new();
+        let empty_stats = compute_statistics(None, &empty_cache, &[], test_date());
+        assert_eq!(empty_stats.fiscal_year, "2083/2084");
+        assert_eq!(empty_stats.total_users_year, 0);
+        assert_eq!(empty_stats.total_active_users_year, 0);
+        assert_eq!(empty_stats.new_users_year, 0);
+        assert_eq!(empty_stats.displaced_users_year, 0);
+        assert_eq!(empty_stats.total_inactive_users_year, 0);
+
+        let mut cache = Cache::new();
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 701, "BA-01-PA-7001", Some("2026-11-01T00:00:00Z")),
+        );
+
+        // Ignored statuses with varied casing and whitespace
+        for (idx, st) in [" deleted ", "Amended", "ROLLED_BACK"].into_iter().enumerate() {
+            cache.write(
+                ResourceName::BillResource,
+                (idx + 1) as i32,
+                make_bill(
+                    (idx + 1) as i32,
+                    "701",
+                    "BA-01-PA-7001",
+                    "2083/84",
+                    "Fee",
+                    "1",
+                    Some(st),
+                ),
+            );
+        }
+
+        // Uncached external vehicle billed twice with top-level & PascalCase fields and different formatting
+        cache.write(
+            ResourceName::BillResource,
+            10,
+            DatabaseResource {
+                id: Some(10),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "vehicleId": "EXT-55",
+                    "vehicleNumber": "ba 02 pa 5555",
+                    "periodStart": "2026-09-01",
+                    "status": "PAID"
+                })),
+                external_content: None,
+            },
+        );
+        cache.write(
+            ResourceName::BillResource,
+            11,
+            DatabaseResource {
+                id: Some(11),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "vehicle": { "VehicleId": "EXT-55", "VehicleNumber": "BA-02-PA-5555" },
+                    "periodEnd": "2026-10-01",
+                    "status": "PAID"
+                })),
+                external_content: None,
+            },
+        );
+
+        let stats = compute_statistics(Some("2083/84"), &cache, &[], test_date());
+        // Cached vehicle 701 only had ignored bills -> inactive; external EXT-55 counted once -> active
+        assert_eq!(stats.total_users_year, 1);
+        assert_eq!(stats.total_active_users_year, 1);
+        assert_eq!(stats.new_users_year, 1);
+        assert_eq!(stats.total_inactive_users_year, 1);
+    }
+
+    #[test]
+    fn test_displaced_vehicles_tagged_at_fallback_tie_breaker_and_historical_config() {
+        let mut cache = Cache::new();
+        let latest_vehicle = make_vehicle(50, 9001, "LU-548-GA-9001", Some("2026-11-05T11:09:07Z"));
+        let old_db_vehicle = make_vehicle(12, 9001, "OLD-LU-9001", None);
+        cache.write(ResourceName::VehicleResource, 50, latest_vehicle.clone());
+        cache.write(
+            ResourceName::VehicleResource,
+            51,
+            make_vehicle(51, 9002, "LU-548-GA-9002", Some("2026-11-05T11:09:07Z")),
+        );
+
+        // Vehicle 9001: older taggedAt (external_content None) says ACTIVE, newer taggedAt referencing old DB config says " displaced " (without isDisplaced boolean)
+        cache.write(
+            ResourceName::MemberResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::MemberResource),
+                inner_content: Some(json!({
+                    "vehicleId": "9001",
+                    "vehicleNumber": "LU-548-GA-9001",
+                    "status": "ACTIVE",
+                    "taggedAt": "2026-11-01T10:00:00Z"
+                })),
+                external_content: None,
+            },
+        );
+        cache.write(
+            ResourceName::MemberResource,
+            2,
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(ResourceName::MemberResource),
+                inner_content: Some(json!({
+                    "vehicleId": "12",
+                    "vehicleNumber": "OLD-LU-9001",
+                    "status": " displaced ",
+                    "taggedAt": "2026-11-10T10:00:00Z"
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 9002: same missing timestamp, tie-broken by higher DB id (id: 4 ACTIVE beats id: 3 DISPLACED)
+        cache.write(
+            ResourceName::MemberResource,
+            3,
+            make_member(3, "9002", "LU-548-GA-9002", true, "DISPLACED", None),
+        );
+        cache.write(
+            ResourceName::MemberResource,
+            4,
+            make_member(4, "9002", "LU-548-GA-9002", false, "ACTIVE", None),
+        );
+
+        let stats = compute_statistics(
+            Some("2083/84"),
+            &cache,
+            &[old_db_vehicle, latest_vehicle],
+            test_date(),
+        );
+        assert_eq!(stats.displaced_users_year, 1);
+    }
+
+    #[actix_web::test]
+    async fn test_dashboard_query_variants_and_by_fy_endpoint() {
+        let q1 = DashboardQuery {
+            fiscal_year: Some(" 2083/84 ".to_string()),
+            fiscal_year_camel: Some("2082/83".to_string()),
+            fiscal_year_id: Some("uuid".to_string()),
+        };
+        assert_eq!(q1.requested_fiscal_year(), Some("2083/84"));
+
+        let q2 = DashboardQuery {
+            fiscal_year: None,
+            fiscal_year_camel: Some(" 2082/83 ".to_string()),
+            fiscal_year_id: Some("uuid".to_string()),
+        };
+        assert_eq!(q2.requested_fiscal_year(), Some("2082/83"));
+
+        let q3 = DashboardQuery {
+            fiscal_year: None,
+            fiscal_year_camel: None,
+            fiscal_year_id: Some("  15f21721-50e8-41af-9596-9d8cdb8d6a16 ".to_string()),
+        };
+        assert_eq!(
+            q3.requested_fiscal_year(),
+            Some("15f21721-50e8-41af-9596-9d8cdb8d6a16")
+        );
+
+        let q_blank = DashboardQuery {
+            fiscal_year: Some("   ".to_string()),
+            fiscal_year_camel: None,
+            fiscal_year_id: None,
+        };
+        assert_eq!(q_blank.requested_fiscal_year(), None);
+
+        let mut cache = Cache::new();
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 36017, "LU-548-GA-6236", Some("2026-11-05T11:09:07Z")),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            1,
+            make_bill(1, "36017", "LU-548-GA-6236", "2083/84", "Membership", "1", None),
+        );
+
+        let s_data = create_mock_server_data_for_tests(cache).await;
+
+        let resp_explicit =
+            get_dashboard_statistics_by_fy(web::Path::from("2083/84".to_string()), s_data.clone())
+                .await;
+        assert_eq!(resp_explicit.status(), StatusCode::OK);
+        let body_explicit = actix_web::body::to_bytes(resp_explicit.into_body()).await.unwrap();
+        let parsed_explicit: DashBoardStatistics = serde_json::from_slice(&body_explicit).unwrap();
+        assert_eq!(parsed_explicit.fiscal_year, "2083/84");
+        assert_eq!(parsed_explicit.total_active_users_year, 1);
+
+        let resp_blank =
+            get_dashboard_statistics_by_fy(web::Path::from("   ".to_string()), s_data).await;
+        assert_eq!(resp_blank.status(), StatusCode::OK);
+        let body_blank = actix_web::body::to_bytes(resp_blank.into_body()).await.unwrap();
+        let parsed_blank: DashBoardStatistics = serde_json::from_slice(&body_blank).unwrap();
+        assert_eq!(parsed_blank.fiscal_year, "2083/2084");
+        assert_eq!(parsed_blank.total_active_users_year, 1);
+    }
+
+    #[test]
+    fn test_real_bill_resource_sample_counts_all_active_members_and_ignores_cancelled() {
+        let mut cache = Cache::new();
+
+        // Seed all 7 real SettingResource entries from configuration.
+        let real_settings = [
+            DatabaseResource {
+                id: Some(6),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "arrears-list-rules",
+                    "monthlyPaid": {
+                        "enabled": true,
+                        "fiscalYearId": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                        "billingRuleId": "5"
+                    },
+                    "paidExpired": {
+                        "enabled": true,
+                        "billingRuleId": "5"
+                    }
+                })),
+                external_content: None,
+            },
+            DatabaseResource {
+                id: Some(5),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "linked-fee-rules",
+                    "rules": [
+                        {
+                            "id": "f72c97c7-ddd4-4d35-bbdd-86e4746e57db",
+                            "active": true,
+                            "fiscalYearId": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                            "linkedFeeHeadId": "21",
+                            "sourceFeeHeadId": "3",
+                            "oncePerFiscalYear": true
+                        },
+                        {
+                            "id": "f604ebf4-8c7a-4e48-b9c5-40be292dcb7d",
+                            "active": true,
+                            "fiscalYearId": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                            "linkedFeeHeadId": "36",
+                            "sourceFeeHeadId": "25",
+                            "oncePerFiscalYear": true
+                        }
+                    ],
+                    "enabled": true
+                })),
+                external_content: None,
+            },
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "fiscal-year-management",
+                    "fiscalYears": [
+                        {
+                            "id": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                            "code": "2082/83",
+                            "name": "2082/83",
+                            "status": "ACTIVE",
+                            "endDate": "2026-07-16",
+                            "startDate": "2025-07-17"
+                        }
+                    ]
+                })),
+                external_content: None,
+            },
+            DatabaseResource {
+                id: Some(7),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "organization-vat",
+                    "rate": 13,
+                    "enabled": true,
+                    "billingEntityIds": ["1"]
+                })),
+                external_content: None,
+            },
+            DatabaseResource {
+                id: Some(4),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "billing-sms-phone",
+                    "phone": "9600331176",
+                    "vehicleId": "23437"
+                })),
+                external_content: Some(json!({
+                    "phoneChangeReason": "Number pariwartan bhayeko"
+                })),
+            },
+            DatabaseResource {
+                id: Some(3),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "fiscal-year-selector",
+                    "yearsBack": 4,
+                    "yearsForward": 1,
+                    "archivedYears": []
+                })),
+                external_content: None,
+            },
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "tqms-sangh-branch-filter"
+                })),
+                external_content: None,
+            },
+        ];
+        for setting in real_settings {
+            let sid = setting.id.unwrap();
+            cache.write(ResourceName::SettingResource, sid, setting);
+        }
+
+        let sample_vehicles = vec![
+            (1, 32940, "lu-4-kha-5334"),
+            (2, 36001, "Province-4-56-02-JHA-9922"),
+            (3, 35994, "State-2-E-MM-3333"),
+            (4, 35993, "State-2-E-GH-3333"),
+            (5, 36020, "Province-4-01-001-KHA-0021"),
+            (6, 35909, "State-4-D-KK-5656"),
+            (7, 31361, "DH-90-GHA-5555"),
+            (8, 36004, "State-3-F-AA-0010"),
+            (9, 292, "State-2-F-AB-0010"),
+            (10, 36040, "KA-09-PHA-9009"),
+            (11, 36039, "NA-50-PHA-3690"),
+            (12, 36051, "State-4-E-AA-5699"),
+            (13, 35986, "State-7-G-TR-3892"),
+            (14, 35903, "Province-3-53-01-0-2256"),
+            (15, 34442, "Su Pra-03-6-PA-9913"),
+            (16, 33053, "KO PRA-11-11-YA-11"),
+            (17, 36017, "LU-548-GA-6237"),
+            (18, 36028, "Province-3-02-59-JHA-9988"),
+            (19, 35997, "Province-4-23-45-GA-3320"),
+            (20, 36003, "Province-5-53-21-GA-0099"),
+            (21, 36002, "Ga Pra-15-23-KHA-5555"),
+            (22, 35999, "State-3-D-HN-9866"),
+            (23, 34473, "Ma Pra-11-11-PHA-1110"),
+            (24, 36053, "State-3-G-JJ-0765"),
+            (25, 36012, "State-7-F-GJ-0768"),
+            (26, 36005, "DH-288-PHA-3214"),
+            (27, 35953, "State-3-E-YY-3000"),
+            (28, 36047, "State-5-G-BB-0456"),
+            (29, 36026, "State-3-C1-GH-5556"),
+            (30, 36048, "KA-02-GHA-0006"),
+            (31, 36049, "State-4-H-RR-5677"),
+            (32, 63646, "Ba Pra-03-001-KHA-5642"),
+            (33, 36029, "BHE-02-JHA-0202"),
+            (34, 31532, "DH-02-JHA-223"),
+            (35, 36046, "Province-2-23-349-BA-3333"),
+            (36, 1898, "BA-22-JA-3333"),
+            (37, 36036, "Province-4-56-02-JHA-2233"),
+            (38, 36030, "State-3-I1-ER-0928"),
+            (39, 36009, "STATE-3-E-DD-9987"),
+            (40, 290, "State-4-G-AB-1101"),
+            (41, 2933, "BA-20-JA-5555"),
+            (42, 25826, "RA-333-PHA-4433"),
+            (43, 31676, "Province-3-33-333-KHA-3331"),
+            (44, 35964, "State-4-J1-UU-3333"),
+            (45, 31850, "State-3-B-VV-0011"),
+            (46, 28751, "BA-01-JHA-01"),
+            (47, 773, "BA-09-KHA-5555"),
+            // Vehicles whose only bills are CANCELLED
+            (48, 36027, "Ba Pra-57-122-GA-2850"),
+            (49, 36031, "State-2-F-AB-9767"),
+        ];
+
+        for (db_id, vid, num) in sample_vehicles {
+            cache.write(
+                ResourceName::VehicleResource,
+                db_id,
+                make_vehicle(db_id, vid, num, Some("2026-11-05T11:09:07Z")),
+            );
+        }
+
+        let uuid_fy = "15f21721-50e8-41af-9596-9d8cdb8d6a16";
+        let sample_bills = vec![
+            (28, "32940", "lu-4-kha-5334", "2083/84", None),
+            (26, "32940", "lu-4-kha-5334", "2083/84", None),
+            (23, "32940", "lu-4-kha-5334", "2083/84", None),
+            (22, "32940", "lu-4-kha-5334", "2083/84", None),
+            (25, "32940", "lu-4-kha-5334", "2083/84", None),
+            (24, "32940", "lu-4-kha-5334", "2083/84", None),
+            (46, "36001", "Province-4-56-02-JHA-9922", uuid_fy, None),
+            (38, "35994", "State-2-E-MM-3333", uuid_fy, None),
+            (39, "35994", "State-2-E-MM-3333", uuid_fy, None),
+            (29, "35993", "State-2-E-GH-3333", uuid_fy, None),
+            (16, "35993", "State-2-E-GH-3333", uuid_fy, None),
+            (44, "35993", "State-2-E-GH-3333", uuid_fy, None),
+            (45, "35993", "State-2-E-GH-3333", uuid_fy, None),
+            (50, "35993", "State-2-E-GH-3333", uuid_fy, None),
+            (69, "36020", "Province-4-01-001-KHA-0021", uuid_fy, None),
+            (74, "36020", "Province-4-01-001-KHA-0021", uuid_fy, None),
+            (81, "36020", "Province-4-01-001-KHA-0021", uuid_fy, None),
+            (78, "36020", "Province-4-01-001-KHA-0021", uuid_fy, None),
+            (72, "36020", "Province-4-01-001-KHA-0021", uuid_fy, Some("CANCELLED")),
+            (51, "35909", "State-4-D-KK-5656", uuid_fy, None),
+            (54, "35909", "State-4-D-KK-5656", uuid_fy, None),
+            (55, "35909", "State-4-D-KK-5656", uuid_fy, None),
+            (18, "31361", "DH-90-GHA-5555", uuid_fy, None),
+            (21, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (15, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (30, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (43, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (42, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (41, "36004", "State-3-F-AA-0010", uuid_fy, None),
+            (61, "292", "State-1-F-AB-0010", uuid_fy, None),
+            (63, "292", "State-2-F-AB-0010", uuid_fy, None),
+            (59, "292", "State-1-F-AB-0010", uuid_fy, None),
+            (92, "VH-101", "KA-09-PHA-9009", "2083/84", None),
+            (93, "VH-101", "KA-09-PHA-9009", "2083/84", None),
+            (94, "VH-101", "KA-09-PHA-9009", "2083/2084", None),
+            (95, "36039", "KA-09-PHA-9009", "2083/2084", None),
+            (97, "36040", "KA-09-PHA-9009", uuid_fy, None),
+            (98, "36040", "KA-09-PHA-9009", uuid_fy, None),
+            (99, "36040", "KA-09-PHA-9008", uuid_fy, None),
+            (105, "36040", "KA-09-PHA-9008", uuid_fy, None),
+            (116, "36051", "State-4-E-AA-5699", uuid_fy, None),
+            (103, "36039", "NA-50-PHA-3690", "2083/2084", None),
+            (79, "35986", "State-7-G-TR-3892", uuid_fy, None),
+            (80, "35986", "State-7-G-TR-3892", uuid_fy, None),
+            (82, "35986", "State-7-G-TR-3892", uuid_fy, None),
+            (70, "35986", "State-7-G-TR-3892", uuid_fy, None),
+            (71, "35986", "State-7-G-TR-3892", uuid_fy, None),
+            (13, "35903", "Province-3-53-01-0-2256", uuid_fy, None),
+            (12, "35903", "Province-3-53-01-0-2256", uuid_fy, None),
+            (11, "35903", "Province-3-53-01-0-2256", uuid_fy, None),
+            (33, "34442", "Su Pra-03-6-PA-9913", uuid_fy, None),
+            (75, "33053", "KO PRA-11-11-YA-11", uuid_fy, None),
+            (115, "36017", "LU-548-GA-6237", uuid_fy, None),
+            (57, "36017", "LU-548-GA-6236", uuid_fy, None),
+            (58, "36017", "LU-548-GA-6236", uuid_fy, None),
+            (85, "36028", "Province-3-02-59-JHA-9988", uuid_fy, None),
+            (108, "36028", "Province-3-02-59-JHA-9988", uuid_fy, None),
+            (35, "35997", "Ga Pra-23-45-GA-3320", uuid_fy, None),
+            (36, "35997", "Ga Pra-23-45-GA-3320", uuid_fy, None),
+            (37, "35997", "Province-4-23-45-GA-3320", uuid_fy, None),
+            (34, "35997", "Ga Pra-23-45-GA-3320", uuid_fy, None),
+            (7, "35997", "Ga Pra-23-45-GA-3320", uuid_fy, None),
+            (5, "36003", "Province-5-53-21-GA-0099", uuid_fy, None),
+            (4, "36002", "Ga Pra-15-23-KHA-5555", uuid_fy, None),
+            (8, "35999", "State-3-D-HN-9865", uuid_fy, None),
+            (9, "35999", "State-3-D-HN-9866", uuid_fy, None),
+            (14, "35999", "State-3-D-HN-9866", uuid_fy, None),
+            (49, "35999", "State-3-D-HN-9866", uuid_fy, None),
+            (10, "35999", "State-3-D-HN-9865", uuid_fy, None),
+            (91, "34473", "Ma Pra-11-11-PHA-1110", uuid_fy, None),
+            (114, "36053", "State-3-G-JJ-0765", uuid_fy, None),
+            (62, "36012", "State-7-F-GJ-0767", uuid_fy, None),
+            (65, "36012", "State-7-F-GJ-0768", uuid_fy, None),
+            (68, "36012", "State-7-F-GJ-0768", uuid_fy, None),
+            (64, "36012", "State-7-F-GJ-0767", uuid_fy, None),
+            (48, "36005", "DH-288-PHA-3213", uuid_fy, None),
+            (32, "36005", "DH-288-PHA-3214", uuid_fy, None),
+            (52, "35953", "State-3-E-YY-3000", uuid_fy, None),
+            (106, "36047", "State-5-G-BB-0456", uuid_fy, None),
+            (77, "36026", "State-3-C1-GH-5556", uuid_fy, None),
+            (109, "36048", "KA-02-GHA-0006", uuid_fy, None),
+            (117, "36048", "KA-02-GHA-0006", uuid_fy, None),
+            (111, "36049", "State-4-H-RR-5677", uuid_fy, None),
+            (112, "36049", "State-4-H-RR-5677", uuid_fy, None),
+            (1, "63646", "Ba Pra-03-001-KHA-5642", "2", None),
+            (87, "36029", "BHE-02-JHA-0202", uuid_fy, None),
+            (118, "31532", "DH-02-JHA-222", uuid_fy, None),
+            (100, "31532", "DH-02-JHA-222", uuid_fy, None),
+            (101, "31532", "DH-02-JHA-223", uuid_fy, None),
+            (96, "31532", "DH-02-JHA-222", uuid_fy, None),
+            (102, "31532", "DH-02-JHA-223", uuid_fy, None),
+            (104, "36046", "Province-2-23-349-BA-3333", uuid_fy, None),
+            (3, "1898", "BA-22-JA-3333", uuid_fy, None),
+            (90, "36036", "Province-4-56-02-JHA-2233", uuid_fy, None),
+            (88, "36030", "State-3-I1-ER-0928", uuid_fy, None),
+            (53, "36009", "STATE-3-E-DD-9987", uuid_fy, None),
+            (56, "290", "State-4-G-AB-1101", uuid_fy, None),
+            (31, "2933", "BA-20-JA-5555", uuid_fy, None),
+            (47, "25826", "RA-333-PHA-4433", uuid_fy, None),
+            (107, "31676", "Province-3-33-333-KHA-3331", uuid_fy, None),
+            (19, "35964", "State-4-J1-UU-3333", uuid_fy, None),
+            (67, "31850", "State-3-B-VV-0011", uuid_fy, None),
+            (84, "28751", "BA-01-JHA-01", uuid_fy, None),
+            (2, "773", "BA-09-KHA-5555", uuid_fy, None),
+            // Cancelled bills for vehicles with no other valid bills
+            (86, "36027", "Ba Pra-57-122-GA-2850", uuid_fy, Some("CANCELLED")),
+            (89, "36031", "State-2-F-AB-9767", uuid_fy, Some("CANCELLED")),
+        ];
+
+        for (bill_id, vid, num, fy, status) in sample_bills {
+            let mut bill = make_bill(bill_id, vid, num, fy, "Fee", "1", status);
+            if fy == uuid_fy || fy == "2" {
+                if let Some(Value::Object(ref mut map)) = bill.inner_content {
+                    map.insert("periodStart".to_string(), json!("2026-11-16"));
+                }
+            }
+            cache.write(ResourceName::BillResource, bill_id, bill);
+        }
+
+        // Verify all 47 unique active vehicles are counted regardless of query format,
+        // and the 2 cancelled-only vehicles remain inactive.
+        for requested in [
+            None,
+            Some("2082/83"),
+            Some("2083"),
+            Some("2083/84"),
+            Some("2083/2084"),
+            Some(uuid_fy),
+        ] {
+            let stats = compute_statistics(requested, &cache, &[], test_date());
+            assert_eq!(stats.total_users_year, 49);
+            assert_eq!(
+                stats.total_active_users_year, 47,
+                "active mismatch for {:?}",
+                requested
+            );
+            assert_eq!(stats.new_users_year, 47);
+            assert_eq!(stats.total_inactive_users_year, 2);
+        }
+
+        // Verify rule IDs in linked-fee-rules are never registered as fiscal years
+        let settings_only = cache.read_all(ResourceName::SettingResource).unwrap();
+        let fy_check = FiscalYearConfig::from_settings(&settings_only);
+        assert!(
+            !fy_check.has_ranked_group("f72c97c7-ddd4-4d35-bbdd-86e4746e57db"),
+            "linked-fee-rules rule id must not be treated as a fiscal year"
+        );
+
+        // Even if SettingResource had an arbitrary unparsed label for uuid_fy,
+        // periodStart AD-to-BS conversion ("2026-11-16" -> "2083-08-01" -> "2083/84") still matches all 47.
+        cache.write(
+            ResourceName::SettingResource,
+            2,
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "key": "fiscal-year-management",
+                    "fiscalYears": [
+                        { "id": uuid_fy, "name": "Current FY", "status": "ACTIVE" }
+                    ]
+                })),
+                external_content: None,
+            },
+        );
+        for requested in [None, Some("2083"), Some("2083/84"), Some(uuid_fy)] {
+            let stats = compute_statistics(requested, &cache, &[], test_date());
+            assert_eq!(stats.total_active_users_year, 47);
+        }
+
+        // Verify auditHistory cancellation without top-level status is also ignored
+        cache.write(
+            ResourceName::BillResource,
+            999,
+            DatabaseResource {
+                id: Some(999),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "vehicle": { "id": "36031", "vehicleNumber": "State-2-F-AB-9767" },
+                    "billingDate": "2026-11-06",
+                    "fiscalYearId": uuid_fy,
+                    "auditHistory": [{ "action": "CANCELLED", "reason": "mistake" }]
+                })),
+                external_content: None,
+            },
+        );
+        let stats_audit = compute_statistics(Some("2083/84"), &cache, &[], test_date());
+        assert_eq!(stats_audit.total_active_users_year, 47);
     }
 }
