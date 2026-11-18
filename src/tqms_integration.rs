@@ -387,9 +387,8 @@ fn search_cache_vehicles_with_id_lookup(
         .map(normalize_vehicle_num)
         .unwrap_or_default();
 
-    let mut results: Vec<(Option<i32>, Value)> = Vec::new();
+    let mut matched_resources: Vec<DatabaseResource> = Vec::new();
     let mut seen_cache_ids: HashSet<i32> = HashSet::new();
-    let mut seen_vehicle_keys: HashSet<(Option<String>, String)> = HashSet::new();
     let mut target_vehicle_ids: HashSet<String> = HashSet::new();
 
     if let Some(q_raw) = params
@@ -412,16 +411,15 @@ fn search_cache_vehicles_with_id_lookup(
             continue;
         };
         if vehicle_matches_search_params(inner, params, &query_norm_num) {
-            let vid = extract_vehicle_id_str(inner);
-            let norm_num = extract_vehicle_norm_num(inner);
-            if let Some(ref id_str) = vid {
-                target_vehicle_ids.insert(id_str.clone());
+            if let Some(id_str) = extract_vehicle_id_str(inner) {
+                target_vehicle_ids.insert(id_str);
             }
             if let Some(cid) = res.id {
-                seen_cache_ids.insert(cid);
+                if !seen_cache_ids.insert(cid) {
+                    continue;
+                }
             }
-            seen_vehicle_keys.insert((vid, norm_num));
-            results.push((res.id, inner.clone()));
+            matched_resources.push((*res).clone());
         }
     }
 
@@ -445,18 +443,22 @@ fn search_cache_vehicles_with_id_lookup(
             if !target_vehicle_ids.contains(&vid) {
                 continue;
             }
-            let norm_num = extract_vehicle_norm_num(inner);
-            if !seen_vehicle_keys.insert((Some(vid), norm_num)) {
-                continue;
-            }
             if let Some(cid) = res.id {
                 seen_cache_ids.insert(cid);
             }
-            results.push((res.id, inner.clone()));
+            matched_resources.push((*res).clone());
         }
     }
 
-    results
+    // Deduplicate by VehicleId / normalized VehicleNumber / resource id, keeping only the latest record
+    let deduped = crate::cache::Cache::deduplicate_vehicle_resources(matched_resources);
+    deduped
+        .into_iter()
+        .filter_map(|res| {
+            let id = res.id;
+            res.inner_content.map(|inner| (id, inner))
+        })
+        .collect()
 }
 
 fn insert_vehicle_flags(
@@ -704,27 +706,21 @@ fn merge_and_annotate_vehicle_results(
             "Code": 200,
             "Message": "Cache search results (TQMS unavailable)",
             "Data": {
-                "Data": cache_results.clone(),
                 "cache_results": cache_results,
                 "tqms_results": []
             }
         }));
     }
 
-    let mut combined: Vec<Value> = Vec::with_capacity(cache_results.len() + tqms_results.len());
-    combined.extend(cache_results.iter().cloned());
-    combined.extend(tqms_results.iter().cloned());
-
     let mut payload = tqms_payload.unwrap_or_else(|| json!({ "Code": 200, "Data": {} }));
     if let Some(data_obj) = payload.get_mut("Data").and_then(Value::as_object_mut) {
-        data_obj.insert("Data".to_string(), Value::Array(combined));
+        data_obj.remove("Data");
         data_obj.insert("cache_results".to_string(), Value::Array(cache_results));
         data_obj.insert("tqms_results".to_string(), Value::Array(tqms_results));
     } else if let Some(root_obj) = payload.as_object_mut() {
         root_obj.insert(
             "Data".to_string(),
             json!({
-                "Data": combined,
                 "cache_results": cache_results,
                 "tqms_results": tqms_results
             }),
@@ -1351,11 +1347,10 @@ mod tests {
         let merged = merge_and_annotate_vehicle_results(&cache, &params, Ok(tqms_response))
             .expect("expected merged search response");
 
-        let data_items = merged
-            .pointer("/Data/Data")
-            .and_then(Value::as_array)
-            .expect("expected Data.Data array");
-        assert_eq!(data_items.len(), 2, "must display both cache hit (via VehicleId) and TQMS hit");
+        assert!(
+            merged.pointer("/Data/Data").is_none(),
+            "redundant Data.Data array must not be present"
+        );
 
         let cache_items = merged
             .pointer("/Data/cache_results")
@@ -1405,13 +1400,22 @@ mod tests {
         )
         .expect("cache hit should still return 200-equivalent payload");
 
-        let items = merged.pointer("/Data/Data").and_then(Value::as_array).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["VehicleId"], 36048);
-        assert_eq!(items[0]["is_in_billing"], true);
-        assert_eq!(items[0]["is_in_tqms"], false);
+        assert!(merged.pointer("/Data/Data").is_none());
+        let cache_items = merged
+            .pointer("/Data/cache_results")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(cache_items.len(), 1);
+        assert_eq!(cache_items[0]["VehicleId"], 36048);
+        assert_eq!(cache_items[0]["is_in_billing"], true);
+        assert_eq!(cache_items[0]["is_in_tqms"], false);
+        assert!(merged
+            .pointer("/Data/tqms_results")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
 
-        // Searching same number as both cache and TQMS shows both results in Data.Data
+        // Searching same number as both cache and TQMS returns cache_results + tqms_results without Data.Data
         let params_by_num = VehicleSearchParameters {
             page: Some(1),
             page_size: Some(20),
@@ -1428,10 +1432,46 @@ mod tests {
         });
         let merged_both = merge_and_annotate_vehicle_results(&cache, &params_by_num, Ok(tqms_same))
             .expect("expected both cache and TQMS results");
+        assert!(merged_both.pointer("/Data/Data").is_none());
         assert_eq!(
-            merged_both.pointer("/Data/Data").and_then(Value::as_array).unwrap().len(),
-            2
+            merged_both
+                .pointer("/Data/cache_results")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            1
         );
+        assert_eq!(
+            merged_both
+                .pointer("/Data/tqms_results")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Even if multiple duplicate vehicle resources exist in the underlying map with the same VehicleId,
+        // only the latest one is returned in cache_results.
+        let mut stale_res = make_cached_vehicle(5, 36048, "KA-02-GHA-0006", "Old Owner");
+        stale_res.external_content = Some(json!({ "createdTime": "2026-01-01T00:00:00Z" }));
+        let mut latest_res = make_cached_vehicle(12, 36048, "KA-02-GHA-0006", "Latest Owner");
+        latest_res.external_content = Some(json!({ "createdTime": "2026-11-18T00:00:00Z" }));
+        {
+            let map = cache.cache.get_mut(&VehicleResource).unwrap();
+            map.clear();
+            map.insert(5, stale_res);
+            map.insert(12, latest_res);
+        }
+        let merged_latest =
+            merge_and_annotate_vehicle_results(&cache, &params_by_id, Err(anyhow::anyhow!("offline")))
+                .unwrap();
+        let deduped_cache_items = merged_latest
+            .pointer("/Data/cache_results")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(deduped_cache_items.len(), 1);
+        assert_eq!(deduped_cache_items[0]["cache_id"], 12);
+        assert_eq!(deduped_cache_items[0]["Owners"][0]["Name"], "Latest Owner");
     }
 
     struct MockDbState {
@@ -1769,8 +1809,7 @@ mod tests {
         };
         let cache = s_data.cache.read().await;
         let merged = merge_and_annotate_vehicle_results(&cache, &params, Ok(tqms_payload)).unwrap();
-        let data = merged.pointer("/Data/Data").and_then(Value::as_array).unwrap();
-        assert_eq!(data.len(), 2);
+        assert!(merged.pointer("/Data/Data").is_none());
         assert_eq!(merged.pointer("/Data/cache_results/0/cache_id").unwrap(), 9001);
         assert_eq!(merged.pointer("/Data/tqms_results/0/is_in_billing").unwrap(), true);
     }
