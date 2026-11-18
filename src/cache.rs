@@ -1,6 +1,6 @@
 use crate::resource::{DatabaseResource, ResourceName};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct Cache {
@@ -166,19 +166,124 @@ impl Cache {
         (matches, found_count)
     }
 
-    pub fn write(&mut self, resource_name: ResourceName, id: i32, resource: DatabaseResource) {
-        self.cache.entry(resource_name).or_default().insert(id, resource);
+    fn copy_metadata_if_missing(target: &mut DatabaseResource, source: &DatabaseResource) {
+        let Some(source_meta) = source
+            .inner_content
+            .as_ref()
+            .and_then(|s| s.get("metadata"))
+            .filter(|m| !m.is_null())
+        else {
+            return;
+        };
+
+        if let Some(Value::Object(ref mut map)) = target.inner_content {
+            let has_metadata = map.get("metadata").is_some_and(|m| !m.is_null());
+            if !has_metadata {
+                map.insert("metadata".to_string(), source_meta.clone());
+            }
+        }
+    }
+
+    #[inline]
+    fn vehicle_record_rank(
+        resource: &DatabaseResource,
+        fallback_id: Option<i32>,
+    ) -> (Option<chrono::DateTime<chrono::Utc>>, Option<i32>) {
+        (Self::extract_created_time(resource), resource.id.or(fallback_id))
+    }
+
+    pub fn write(&mut self, resource_name: ResourceName, id: i32, mut resource: DatabaseResource) {
+        if resource_name != ResourceName::VehicleResource {
+            self.cache.entry(resource_name).or_default().insert(id, resource);
+            return;
+        }
+
+        if resource.id.is_none() {
+            resource.id = Some(id);
+        }
+
+        let incoming_vid = resource
+            .inner_content
+            .as_ref()
+            .and_then(Self::extract_vehicle_id);
+        let incoming_vnum = resource
+            .inner_content
+            .as_ref()
+            .and_then(Self::extract_normalized_vehicle_number);
+
+        let entry = self.cache.entry(resource_name).or_default();
+
+        let matching_keys: Vec<i32> = entry
+            .iter()
+            .filter_map(|(&existing_key, existing_res)| {
+                if existing_key == id {
+                    return Some(existing_key);
+                }
+                let inner = existing_res.inner_content.as_ref()?;
+                let same_id = incoming_vid
+                    .as_ref()
+                    .is_some_and(|vid| Self::extract_vehicle_id(inner).as_ref() == Some(vid));
+                let same_num = incoming_vnum.as_ref().is_some_and(|vnum| {
+                    Self::extract_normalized_vehicle_number(inner).as_ref() == Some(vnum)
+                });
+                if same_id || same_num {
+                    Some(existing_key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if matching_keys.is_empty() {
+            entry.insert(id, resource);
+            return;
+        }
+
+        let mut candidates: Vec<(
+            (Option<chrono::DateTime<chrono::Utc>>, Option<i32>),
+            usize,
+            i32,
+            DatabaseResource,
+        )> = Vec::with_capacity(matching_keys.len() + 1);
+
+        // Highest tie-breaker index on incoming ensures incoming wins when rank ties with existing.
+        let incoming_rank = Self::vehicle_record_rank(&resource, Some(id));
+        candidates.push((incoming_rank, 1, id, resource));
+
+        for key in matching_keys {
+            if let Some(existing) = entry.remove(&key) {
+                let rank = Self::vehicle_record_rank(&existing, Some(key));
+                candidates.push((rank, 0, key, existing));
+            }
+        }
+
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        let mut iter = candidates.into_iter();
+        if let Some((_, _, winner_key, mut winner_res)) = iter.next() {
+            for (_, _, _, other) in iter {
+                Self::copy_metadata_if_missing(&mut winner_res, &other);
+            }
+            entry.insert(winner_key, winner_res);
+        }
     }
 
     fn extract_vehicle_id(inner: &Value) -> Option<String> {
-        inner.get("VehicleId").and_then(|id| {
-            id.as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .or_else(|| id.as_i64().map(|n| n.to_string()))
-                .or_else(|| id.as_u64().map(|n| n.to_string()))
-        })
+        for key in ["VehicleId", "vehicleId", "id"] {
+            if let Some(id) = inner.get(key) {
+                let parsed = id
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .or_else(|| id.as_i64().map(|n| n.to_string()))
+                    .or_else(|| id.as_u64().map(|n| n.to_string()));
+                if parsed.is_some() {
+                    return parsed;
+                }
+            }
+        }
+        None
     }
 
     fn normalize_vehicle_number(raw: &str) -> Option<String> {
@@ -219,44 +324,28 @@ impl Cache {
             .map(|dt| dt.with_timezone(&chrono::Utc))
     }
 
-    /// Deduplicates `VehicleResource` entries by unique `VehicleId` and normalized `VehicleNumber`,
-    /// selecting the latest record by `external_content.createdTime` (missing `createdTime` is
-    /// treated as oldest) and copying a non-null `metadata` field from any matching duplicate.
+    /// Deduplicates `VehicleResource` entries assuming records sharing either `VehicleId` or
+    /// normalized `VehicleNumber` represent the same vehicle, keeping the latest record by
+    /// `external_content.createdTime` (missing `createdTime` is treated as oldest) and copying a
+    /// non-null `metadata` field from any matching duplicate.
     pub fn deduplicate_vehicle_resources(
-        mut resources: Vec<DatabaseResource>,
+        resources: Vec<DatabaseResource>,
     ) -> Vec<DatabaseResource> {
-        resources.sort_by(|a, b| {
-            let time_a = Self::extract_created_time(a);
-            let time_b = Self::extract_created_time(b);
-            time_b.cmp(&time_a).then_with(|| b.id.cmp(&a.id))
-        });
+        let mut ranked: Vec<(
+            (Option<chrono::DateTime<chrono::Utc>>, Option<i32>),
+            DatabaseResource,
+        )> = resources
+            .into_iter()
+            .map(|res| (Self::vehicle_record_rank(&res, None), res))
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-        let mut metadata_by_id: HashMap<String, Value> = HashMap::new();
-        let mut metadata_by_number: HashMap<String, Value> = HashMap::new();
+        let cap = ranked.len();
+        let mut id_to_idx: HashMap<String, usize> = HashMap::with_capacity(cap);
+        let mut number_to_idx: HashMap<String, usize> = HashMap::with_capacity(cap);
+        let mut unique_resources: Vec<DatabaseResource> = Vec::with_capacity(cap);
 
-        for resource in &resources {
-            let Some(inner) = &resource.inner_content else {
-                continue;
-            };
-            let Some(metadata) = inner.get("metadata").filter(|m| !m.is_null()) else {
-                continue;
-            };
-
-            if let Some(v_id) = Self::extract_vehicle_id(inner) {
-                metadata_by_id.entry(v_id).or_insert_with(|| metadata.clone());
-            }
-            if let Some(v_num) = Self::extract_normalized_vehicle_number(inner) {
-                metadata_by_number
-                    .entry(v_num)
-                    .or_insert_with(|| metadata.clone());
-            }
-        }
-
-        let mut seen_ids: HashSet<String> = HashSet::new();
-        let mut seen_numbers: HashSet<String> = HashSet::new();
-        let mut unique_resources = Vec::with_capacity(resources.len());
-
-        for mut resource in resources {
+        for (_, resource) in ranked {
             let (v_id, v_num) = match &resource.inner_content {
                 Some(inner) => (
                     Self::extract_vehicle_id(inner),
@@ -265,35 +354,29 @@ impl Cache {
                 None => (None, None),
             };
 
-            let is_duplicate_id = v_id.as_ref().is_some_and(|id| seen_ids.contains(id));
-            let is_duplicate_num = v_num.as_ref().is_some_and(|num| seen_numbers.contains(num));
+            let existing_idx = v_id
+                .as_ref()
+                .and_then(|id| id_to_idx.get(id).copied())
+                .or_else(|| v_num.as_ref().and_then(|num| number_to_idx.get(num).copied()));
 
-            if is_duplicate_id || is_duplicate_num {
+            if let Some(idx) = existing_idx {
+                if let Some(id) = v_id {
+                    id_to_idx.entry(id).or_insert(idx);
+                }
+                if let Some(num) = v_num {
+                    number_to_idx.entry(num).or_insert(idx);
+                }
+                Self::copy_metadata_if_missing(&mut unique_resources[idx], &resource);
                 continue;
             }
 
-            if let Some(id) = &v_id {
-                seen_ids.insert(id.clone());
+            let idx = unique_resources.len();
+            if let Some(id) = v_id {
+                id_to_idx.insert(id, idx);
             }
-            if let Some(num) = &v_num {
-                seen_numbers.insert(num.clone());
+            if let Some(num) = v_num {
+                number_to_idx.insert(num, idx);
             }
-
-            if let Some(Value::Object(ref mut map)) = resource.inner_content {
-                let has_metadata = map.get("metadata").is_some_and(|m| !m.is_null());
-                if !has_metadata {
-                    let copied_metadata = v_id
-                        .as_ref()
-                        .and_then(|id| metadata_by_id.get(id))
-                        .or_else(|| v_num.as_ref().and_then(|num| metadata_by_number.get(num)))
-                        .cloned();
-
-                    if let Some(metadata) = copied_metadata {
-                        map.insert("metadata".to_string(), metadata);
-                    }
-                }
-            }
-
             unique_resources.push(resource);
         }
 
@@ -629,5 +712,73 @@ mod tests {
         let inner = deduped[0].inner_content.as_ref().unwrap();
         assert_eq!(inner["Owners"][0]["Name"], "Latest Owner");
         assert_eq!(inner["metadata"]["blacklistedReason"], "legacy");
+    }
+
+    #[test]
+    fn test_cache_write_vehicle_same_id_or_same_number_keeps_only_latest() {
+        let mut cache = Cache::new();
+
+        // 1. Write older record with blacklist metadata (no createdTime -> oldest)
+        let mut older = make_sample_vehicle(1, "LU-548-GA-0001", "Old Owner", 36017);
+        if let Some(Value::Object(ref mut map)) = older.inner_content {
+            map.insert(
+                "metadata".to_string(),
+                serde_json::json!({ "isBlacklisted": true }),
+            );
+        }
+        cache.write(ResourceName::VehicleResource, 1, older);
+
+        // 2. Write newer record with SAME VehicleId 36017 but different DB id (2) and updated number
+        let mut newer = make_sample_vehicle(2, "LU-548-GA-6236", "Latest Owner", 36017);
+        newer.external_content = Some(serde_json::json!({ "createdTime": "2026-11-05T11:09:07Z" }));
+        cache.write(ResourceName::VehicleResource, 2, newer);
+
+        let all = cache.read_all(ResourceName::VehicleResource).unwrap();
+        assert_eq!(all.len(), 1, "only latest vehicle must remain in cache");
+        assert_eq!(all[0].id, Some(2));
+        let inner = all[0].inner_content.as_ref().unwrap();
+        assert_eq!(inner["Owners"][0]["Name"], "Latest Owner");
+        assert_eq!(inner["metadata"]["isBlacklisted"], true);
+
+        // 3. Writing an OLDER record with SAME normalized VehicleNumber must NOT overwrite newer record,
+        //    and if the older record adds metadata while winner lacks one, winner receives it cleanly.
+        let mut stale_same_num = make_sample_vehicle(3, "lu 548 ga 6236", "Stale Owner", 99999);
+        stale_same_num.external_content =
+            Some(serde_json::json!({ "createdTime": "2026-11-01T00:00:00Z" }));
+        cache.write(ResourceName::VehicleResource, 3, stale_same_num);
+
+        let after_stale = cache.read_all(ResourceName::VehicleResource).unwrap();
+        assert_eq!(after_stale.len(), 1);
+        assert_eq!(after_stale[0].id, Some(2));
+        assert_eq!(
+            after_stale[0].inner_content.as_ref().unwrap()["Owners"][0]["Name"],
+            "Latest Owner"
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_vehicles_transitive_id_and_number_match() {
+        let mut r1 = make_sample_vehicle(1, "NEW-001", "Newest Owner", 100);
+        r1.external_content = Some(serde_json::json!({ "createdTime": "2026-11-05T10:00:00Z" }));
+
+        let mut r2 = make_sample_vehicle(2, "OLD-001", "Middle Owner", 100);
+        r2.external_content = Some(serde_json::json!({ "createdTime": "2026-11-03T10:00:00Z" }));
+
+        let mut r3 = make_sample_vehicle(3, "OLD-001", "Oldest Transitive Owner", 200);
+        r3.external_content = Some(serde_json::json!({ "createdTime": "2026-11-01T10:00:00Z" }));
+        if let Some(Value::Object(ref mut map)) = r3.inner_content {
+            map.insert(
+                "metadata".to_string(),
+                serde_json::json!({ "tags": ["blacklisted"] }),
+            );
+        }
+
+        let deduped = Cache::deduplicate_vehicle_resources(vec![r3, r2, r1]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, Some(1));
+        assert_eq!(
+            deduped[0].inner_content.as_ref().unwrap()["metadata"]["tags"][0],
+            "blacklisted"
+        );
     }
 }

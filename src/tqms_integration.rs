@@ -32,7 +32,7 @@ impl Status {
 }
 
 // Sample of search url /api/v1/cts/vehicle/search?page=1&pageSize=20&vehicleNumber=&ownerName=&sanghBranch=&status=
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleSearchParameters {
     pub page: Option<u32>,
     pub page_size: Option<u32>,
@@ -221,6 +221,519 @@ impl TQMSClient {
     }
 }
 
+fn normalize_vehicle_num(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().filter(|c| c.is_alphanumeric()) {
+        for upper in c.to_uppercase() {
+            out.push(upper);
+        }
+    }
+    out
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let h = haystack.trim();
+    let n = needle.trim();
+    if n.is_empty() {
+        return true;
+    }
+    if h.is_ascii() && n.is_ascii() {
+        h.as_bytes()
+            .windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n.as_bytes()))
+    } else {
+        h.to_lowercase().contains(&n.to_lowercase())
+    }
+}
+
+fn extract_vehicle_id_str(v: &Value) -> Option<String> {
+    for key in ["VehicleId", "vehicleId", "id"] {
+        if let Some(val) = v.get(key) {
+            if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(s.to_string());
+            }
+            if let Some(n) = val.as_i64() {
+                return Some(n.to_string());
+            }
+            if let Some(n) = val.as_u64() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_vehicle_norm_num(inner: &Value) -> String {
+    inner
+        .get("VehicleNumber")
+        .or_else(|| inner.get("vehicleNumber"))
+        .or_else(|| inner.get("NormalizedVehicleNumber"))
+        .or_else(|| inner.get("normalizedVehicleNumber"))
+        .and_then(Value::as_str)
+        .map(normalize_vehicle_num)
+        .unwrap_or_default()
+}
+
+fn matches_vehicle_number_field(val: Option<&Value>, q_raw: &str, q_norm: &str) -> bool {
+    let Some(s) = val.and_then(Value::as_str) else {
+        return false;
+    };
+    if contains_case_insensitive(s, q_raw) {
+        return true;
+    }
+    !q_norm.is_empty() && normalize_vehicle_num(s).contains(q_norm)
+}
+
+fn vehicle_matches_search_params(
+    inner: &Value,
+    params: &VehicleSearchParameters,
+    query_norm_num: &str,
+) -> bool {
+    if let Some(q_raw) = params
+        .vehicle_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let num_match = matches_vehicle_number_field(inner.get("VehicleNumber"), q_raw, query_norm_num)
+            || matches_vehicle_number_field(
+                inner.get("NormalizedVehicleNumber"),
+                q_raw,
+                query_norm_num,
+            );
+        let id_match = extract_vehicle_id_str(inner).is_some_and(|id| id == q_raw);
+        if !num_match && !id_match {
+            return false;
+        }
+    }
+
+    if let Some(q_owner) = params
+        .owner_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let owner_match = inner
+            .get("Owners")
+            .or_else(|| inner.get("owners"))
+            .and_then(Value::as_array)
+            .is_some_and(|owners| {
+                owners.iter().any(|o| {
+                    o.get("Name")
+                        .or_else(|| o.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| contains_case_insensitive(name, q_owner))
+                })
+            });
+        if !owner_match {
+            return false;
+        }
+    }
+
+    if let Some(q_branch) = params
+        .sangh_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let top_branch = inner
+            .get("SanghBranch")
+            .or_else(|| inner.get("sanghBranch"))
+            .and_then(Value::as_str)
+            .is_some_and(|b| contains_case_insensitive(b, q_branch));
+        let owner_branch = inner
+            .get("Owners")
+            .or_else(|| inner.get("owners"))
+            .and_then(Value::as_array)
+            .is_some_and(|owners| {
+                owners.iter().any(|o| {
+                    o.get("SanghBranch")
+                        .or_else(|| o.get("sanghBranch"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|b| contains_case_insensitive(b, q_branch))
+                })
+            });
+        if !top_branch && !owner_branch {
+            return false;
+        }
+    }
+
+    if let Some(ref q_status) = params.status {
+        let status_match = inner
+            .pointer("/Registration/Status")
+            .or_else(|| inner.get("status"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case(q_status.as_str()));
+        if !status_match {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn search_cache_vehicles_with_id_lookup(
+    cache: &crate::cache::Cache,
+    params: &VehicleSearchParameters,
+    tqms_items: &[Value],
+) -> Vec<(Option<i32>, Value)> {
+    let Ok(cached_vehicles) = cache.read_all(VehicleResource) else {
+        return Vec::new();
+    };
+
+    let query_norm_num = params
+        .vehicle_number
+        .as_deref()
+        .map(normalize_vehicle_num)
+        .unwrap_or_default();
+
+    let mut results: Vec<(Option<i32>, Value)> = Vec::new();
+    let mut seen_cache_ids: HashSet<i32> = HashSet::new();
+    let mut seen_vehicle_keys: HashSet<(Option<String>, String)> = HashSet::new();
+    let mut target_vehicle_ids: HashSet<String> = HashSet::new();
+
+    if let Some(q_raw) = params
+        .vehicle_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        target_vehicle_ids.insert(q_raw.to_string());
+    }
+    for item in tqms_items {
+        if let Some(vid) = extract_vehicle_id_str(item) {
+            target_vehicle_ids.insert(vid);
+        }
+    }
+
+    // Pass 1: search cache directly with the provided search parameters
+    for res in &cached_vehicles {
+        let Some(inner) = &res.inner_content else {
+            continue;
+        };
+        if vehicle_matches_search_params(inner, params, &query_norm_num) {
+            let vid = extract_vehicle_id_str(inner);
+            let norm_num = extract_vehicle_norm_num(inner);
+            if let Some(ref id_str) = vid {
+                target_vehicle_ids.insert(id_str.clone());
+            }
+            if let Some(cid) = res.id {
+                seen_cache_ids.insert(cid);
+            }
+            seen_vehicle_keys.insert((vid, norm_num));
+            results.push((res.id, inner.clone()));
+        }
+    }
+
+    // Pass 2: when searched by vehicle number, also search cache by matched VehicleId(s)
+    if params
+        .vehicle_number
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        && !target_vehicle_ids.is_empty()
+    {
+        for res in &cached_vehicles {
+            if res.id.is_some_and(|cid| seen_cache_ids.contains(&cid)) {
+                continue;
+            }
+            let Some(inner) = &res.inner_content else {
+                continue;
+            };
+            let Some(vid) = extract_vehicle_id_str(inner) else {
+                continue;
+            };
+            if !target_vehicle_ids.contains(&vid) {
+                continue;
+            }
+            let norm_num = extract_vehicle_norm_num(inner);
+            if !seen_vehicle_keys.insert((Some(vid), norm_num)) {
+                continue;
+            }
+            if let Some(cid) = res.id {
+                seen_cache_ids.insert(cid);
+            }
+            results.push((res.id, inner.clone()));
+        }
+    }
+
+    results
+}
+
+fn insert_vehicle_flags(
+    item: &mut Value,
+    source: &str,
+    is_in_billing: bool,
+    is_in_tqms: bool,
+    cache_id: Option<i32>,
+) {
+    if let Value::Object(map) = item {
+        map.insert("source".to_string(), Value::String(source.to_string()));
+        map.insert("is_in_billing".to_string(), Value::Bool(is_in_billing));
+        map.insert("is_in_tqms".to_string(), Value::Bool(is_in_tqms));
+        if let Some(cid) = cache_id {
+            map.insert("cache_id".to_string(), json!(cid));
+        }
+    }
+}
+
+fn find_matching_vehicle_resource<'a, I>(
+    resources: I,
+    vid: Option<&str>,
+    norm_num: &str,
+) -> Option<&'a DatabaseResource>
+where
+    I: IntoIterator<Item = &'a DatabaseResource>,
+{
+    resources.into_iter().find(|res| {
+        let Some(inner) = res.inner_content.as_ref() else {
+            return false;
+        };
+        let id_match = vid.is_some_and(|v| extract_vehicle_id_str(inner).as_deref() == Some(v));
+        let num_match = !norm_num.is_empty() && extract_vehicle_norm_num(inner) == norm_num;
+        id_match || num_match
+    })
+}
+
+fn clean_tqms_vehicle_value(item: &Value) -> Value {
+    let mut cleaned = item.clone();
+    if let Some(map) = cleaned.as_object_mut() {
+        for key in ["source", "is_in_billing", "is_in_tqms", "cache_id"] {
+            map.remove(key);
+        }
+    }
+    cleaned
+}
+
+fn is_vehicle_object(val: &Value) -> bool {
+    val.is_object()
+        && (extract_vehicle_id_str(val).is_some() || !extract_vehicle_norm_num(val).is_empty())
+}
+
+fn extract_tqms_vehicle_items(payload: &Value) -> Vec<Value> {
+    if let Some(arr) = payload.pointer("/Data/Data").and_then(Value::as_array) {
+        return arr.iter().filter(|v| is_vehicle_object(v)).cloned().collect();
+    }
+    if let Some(data) = payload.get("Data") {
+        if let Some(arr) = data.as_array() {
+            return arr.iter().filter(|v| is_vehicle_object(v)).cloned().collect();
+        }
+        if is_vehicle_object(data) {
+            return vec![data.clone()];
+        }
+    }
+    if is_vehicle_object(payload) {
+        return vec![payload.clone()];
+    }
+    Vec::new()
+}
+
+/// Ensures every TQMS vehicle exists in either `s_data.cache` or `s_data.db`
+/// (matched by `VehicleId` or normalized `VehicleNumber`). Vehicles present in DB
+/// but missing from cache are synced into cache; vehicles absent from both DB and cache
+/// are created as new `VehicleResource` records in DB and written into cache.
+pub async fn ensure_tqms_vehicles_in_cache_and_db(
+    s_data: &ServerData,
+    tqms_items: &[Value],
+) -> Vec<DatabaseResource> {
+    if tqms_items.is_empty() {
+        return Vec::new();
+    }
+
+    let uncached_items: Vec<Value> = {
+        let cache = s_data.cache.read().await;
+        let cached = cache.read_all(VehicleResource).unwrap_or_default();
+
+        tqms_items
+            .iter()
+            .filter_map(|item| {
+                let vid = extract_vehicle_id_str(item);
+                let norm_num = extract_vehicle_norm_num(item);
+                if vid.is_none() && norm_num.is_empty() {
+                    return None;
+                }
+                if find_matching_vehicle_resource(cached.iter().copied(), vid.as_deref(), &norm_num)
+                    .is_some()
+                {
+                    None
+                } else {
+                    Some(clean_tqms_vehicle_value(item))
+                }
+            })
+            .collect()
+    };
+
+    if uncached_items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut known_db_vehicles = s_data
+        .db
+        .read_all_resource(VehicleResource)
+        .await
+        .unwrap_or_default();
+
+    let mut created_resources = Vec::new();
+
+    for clean_item in uncached_items {
+        let vid = extract_vehicle_id_str(&clean_item);
+        let norm_num = extract_vehicle_norm_num(&clean_item);
+
+        if let Some(existing_db_res) = find_matching_vehicle_resource(
+            known_db_vehicles.iter(),
+            vid.as_deref(),
+            &norm_num,
+        )
+        .cloned()
+        {
+            if let Some(db_id) = existing_db_res.id {
+                s_data
+                    .cache
+                    .write()
+                    .await
+                    .write(VehicleResource, db_id, existing_db_res);
+            }
+            continue;
+        }
+
+        let now_str = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut new_res = DatabaseResource {
+            id: None,
+            resource_name: Some(VehicleResource),
+            inner_content: Some(clean_item),
+            external_content: Some(json!({ "createdTime": now_str })),
+        };
+
+        match s_data
+            .db
+            .create_resource(VehicleResource, new_res.clone())
+            .await
+        {
+            Ok(created_id) => {
+                new_res.id = Some(created_id);
+                s_data
+                    .cache
+                    .write()
+                    .await
+                    .write(VehicleResource, created_id, new_res.clone());
+                known_db_vehicles.push(new_res.clone());
+                created_resources.push(new_res);
+            }
+            Err(err) => {
+                eprintln!("Failed to create TQMS vehicle resource in DB: {err:?}");
+            }
+        }
+    }
+
+    created_resources
+}
+
+fn merge_and_annotate_vehicle_results(
+    cache: &crate::cache::Cache,
+    params: &VehicleSearchParameters,
+    tqms_result: Result<Value>,
+) -> Result<Value> {
+    let mut tqms_payload = None;
+    let mut tqms_items: Vec<Value> = Vec::new();
+    let mut tqms_err = None;
+
+    match tqms_result {
+        Ok(mut val) => {
+            if let Some(Value::Array(arr)) = val.pointer_mut("/Data/Data").map(Value::take) {
+                tqms_items = arr;
+            }
+            tqms_payload = Some(val);
+        }
+        Err(err) => {
+            tqms_err = Some(err);
+        }
+    }
+
+    let raw_cache_hits = search_cache_vehicles_with_id_lookup(cache, params, &tqms_items);
+
+    let mut tqms_ids: HashSet<String> = HashSet::with_capacity(tqms_items.len());
+    let mut tqms_norms: HashSet<String> = HashSet::with_capacity(tqms_items.len());
+    for item in &tqms_items {
+        if let Some(vid) = extract_vehicle_id_str(item) {
+            tqms_ids.insert(vid);
+        }
+        let norm = extract_vehicle_norm_num(item);
+        if !norm.is_empty() {
+            tqms_norms.insert(norm);
+        }
+    }
+
+    let mut cache_ids: HashSet<String> = HashSet::with_capacity(raw_cache_hits.len());
+    let mut cache_norms: HashSet<String> = HashSet::with_capacity(raw_cache_hits.len());
+    for (_, item) in &raw_cache_hits {
+        if let Some(vid) = extract_vehicle_id_str(item) {
+            cache_ids.insert(vid);
+        }
+        let norm = extract_vehicle_norm_num(item);
+        if !norm.is_empty() {
+            cache_norms.insert(norm);
+        }
+    }
+
+    let mut cache_results: Vec<Value> = Vec::with_capacity(raw_cache_hits.len());
+    for (cache_id, mut item) in raw_cache_hits {
+        let in_tqms = extract_vehicle_id_str(&item).is_some_and(|vid| tqms_ids.contains(&vid))
+            || {
+                let norm = extract_vehicle_norm_num(&item);
+                !norm.is_empty() && tqms_norms.contains(&norm)
+            };
+        insert_vehicle_flags(&mut item, "cache", true, in_tqms, cache_id);
+        cache_results.push(item);
+    }
+
+    let mut tqms_results: Vec<Value> = Vec::with_capacity(tqms_items.len());
+    for mut item in tqms_items {
+        let in_billing = extract_vehicle_id_str(&item).is_some_and(|vid| cache_ids.contains(&vid))
+            || {
+                let norm = extract_vehicle_norm_num(&item);
+                !norm.is_empty() && cache_norms.contains(&norm)
+            };
+        insert_vehicle_flags(&mut item, "tqms", in_billing, true, None);
+        tqms_results.push(item);
+    }
+
+    if let Some(err) = tqms_err {
+        if cache_results.is_empty() {
+            return Err(err);
+        }
+        return Ok(json!({
+            "Code": 200,
+            "Message": "Cache search results (TQMS unavailable)",
+            "Data": {
+                "Data": cache_results.clone(),
+                "cache_results": cache_results,
+                "tqms_results": []
+            }
+        }));
+    }
+
+    let mut combined: Vec<Value> = Vec::with_capacity(cache_results.len() + tqms_results.len());
+    combined.extend(cache_results.iter().cloned());
+    combined.extend(tqms_results.iter().cloned());
+
+    let mut payload = tqms_payload.unwrap_or_else(|| json!({ "Code": 200, "Data": {} }));
+    if let Some(data_obj) = payload.get_mut("Data").and_then(Value::as_object_mut) {
+        data_obj.insert("Data".to_string(), Value::Array(combined));
+        data_obj.insert("cache_results".to_string(), Value::Array(cache_results));
+        data_obj.insert("tqms_results".to_string(), Value::Array(tqms_results));
+    } else if let Some(root_obj) = payload.as_object_mut() {
+        root_obj.insert(
+            "Data".to_string(),
+            json!({
+                "Data": combined,
+                "cache_results": cache_results,
+                "tqms_results": tqms_results
+            }),
+        );
+    }
+
+    Ok(payload)
+}
+
 pub async fn search_vehicles(
     vehicle_search_parameters: web::Json<VehicleSearchParameters>,
     s_data: web::Data<Arc<ServerData>>,
@@ -230,10 +743,15 @@ pub async fn search_vehicles(
         return HttpResponse::BadRequest().body("At least one search parameter must be provided");
     }
 
-    //Search in vehicle cache first and if found send both cache and tqms result, if not found search in tqms and send result and insert a flag that is in billing but not in tqms
+    let tqms_result = s_data.tqms_client.search_vehicles(params.clone()).await;
+    if let Ok(ref val) = tqms_result {
+        let tqms_items = extract_tqms_vehicle_items(val);
+        ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+    }
 
-    
-    match s_data.tqms_client.search_vehicles(params).await {
+    let cache = s_data.cache.read().await;
+
+    match merge_and_annotate_vehicle_results(&cache, &params, tqms_result) {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(e) => HttpResponse::InternalServerError()
             .body(format!("Failed to search vehicles: {e:?}")),
@@ -759,8 +1277,603 @@ pub async fn get_vehicle_details(
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     match s_data.tqms_client.get_vehicle_details(&vehicle_number).await {
-        Ok(res) => HttpResponse::Ok().json(res),
+        Ok(res) => {
+            let tqms_items = extract_tqms_vehicle_items(&res);
+            ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+            HttpResponse::Ok().json(res)
+        }
         Err(e) => HttpResponse::InternalServerError()
             .body(format!("Failed to get vehicle details: {e:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::Cache;
+
+    fn make_cached_vehicle(id: i32, vehicle_id: i64, vehicle_number: &str, owner: &str) -> DatabaseResource {
+        DatabaseResource {
+            id: Some(id),
+            resource_name: Some(VehicleResource),
+            inner_content: Some(json!({
+                "VehicleId": vehicle_id,
+                "VehicleNumber": vehicle_number,
+                "NormalizedVehicleNumber": vehicle_number,
+                "Registration": { "Status": "ACTIVE" },
+                "Owners": [{ "Name": owner, "SanghBranch": "Main Branch" }]
+            })),
+            external_content: None,
+        }
+    }
+
+    #[test]
+    fn test_search_vehicles_by_number_also_finds_by_vehicle_id_in_cache_and_displays_both() {
+        let mut cache = Cache::new();
+        // Cached vehicle shares VehicleId 36017 with TQMS result even with an older number
+        cache.write(
+            VehicleResource,
+            6390,
+            make_cached_vehicle(6390, 36017, "LU-548-GA-0001", "Cached Owner"),
+        );
+        // Second vehicle matching directly by normalized vehicle number
+        cache.write(
+            VehicleResource,
+            6391,
+            make_cached_vehicle(6391, 99999, "BA-01-PA-1234", "Another Owner"),
+        );
+
+        let params = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("LU-548-GA-6236".to_string()),
+            owner_name: None,
+            sangh_branch: None,
+            status: None,
+        };
+
+        let tqms_response = json!({
+            "Code": 200,
+            "Message": "Success",
+            "Data": {
+                "Data": [
+                    {
+                        "VehicleId": 36017,
+                        "VehicleNumber": "LU-548-GA-6236",
+                        "Registration": { "Status": "ACTIVE" },
+                        "Owners": [{ "Name": "TQMS Owner" }]
+                    }
+                ],
+                "Paging": { "Page": 1, "TotalItems": 1 }
+            }
+        });
+
+        let merged = merge_and_annotate_vehicle_results(&cache, &params, Ok(tqms_response))
+            .expect("expected merged search response");
+
+        let data_items = merged
+            .pointer("/Data/Data")
+            .and_then(Value::as_array)
+            .expect("expected Data.Data array");
+        assert_eq!(data_items.len(), 2, "must display both cache hit (via VehicleId) and TQMS hit");
+
+        let cache_items = merged
+            .pointer("/Data/cache_results")
+            .and_then(Value::as_array)
+            .unwrap();
+        let tqms_items = merged
+            .pointer("/Data/tqms_results")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(cache_items.len(), 1);
+        assert_eq!(tqms_items.len(), 1);
+
+        assert_eq!(cache_items[0]["VehicleId"], 36017);
+        assert_eq!(cache_items[0]["source"], "cache");
+        assert_eq!(cache_items[0]["cache_id"], 6390);
+        assert_eq!(cache_items[0]["is_in_billing"], true);
+        assert_eq!(cache_items[0]["is_in_tqms"], true);
+
+        assert_eq!(tqms_items[0]["VehicleId"], 36017);
+        assert_eq!(tqms_items[0]["source"], "tqms");
+        assert_eq!(tqms_items[0]["is_in_billing"], true);
+        assert_eq!(tqms_items[0]["is_in_tqms"], true);
+    }
+
+    #[test]
+    fn test_search_vehicles_cache_only_and_direct_vehicle_id_query() {
+        let mut cache = Cache::new();
+        cache.write(
+            VehicleResource,
+            10,
+            make_cached_vehicle(10, 36048, "KA-02-GHA-0006", "Aman Test"),
+        );
+
+        // Searching with vehicle_number containing the VehicleId finds cache even when TQMS fails
+        let params_by_id = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("36048".to_string()),
+            owner_name: None,
+            sangh_branch: None,
+            status: None,
+        };
+        let merged = merge_and_annotate_vehicle_results(
+            &cache,
+            &params_by_id,
+            Err(anyhow::anyhow!("TQMS offline")),
+        )
+        .expect("cache hit should still return 200-equivalent payload");
+
+        let items = merged.pointer("/Data/Data").and_then(Value::as_array).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["VehicleId"], 36048);
+        assert_eq!(items[0]["is_in_billing"], true);
+        assert_eq!(items[0]["is_in_tqms"], false);
+
+        // Searching same number as both cache and TQMS shows both results in Data.Data
+        let params_by_num = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("ka 02 gha 0006".to_string()),
+            owner_name: None,
+            sangh_branch: None,
+            status: None,
+        };
+        let tqms_same = json!({
+            "Code": 200,
+            "Data": {
+                "Data": [{ "VehicleId": 36048, "VehicleNumber": "KA-02-GHA-0006" }]
+            }
+        });
+        let merged_both = merge_and_annotate_vehicle_results(&cache, &params_by_num, Ok(tqms_same))
+            .expect("expected both cache and TQMS results");
+        assert_eq!(
+            merged_both.pointer("/Data/Data").and_then(Value::as_array).unwrap().len(),
+            2
+        );
+    }
+
+    struct MockDbState {
+        rows: Vec<DatabaseResource>,
+        inserted: Vec<DatabaseResource>,
+        select_calls: usize,
+        next_id: i32,
+    }
+
+    fn append_row_desc_field(buf: &mut Vec<u8>, name: &str, type_oid: i32, type_size: i16) {
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&0i32.to_be_bytes()); // table oid
+        buf.extend_from_slice(&0i16.to_be_bytes()); // col attr
+        buf.extend_from_slice(&type_oid.to_be_bytes());
+        buf.extend_from_slice(&type_size.to_be_bytes());
+        buf.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
+        buf.extend_from_slice(&1i16.to_be_bytes()); // format = binary
+    }
+
+    fn push_pg_msg(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
+        out.push(tag);
+        out.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    fn decode_cstr(buf: &[u8], pos: &mut usize) -> String {
+        let start = *pos;
+        let end = buf[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|rel| start + rel)
+            .unwrap_or(buf.len());
+        *pos = (end + 1).min(buf.len());
+        String::from_utf8_lossy(&buf[start..end]).to_string()
+    }
+
+    fn decode_bind_json_params(body: &[u8]) -> (Option<Value>, Option<Value>) {
+        let mut pos = 0usize;
+        let _portal = decode_cstr(body, &mut pos);
+        let _stmt = decode_cstr(body, &mut pos);
+        if pos + 2 > body.len() {
+            return (None, None);
+        }
+        let fmt_count = i16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2 + fmt_count * 2;
+        if pos + 2 > body.len() {
+            return (None, None);
+        }
+        let param_count = i16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2;
+        let mut parsed = Vec::with_capacity(param_count);
+        for _ in 0..param_count {
+            if pos + 4 > body.len() {
+                break;
+            }
+            let len = i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+            pos += 4;
+            if len < 0 {
+                parsed.push(None);
+            } else {
+                let ulen = len as usize;
+                let end = (pos + ulen).min(body.len());
+                let slice = &body[pos..end];
+                pos = end;
+                let json_bytes = if slice.first() == Some(&1) {
+                    &slice[1..]
+                } else {
+                    slice
+                };
+                parsed.push(serde_json::from_slice::<Value>(json_bytes).ok());
+            }
+        }
+        (
+            parsed.first().cloned().flatten(),
+            parsed.get(1).cloned().flatten(),
+        )
+    }
+
+    async fn create_mock_server_data_with_db(
+        initial_db_rows: Vec<DatabaseResource>,
+        initial_cache: Cache,
+    ) -> (Arc<ServerData>, Arc<tokio::sync::Mutex<MockDbState>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let db_state = Arc::new(tokio::sync::Mutex::new(MockDbState {
+            rows: initial_db_rows,
+            inserted: Vec::new(),
+            select_calls: 0,
+            next_id: 9001,
+        }));
+        let state_for_task = Arc::clone(&db_state);
+
+        let (client_io, mut server_io) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            let Ok(startup_len) = server_io.read_i32().await else {
+                return;
+            };
+            let mut startup_body = vec![0u8; (startup_len as usize).saturating_sub(4)];
+            if server_io.read_exact(&mut startup_body).await.is_err() {
+                return;
+            }
+
+            let handshake = [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'];
+            if server_io.write_all(&handshake).await.is_err() {
+                return;
+            }
+            let _ = server_io.flush().await;
+
+            #[derive(Clone, Copy)]
+            enum QueryKind {
+                SelectVehicles,
+                InsertVehicle,
+            }
+
+            let mut current_query = QueryKind::InsertVehicle;
+            let mut pending_insert: (Option<Value>, Option<Value>) = (None, None);
+            let mut resp_buf: Vec<u8> = Vec::new();
+
+            loop {
+                let Ok(tag) = server_io.read_u8().await else {
+                    break;
+                };
+                let Ok(msg_len) = server_io.read_i32().await else {
+                    break;
+                };
+                let body_len = (msg_len as usize).saturating_sub(4);
+                let mut body = vec![0u8; body_len];
+                if server_io.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+
+                match tag {
+                    b'P' => {
+                        let sql = String::from_utf8_lossy(&body);
+                        current_query = if sql.contains("INSERT INTO") {
+                            QueryKind::InsertVehicle
+                        } else {
+                            QueryKind::SelectVehicles
+                        };
+                        resp_buf.extend_from_slice(&[b'1', 0, 0, 0, 4]);
+                    }
+                    b'D' => {
+                        if body.first() == Some(&b'S') {
+                            match current_query {
+                                QueryKind::SelectVehicles => {
+                                    // 0 parameters
+                                    push_pg_msg(&mut resp_buf, b't', &0i16.to_be_bytes());
+                                    // 3 columns: id, inner_content, external_content
+                                    let mut fields = Vec::new();
+                                    fields.extend_from_slice(&3i16.to_be_bytes());
+                                    append_row_desc_field(&mut fields, "id", 23, 4);
+                                    append_row_desc_field(&mut fields, "inner_content", 3802, -1);
+                                    append_row_desc_field(
+                                        &mut fields,
+                                        "external_content",
+                                        3802,
+                                        -1,
+                                    );
+                                    push_pg_msg(&mut resp_buf, b'T', &fields);
+                                }
+                                QueryKind::InsertVehicle => {
+                                    // 2 JSONB params (3802)
+                                    resp_buf.extend_from_slice(&[
+                                        b't', 0, 0, 0, 14, 0, 2, 0, 0, 0x0e, 0xda, 0, 0, 0x0e,
+                                        0xda,
+                                    ]);
+                                    let mut fields = Vec::new();
+                                    fields.extend_from_slice(&1i16.to_be_bytes());
+                                    append_row_desc_field(&mut fields, "id", 23, 4);
+                                    push_pg_msg(&mut resp_buf, b'T', &fields);
+                                }
+                            }
+                        }
+                    }
+                    b'B' => {
+                        if matches!(current_query, QueryKind::InsertVehicle) {
+                            pending_insert = decode_bind_json_params(&body);
+                        }
+                        resp_buf.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+                    }
+                    b'E' => {
+                        let mut guard = state_for_task.lock().await;
+                        match current_query {
+                            QueryKind::SelectVehicles => {
+                                guard.select_calls += 1;
+                                for row in &guard.rows {
+                                    let mut row_buf = Vec::new();
+                                    row_buf.extend_from_slice(&3i16.to_be_bytes());
+                                    // col 0: id (i32)
+                                    let id_val = row.id.unwrap_or_default();
+                                    row_buf.extend_from_slice(&4i32.to_be_bytes());
+                                    row_buf.extend_from_slice(&id_val.to_be_bytes());
+                                    // col 1: inner_content (jsonb binary: 0x01 + utf8)
+                                    if let Some(inner) = &row.inner_content {
+                                        let json_bytes = serde_json::to_vec(inner).unwrap();
+                                        let len = (1 + json_bytes.len()) as i32;
+                                        row_buf.extend_from_slice(&len.to_be_bytes());
+                                        row_buf.push(1);
+                                        row_buf.extend_from_slice(&json_bytes);
+                                    } else {
+                                        row_buf.extend_from_slice(&(-1i32).to_be_bytes());
+                                    }
+                                    // col 2: external_content
+                                    if let Some(ext) = &row.external_content {
+                                        let json_bytes = serde_json::to_vec(ext).unwrap();
+                                        let len = (1 + json_bytes.len()) as i32;
+                                        row_buf.extend_from_slice(&len.to_be_bytes());
+                                        row_buf.push(1);
+                                        row_buf.extend_from_slice(&json_bytes);
+                                    } else {
+                                        row_buf.extend_from_slice(&(-1i32).to_be_bytes());
+                                    }
+                                    push_pg_msg(&mut resp_buf, b'D', &row_buf);
+                                }
+                                let complete = format!("SELECT {}\0", guard.rows.len());
+                                push_pg_msg(&mut resp_buf, b'C', complete.as_bytes());
+                            }
+                            QueryKind::InsertVehicle => {
+                                let assigned_id = guard.next_id;
+                                guard.next_id += 1;
+                                let (inner_val, ext_val) = pending_insert.clone();
+                                let new_row = DatabaseResource {
+                                    id: Some(assigned_id),
+                                    resource_name: Some(VehicleResource),
+                                    inner_content: inner_val,
+                                    external_content: ext_val,
+                                };
+                                guard.rows.push(new_row.clone());
+                                guard.inserted.push(new_row);
+
+                                let mut row_buf = Vec::new();
+                                row_buf.extend_from_slice(&1i16.to_be_bytes());
+                                row_buf.extend_from_slice(&4i32.to_be_bytes());
+                                row_buf.extend_from_slice(&assigned_id.to_be_bytes());
+                                push_pg_msg(&mut resp_buf, b'D', &row_buf);
+                                push_pg_msg(&mut resp_buf, b'C', b"INSERT 0 1\0");
+                            }
+                        }
+                    }
+                    b'S' => {
+                        resp_buf.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+                        if server_io.write_all(&resp_buf).await.is_err() {
+                            break;
+                        }
+                        let _ = server_io.flush().await;
+                        resp_buf.clear();
+                    }
+                    b'X' => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let (client, connection) = tokio_postgres::Config::new()
+            .connect_raw(client_io, tokio_postgres::NoTls)
+            .await
+            .expect("mock postgres connect_raw failed");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let s_data = Arc::new(ServerData {
+            db: Arc::new(crate::db::Database::new(Arc::new(client))),
+            tqms_client: Arc::new(TQMSClient::new().await),
+            cache: Arc::new(RwLock::new(initial_cache)),
+        });
+
+        (s_data, db_state)
+    }
+
+    #[actix_web::test]
+    async fn test_tqms_vehicle_not_in_cache_or_db_creates_vehicle_resource_and_caches_it() {
+        let (s_data, db_state) = create_mock_server_data_with_db(Vec::new(), Cache::new()).await;
+
+        let tqms_payload = json!({
+            "Code": 200,
+            "Message": "Success",
+            "Data": {
+                "Data": [
+                    {
+                        "VehicleId": 777,
+                        "VehicleNumber": "ना १ ज ७७७७",
+                        "VehicleType": "Jeep",
+                        "Owners": [{ "Name": "TQMS New Owner", "SanghBranch": "Pokhara" }],
+                        "source": "tqms",
+                        "is_in_billing": false,
+                        "is_in_tqms": true,
+                        "cache_id": null
+                    }
+                ]
+            }
+        });
+
+        let tqms_items = extract_tqms_vehicle_items(&tqms_payload);
+        assert_eq!(tqms_items.len(), 1);
+
+        let created = ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, Some(9001));
+        assert_eq!(created[0].resource_name, Some(VehicleResource));
+
+        let created_inner = created[0].inner_content.as_ref().unwrap();
+        assert_eq!(created_inner["VehicleId"], 777);
+        assert_eq!(created_inner["VehicleNumber"], "ना १ ज ७७७७");
+        assert!(created_inner.get("source").is_none());
+        assert!(created_inner.get("is_in_billing").is_none());
+
+        // DB received exactly one INSERT with clean vehicle JSON
+        {
+            let guard = db_state.lock().await;
+            assert_eq!(guard.inserted.len(), 1);
+            assert_eq!(guard.inserted[0].id, Some(9001));
+            assert_eq!(guard.inserted[0].inner_content.as_ref().unwrap()["VehicleId"], 777);
+        }
+
+        // Cache now holds the newly created VehicleResource under id 9001
+        let cached = s_data
+            .cache
+            .read()
+            .await
+            .read(VehicleResource, 9001)
+            .expect("newly created TQMS vehicle must be stored in cache");
+        assert_eq!(cached.inner_content.as_ref().unwrap()["VehicleId"], 777);
+
+        // Merging search results afterwards reflects it as in billing too
+        let params = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("ना १ ज ७७७७".to_string()),
+            owner_name: None,
+            sangh_branch: None,
+            status: None,
+        };
+        let cache = s_data.cache.read().await;
+        let merged = merge_and_annotate_vehicle_results(&cache, &params, Ok(tqms_payload)).unwrap();
+        let data = merged.pointer("/Data/Data").and_then(Value::as_array).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(merged.pointer("/Data/cache_results/0/cache_id").unwrap(), 9001);
+        assert_eq!(merged.pointer("/Data/tqms_results/0/is_in_billing").unwrap(), true);
+    }
+
+    #[actix_web::test]
+    async fn test_tqms_vehicle_already_in_cache_is_not_created_in_db() {
+        let mut cache = Cache::new();
+        cache.write(
+            VehicleResource,
+            101,
+            make_cached_vehicle(101, 36017, "LU-548-GA-0001", "Existing By Id"),
+        );
+        cache.write(
+            VehicleResource,
+            102,
+            make_cached_vehicle(102, 44444, "BA-01-PA-2222", "Existing By Num"),
+        );
+
+        let (s_data, db_state) = create_mock_server_data_with_db(Vec::new(), cache).await;
+
+        let tqms_items = vec![
+            // Same VehicleId 36017 even though plate changed
+            json!({ "VehicleId": 36017, "VehicleNumber": "LU-548-GA-9999" }),
+            // Same normalized VehicleNumber even with different formatting / id
+            json!({ "VehicleId": 88888, "VehicleNumber": "ba 01 pa 2222" }),
+        ];
+
+        let created = ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+        assert!(created.is_empty());
+
+        let guard = db_state.lock().await;
+        assert_eq!(guard.select_calls, 0);
+        assert!(guard.inserted.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn test_tqms_vehicle_missing_from_cache_but_present_in_db_syncs_cache_without_duplicating_db() {
+        let existing_db_vehicle =
+            make_cached_vehicle(555, 5050, "NA-04-KHA-5050", "Only In DB Initially");
+
+        let (s_data, db_state) =
+            create_mock_server_data_with_db(vec![existing_db_vehicle], Cache::new()).await;
+
+        let tqms_items = vec![
+            // Already in DB (by VehicleId / VehicleNumber)
+            json!({ "VehicleId": 5050, "VehicleNumber": "NA-04-KHA-5050" }),
+            // Brand new TQMS-only vehicle (not in cache or DB)
+            json!({ "VehicleId": 6060, "VehicleNumber": "GA-02-CHA-6060" }),
+            // Duplicate of the brand new vehicle inside same TQMS batch -> should only insert once
+            json!({ "VehicleId": 6060, "VehicleNumber": "GA-02-CHA-6060" }),
+        ];
+
+        let created = ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, Some(9001));
+        assert_eq!(created[0].inner_content.as_ref().unwrap()["VehicleId"], 6060);
+
+        {
+            let guard = db_state.lock().await;
+            assert_eq!(guard.select_calls, 1);
+            assert_eq!(guard.inserted.len(), 1, "must not duplicate DB vehicle or intra-batch vehicle");
+        }
+
+        let cache = s_data.cache.read().await;
+        assert!(
+            cache.read(VehicleResource, 555).is_some(),
+            "existing DB vehicle should be warmed into cache"
+        );
+        assert!(
+            cache.read(VehicleResource, 9001).is_some(),
+            "newly created TQMS vehicle should be stored in cache"
+        );
+    }
+
+    #[test]
+    fn test_extract_tqms_vehicle_items_handles_search_details_and_non_vehicle_payloads() {
+        let search_payload = json!({
+            "Code": 200,
+            "Data": {
+                "Data": [
+                    { "VehicleId": 1, "VehicleNumber": "BA-01-PA-0001" },
+                    { "NotAVehicle": true }
+                ]
+            }
+        });
+        assert_eq!(extract_tqms_vehicle_items(&search_payload).len(), 1);
+
+        let details_payload = json!({
+            "Code": 200,
+            "Data": {
+                "VehicleId": 2,
+                "VehicleNumber": "BA-02-PA-0002",
+                "Owners": [{ "Name": "Test Owner" }]
+            }
+        });
+        let detail_items = extract_tqms_vehicle_items(&details_payload);
+        assert_eq!(detail_items.len(), 1);
+        assert_eq!(detail_items[0]["VehicleId"], 2);
+
+        let non_vehicle_payload = json!({
+            "Code": 200,
+            "Data": { "IsValid": true }
+        });
+        assert!(extract_tqms_vehicle_items(&non_vehicle_payload).is_empty());
     }
 }
