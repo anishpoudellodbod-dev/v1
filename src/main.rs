@@ -24,6 +24,7 @@ pub mod members;
 mod api_stream;
 pub mod date;
 pub mod log;
+pub mod sms;
 
 
 #[derive(Clone)]
@@ -101,6 +102,9 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: POST,      api/v1/bills/rollback/{id}",
             "method: GET,       api/v1/bills/logs",
             "method: GET,       api/v1/bills/logs/{bill_id}",
+            "method: POST,      api/v1/sms/preview",
+            "method: POST,      api/v1/sms/send",
+            "method: POST,      api/v1/sms/send-raw",
         ]
         .into_iter()
         .map(String::from),
@@ -282,6 +286,7 @@ async fn main() -> std::io::Result<()> {
                     .service(web::scope("/members").configure(members::configure_routes)),
             )
             .service(web::scope("/api/v1/members").configure(members::configure_routes))
+            .service(web::scope("/api/v1/sms").configure(sms::configure_routes))
             .service(
                 web::scope("/api/v1/tqms")
                     .route("/search", web::post().to(tqms_integration::search_vehicles))
