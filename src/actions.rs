@@ -107,7 +107,15 @@ pub async fn update(
     {
         let mut cache = s_data.cache.write().await;
 
-        cache.write(resource_name, id, db_resource);
+        cache.write(
+            resource_name,
+            id,
+            DatabaseResource {
+                id: Some(id),
+                resource_name: Some(resource_name),
+                ..db_resource
+            },
+        );
     }
 
     HttpResponse::Ok().json(format!("Resource updated with id: {}", id))
@@ -353,5 +361,119 @@ mod tests {
     async fn test_is_admin_false_when_no_claims() {
         let req = actix_web::test::TestRequest::default().to_http_request();
         assert!(!is_admin(req));
+    }
+
+    async fn create_mock_server_data_for_update() -> web::Data<Arc<ServerData>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_io, mut server_io) = tokio::io::duplex(65536);
+
+        tokio::spawn(async move {
+            let Ok(startup_len) = server_io.read_i32().await else {
+                return;
+            };
+            let mut startup_body = vec![0u8; (startup_len as usize).saturating_sub(4)];
+            if server_io.read_exact(&mut startup_body).await.is_err() {
+                return;
+            }
+
+            let handshake = [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'];
+            if server_io.write_all(&handshake).await.is_err() {
+                return;
+            }
+            let _ = server_io.flush().await;
+
+            let mut resp_buf: Vec<u8> = Vec::new();
+            loop {
+                let Ok(tag) = server_io.read_u8().await else {
+                    break;
+                };
+                let Ok(msg_len) = server_io.read_i32().await else {
+                    break;
+                };
+                let body_len = (msg_len as usize).saturating_sub(4);
+                let mut body = vec![0u8; body_len];
+                if server_io.read_exact(&mut body).await.is_err() {
+                    break;
+                }
+
+                match tag {
+                    b'P' => {
+                        resp_buf.extend_from_slice(&[b'1', 0, 0, 0, 4]);
+                    }
+                    b'D' => {
+                        if body.first() == Some(&b'S') {
+                            // 3 params: JSONB (3802), JSONB (3802), INT4 (23) + NoData
+                            resp_buf.extend_from_slice(&[
+                                b't', 0, 0, 0, 18, 0, 3, 0, 0, 0x0e, 0xda, 0, 0, 0x0e, 0xda, 0, 0,
+                                0, 23,
+                            ]);
+                            resp_buf.extend_from_slice(&[b'n', 0, 0, 0, 4]);
+                        }
+                    }
+                    b'B' => {
+                        resp_buf.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+                    }
+                    b'E' => {
+                        resp_buf.extend_from_slice(b"C\x00\x00\x00\x0dUPDATE 1\0");
+                    }
+                    b'S' => {
+                        resp_buf.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+                        if server_io.write_all(&resp_buf).await.is_err() {
+                            break;
+                        }
+                        let _ = server_io.flush().await;
+                        resp_buf.clear();
+                    }
+                    b'X' => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let (client, connection) = tokio_postgres::Config::new()
+            .connect_raw(client_io, tokio_postgres::NoTls)
+            .await
+            .expect("mock postgres connect_raw failed");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        web::Data::new(Arc::new(ServerData {
+            db: Arc::new(crate::db::Database::new(Arc::new(client))),
+            tqms_client: Arc::new(crate::tqms_integration::TQMSClient::new().await),
+            cache: Arc::new(tokio::sync::RwLock::new(crate::cache::Cache::new())),
+        }))
+    }
+
+    #[actix_web::test]
+    async fn test_update_sets_cache_id_when_payload_id_is_none() {
+        let s_data = create_mock_server_data_for_update().await;
+        let payload = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({ "SanghBranch": "Loadboard sthaniya" })),
+            external_content: None,
+        };
+        let req = actix_web::test::TestRequest::default().to_http_request();
+
+        let resp = update(
+            web::Path::from((ResourceName::SettingResource, 42)),
+            web::Json(payload),
+            req,
+            s_data.clone(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let cached = s_data
+            .cache
+            .read()
+            .await
+            .read(ResourceName::SettingResource, 42)
+            .expect("updated resource should exist in cache");
+        assert_eq!(cached.id, Some(42));
+        assert_eq!(cached.resource_name, Some(ResourceName::SettingResource));
     }
 }
