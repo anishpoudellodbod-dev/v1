@@ -387,7 +387,9 @@ impl Cache {
         let resource_names: Vec<_> = db
             .resource_name
             .iter()
-            .filter(|&&ref r| *r != ResourceName::UserResource)
+            .filter(|&&ref r| {
+                *r != ResourceName::UserResource && *r != ResourceName::PermissionResource
+            })
             .cloned()
             .collect();
 

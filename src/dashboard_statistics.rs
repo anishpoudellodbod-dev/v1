@@ -312,6 +312,7 @@ impl<'a> VehicleIndex<'a> {
 pub(crate) struct FiscalYearConfig {
     default_fiscal_year: Option<String>,
     fallback_fiscal_year: Option<String>,
+    billing_rule_fiscal_year: Option<String>,
     /// Maps any normalized fiscal year token (UUID, short label, full label) to a canonical group id.
     alias_to_group: HashMap<String, usize>,
     /// Maps a canonical group id to its display string and optional chronological order rank.
@@ -326,6 +327,7 @@ impl FiscalYearConfig {
         let mut config = Self {
             default_fiscal_year: None,
             fallback_fiscal_year: None,
+            billing_rule_fiscal_year: None,
             alias_to_group: HashMap::new(),
             group_display: Vec::new(),
             group_rank: Vec::new(),
@@ -339,6 +341,41 @@ impl FiscalYearConfig {
         }
 
         config
+    }
+
+    pub(crate) fn apply_billing_rules(&mut self, billing_rules: &[&DatabaseResource]) {
+        let mut best: Option<(i32, String)> = None;
+        for rule in billing_rules {
+            let Some(inner) = rule.inner_content.as_ref() else {
+                continue;
+            };
+            if let Some(status) = inner.get("status").and_then(Value::as_str) {
+                if !status.trim().eq_ignore_ascii_case("ACTIVE") {
+                    continue;
+                }
+            }
+            let Some(fy_raw) = extract_string_or_int(inner.get("fiscalYear"))
+                .or_else(|| extract_string_or_int(inner.get("fiscalYearId")))
+            else {
+                continue;
+            };
+            if let Some(start_year) = parse_fiscal_year_start(&fy_raw) {
+                self.register_group(&fy_raw, &[fy_raw.clone()]);
+                let should_update = match &best {
+                    None => true,
+                    Some((best_year, _)) => start_year > *best_year,
+                };
+                if should_update {
+                    best = Some((start_year, fy_raw));
+                }
+            }
+        }
+
+        if let Some((_, best_fy)) = best {
+            if self.billing_rule_fiscal_year.is_none() {
+                self.billing_rule_fiscal_year = Some(best_fy);
+            }
+        }
     }
 
     fn collect_from_value(&mut self, value: &Value) {
@@ -361,6 +398,11 @@ impl FiscalYearConfig {
                                 if enabled && self.fallback_fiscal_year.is_none() {
                                     if let Some(fy_id) =
                                         extract_string_or_int(monthly_paid.get("fiscalYearId"))
+                                            .or_else(|| {
+                                                extract_string_or_int(
+                                                    monthly_paid.get("fiscalYear"),
+                                                )
+                                            })
                                     {
                                         self.fallback_fiscal_year = Some(fy_id);
                                     }
@@ -383,6 +425,11 @@ impl FiscalYearConfig {
                                         if active {
                                             if let Some(fy_id) =
                                                 extract_string_or_int(rule.get("fiscalYearId"))
+                                                    .or_else(|| {
+                                                        extract_string_or_int(
+                                                            rule.get("fiscalYear"),
+                                                        )
+                                                    })
                                             {
                                                 self.fallback_fiscal_year = Some(fy_id);
                                                 break;
@@ -397,6 +444,82 @@ impl FiscalYearConfig {
                     }
                 }
 
+                // Unified schemaVersion 1 SettingResource sub-objects
+                if let Some(arrears_obj) = map.get("arrears").and_then(Value::as_object) {
+                    if let Some(monthly_paid) =
+                        arrears_obj.get("monthlyPaid").and_then(Value::as_object)
+                    {
+                        let enabled = monthly_paid
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if enabled && self.fallback_fiscal_year.is_none() {
+                            if let Some(fy_id) =
+                                extract_string_or_int(monthly_paid.get("fiscalYearId")).or_else(
+                                    || extract_string_or_int(monthly_paid.get("fiscalYear")),
+                                )
+                            {
+                                self.fallback_fiscal_year = Some(fy_id);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(linked_obj) = map.get("linkedFeeRules").and_then(Value::as_object) {
+                    let enabled = linked_obj
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if enabled && self.fallback_fiscal_year.is_none() {
+                        if let Some(rules) = linked_obj.get("rules").and_then(Value::as_array) {
+                            for rule in rules {
+                                let active = rule
+                                    .get("active")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if active {
+                                    if let Some(fy_id) =
+                                        extract_string_or_int(rule.get("fiscalYearId")).or_else(
+                                            || extract_string_or_int(rule.get("fiscalYear")),
+                                        )
+                                    {
+                                        self.fallback_fiscal_year = Some(fy_id);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(fy_obj) = map.get("fiscalYear").and_then(Value::as_object) {
+                    if let Some(active_fys) =
+                        fy_obj.get("activeFiscalYears").and_then(Value::as_array)
+                    {
+                        for item in active_fys {
+                            if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty())
+                            {
+                                if parse_fiscal_year_start(s).is_some() {
+                                    self.register_group(s, &[s.to_string()]);
+                                    if self.default_fiscal_year.is_none() {
+                                        self.default_fiscal_year = Some(s.to_string());
+                                    }
+                                }
+                            } else if item.is_object() {
+                                self.collect_from_value(item);
+                            }
+                        }
+                    }
+                    for (sub_k, sub_v) in fy_obj {
+                        if sub_k != "activeFiscalYears"
+                            && sub_k != "selector"
+                            && (sub_v.is_object() || sub_v.is_array())
+                        {
+                            self.collect_from_value(sub_v);
+                        }
+                    }
+                }
+
                 for key in ["currentFiscalYear", "currentFiscalYearId", "activeFiscalYear"] {
                     if let Some(val) = map.get(key).and_then(Value::as_str).map(str::trim) {
                         if !val.is_empty() && self.default_fiscal_year.is_none() {
@@ -404,6 +527,15 @@ impl FiscalYearConfig {
                         }
                     }
                 }
+
+                let is_rule_like = map.contains_key("linkedFeeHeadId")
+                    || map.contains_key("sourceFeeHeadId")
+                    || map.contains_key("billingRuleId")
+                    || map.contains_key("feeHead")
+                    || map
+                        .get("resourceType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("BILLING_RULE"));
 
                 // Detect a fiscal year entry object containing id and/or label/date fields.
                 let id_str = extract_string_or_int(map.get("id"))
@@ -430,18 +562,19 @@ impl FiscalYearConfig {
                     }
                 }
 
-                let is_fy_object = label_str
-                    .as_deref()
-                    .is_some_and(|l| parse_fiscal_year_start(l).is_some())
-                    || map
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| t.eq_ignore_ascii_case("FISCAL_YEAR"))
-                    || (id_str.is_some()
-                        && (map.contains_key("startDate")
-                            || map.contains_key("start_date")
-                            || map.contains_key("endDate")
-                            || map.contains_key("end_date")));
+                let is_fy_object = !is_rule_like
+                    && (label_str
+                        .as_deref()
+                        .is_some_and(|l| parse_fiscal_year_start(l).is_some())
+                        || map
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t.eq_ignore_ascii_case("FISCAL_YEAR"))
+                        || (id_str.is_some()
+                            && (map.contains_key("startDate")
+                                || map.contains_key("start_date")
+                                || map.contains_key("endDate")
+                                || map.contains_key("end_date"))));
 
                 if is_fy_object {
                     if let (Some(id), Some(y)) = (
@@ -479,6 +612,20 @@ impl FiscalYearConfig {
                 }
 
                 for (k, v) in map {
+                    if matches!(
+                        k.as_str(),
+                        "arrears"
+                            | "linkedFeeRules"
+                            | "vat"
+                            | "smsSettings"
+                            | "displacedTagging"
+                            | "receiptCancelWindow"
+                            | "insuranceEligibility"
+                            | "selector"
+                    ) || (k == "fiscalYear" && v.is_object())
+                    {
+                        continue;
+                    }
                     if k == "fiscalYears" || k == "fiscal_years" || v.is_array() || v.is_object() {
                         self.collect_from_value(v);
                     }
@@ -608,17 +755,42 @@ impl FiscalYearConfig {
             return req.to_string();
         }
 
-        if let Some(def) = self
-            .default_fiscal_year
-            .as_ref()
-            .or(self.fallback_fiscal_year.as_ref())
-        {
+        if let Some(def) = self.default_fiscal_year.as_ref() {
             if let Some(gid) = self.lookup_group_id(def.trim()) {
                 if let Some(label) = self.group_display.get(gid) {
                     return label.clone();
                 }
             }
             return def.clone();
+        }
+
+        if let Some(fb) = self.fallback_fiscal_year.as_ref() {
+            if self.has_ranked_group(fb) || parse_fiscal_year_start(fb).is_some() {
+                if let Some(gid) = self.lookup_group_id(fb.trim()) {
+                    if let Some(label) = self.group_display.get(gid) {
+                        return label.clone();
+                    }
+                }
+                return fb.clone();
+            }
+            if let Some(rule_fy) = self.billing_rule_fiscal_year.as_ref() {
+                if let Some(gid) = self.lookup_group_id(rule_fy.trim()) {
+                    if let Some(label) = self.group_display.get(gid) {
+                        return label.clone();
+                    }
+                }
+                return rule_fy.clone();
+            }
+            return fb.clone();
+        }
+
+        if let Some(rule_fy) = self.billing_rule_fiscal_year.as_ref() {
+            if let Some(gid) = self.lookup_group_id(rule_fy.trim()) {
+                if let Some(label) = self.group_display.get(gid) {
+                    return label.clone();
+                }
+            }
+            return rule_fy.clone();
         }
 
         "2083/2084".to_string()
@@ -1044,6 +1216,11 @@ pub fn compute_statistics(
         .unwrap_or_default();
     let mut fy_config = FiscalYearConfig::from_settings(&settings);
 
+    let billing_rules: Vec<&DatabaseResource> = cache
+        .read_all(ResourceName::BillingRuleResource)
+        .unwrap_or_default();
+    fy_config.apply_billing_rules(&billing_rules);
+
     let bills: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::BillResource)
         .unwrap_or_default();
@@ -1065,8 +1242,22 @@ pub fn compute_statistics(
         let norm_num = v_num.and_then(normalize_vehicle_number);
         index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
 
-        let bill_fy_raw = extract_string_or_int(inner.get("fiscalYearId"))
-            .or_else(|| extract_string_or_int(inner.get("fiscalYear")));
+        let bill_fy_id = extract_string_or_int(inner.get("fiscalYearId"));
+        let bill_fy_label = extract_string_or_int(inner.get("fiscalYear"));
+        if let (Some(ref fy_id), Some(ref fy_label)) = (&bill_fy_id, &bill_fy_label) {
+            if !fy_id.eq_ignore_ascii_case(fy_label) {
+                if let Some(y) = parse_fiscal_year_start(fy_label) {
+                    let conflicting_setting = fy_config
+                        .setting_year_to_id
+                        .get(&y)
+                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(fy_id));
+                    if !conflicting_setting {
+                        fy_config.register_group(fy_label, &[fy_id.clone(), fy_label.clone()]);
+                    }
+                }
+            }
+        }
+        let bill_fy_raw = bill_fy_label.or(bill_fy_id);
 
         let resolved_bill_fy = if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
             if let Some(fy) = bill_fy_raw {
@@ -2423,5 +2614,266 @@ mod tests {
         );
         let stats_audit = compute_statistics(Some("2083/84"), &cache, &[], test_date());
         assert_eq!(stats_audit.total_active_users_year, 47);
+    }
+
+    #[test]
+    fn test_migrated_billing_rule_fiscal_year_and_schema_v1_setting_resource() {
+        let mut cache = Cache::new();
+        let uuid_fy = "15f21721-50e8-41af-9596-9d8cdb8d6a16";
+
+        // Migrated BillingRuleResource using fiscalYear: "2082/2083"
+        cache.write(
+            ResourceName::BillingRuleResource,
+            24,
+            DatabaseResource {
+                id: Some(24),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(json!({
+                    "scope": "COMMON",
+                    "amount": 0,
+                    "period": null,
+                    "status": "ACTIVE",
+                    "feeHead": { "id": 23, "name": "तेश्रो पक्ष दुर्घटना सेवा सहयोग" },
+                    "validity": "SAME_DAY",
+                    "frequency": "ONE_TIME",
+                    "fiscalYear": "2082/2083",
+                    "resourceType": "BILLING_RULE",
+                    "effectiveDate": "2026-11-01",
+                    "billingEntityId": 1,
+                    "meetingReference": "Testing Rule",
+                    "vehicleCategoryId": null
+                })),
+                external_content: None,
+            },
+        );
+
+        // Unified schemaVersion 1 SettingResource where linkedFeeRules rule UUID must not pollute setting_year_to_id
+        cache.write(
+            ResourceName::SettingResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "vat": { "rate": 13, "enabled": true, "billingEntityIds": ["1"] },
+                    "arrears": {
+                        "monthlyPaid": {
+                            "enabled": true,
+                            "fiscalYearId": uuid_fy,
+                            "billingRuleId": "5"
+                        },
+                        "paidExpired": { "enabled": true, "billingRuleId": "5" }
+                    },
+                    "fiscalYear": {
+                        "selector": { "yearsBack": 4, "yearsForward": 1, "archivedYears": [] },
+                        "activeFiscalYears": []
+                    },
+                    "SanghBranch": "Loadboard sthaniya",
+                    "schemaVersion": 1,
+                    "linkedFeeRules": {
+                        "rules": [
+                            {
+                                "id": "f72c97c7-ddd4-4d35-bbdd-86e4746e57db",
+                                "active": true,
+                                "fiscalYear": "2082/2083",
+                                "linkedFeeHeadId": "21",
+                                "sourceFeeHeadId": "3",
+                                "oncePerFiscalYear": true
+                            }
+                        ],
+                        "enabled": true
+                    },
+                    "displacedTagging": { "enabled": true },
+                    "receiptCancelWindow": { "hours": 24, "enabled": false },
+                    "insuranceEligibility": { "enabled": false, "ruleIds": [], "minPaidRules": 1 }
+                })),
+                external_content: None,
+            },
+        );
+
+        let settings_only = cache.read_all(ResourceName::SettingResource).unwrap();
+        let fy_check = FiscalYearConfig::from_settings(&settings_only);
+        assert!(
+            !fy_check.has_ranked_group("f72c97c7-ddd4-4d35-bbdd-86e4746e57db"),
+            "linkedFeeRules rule id must not be registered as a fiscal year"
+        );
+        assert!(
+            !fy_check.setting_year_to_id.contains_key(&2082),
+            "linkedFeeRules rule id must not pollute setting_year_to_id"
+        );
+
+        for (id, vid, num) in [
+            (1, 1001i64, "BA-01-PA-1001"),
+            (2, 1002i64, "BA-01-PA-1002"),
+            (3, 1003i64, "BA-01-PA-1003"),
+            (4, 1004i64, "BA-01-PA-1004"),
+        ] {
+            cache.write(
+                ResourceName::VehicleResource,
+                id,
+                make_vehicle(id, vid, num, None),
+            );
+        }
+
+        // Bill 1 uses migrated "fiscalYear": "2082/2083"
+        let mut b1 = make_bill(1, "1001", "BA-01-PA-1001", "2082/2083", "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = b1.inner_content {
+            m.remove("fiscalYearId");
+            m.insert("fiscalYear".to_string(), json!("2082/2083"));
+            m.insert("periodStart".to_string(), json!("2025-10-10"));
+        }
+        cache.write(ResourceName::BillResource, 1, b1);
+
+        // Bill 2 uses short "fiscalYear": "2082/83"
+        let mut b2 = make_bill(2, "1002", "BA-01-PA-1002", "2082/83", "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = b2.inner_content {
+            m.remove("fiscalYearId");
+            m.insert("fiscalYear".to_string(), json!("2082/83"));
+            m.insert("periodStart".to_string(), json!("2025-10-12"));
+        }
+        cache.write(ResourceName::BillResource, 2, b2);
+
+        // Bill 3 uses legacy UUID fiscalYearId mapped via BS 2082 periodStart
+        let mut b3 = make_bill(3, "1003", "BA-01-PA-1003", uuid_fy, "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = b3.inner_content {
+            m.insert("periodStart".to_string(), json!("2025-10-15"));
+        }
+        cache.write(ResourceName::BillResource, 3, b3);
+
+        for requested in [None, Some("2082/2083"), Some("2082/83"), Some(uuid_fy)] {
+            let stats = compute_statistics(requested, &cache, &[], test_date());
+            assert_eq!(stats.total_users_year, 4, "total mismatch for {requested:?}");
+            assert_eq!(
+                stats.total_active_users_year, 3,
+                "active mismatch for {requested:?}"
+            );
+            assert_eq!(stats.new_users_year, 3, "new mismatch for {requested:?}");
+            assert_eq!(
+                stats.total_inactive_users_year, 1,
+                "inactive mismatch for {requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_migrated_billing_rule_fallback_with_unmapped_setting_uuid_and_fiscal_year_bills() {
+        let mut cache = Cache::new();
+        let uuid_fy = "15f21721-50e8-41af-9596-9d8cdb8d6a16";
+
+        // SettingResource has empty activeFiscalYears and an unmapped UUID in arrears.monthlyPaid
+        cache.write(
+            ResourceName::SettingResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "arrears": {
+                        "monthlyPaid": {
+                            "enabled": true,
+                            "fiscalYearId": uuid_fy,
+                            "billingRuleId": "5"
+                        }
+                    },
+                    "fiscalYear": { "activeFiscalYears": [] },
+                    "schemaVersion": 1
+                })),
+                external_content: None,
+            },
+        );
+
+        // Migrated active BillingRuleResource provides the authoritative fiscalYear "2082/2083"
+        cache.write(
+            ResourceName::BillingRuleResource,
+            24,
+            DatabaseResource {
+                id: Some(24),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(json!({
+                    "status": "ACTIVE",
+                    "fiscalYear": "2082/2083",
+                    "resourceType": "BILLING_RULE"
+                })),
+                external_content: None,
+            },
+        );
+
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 2001, "BA-02-PA-2001", None),
+        );
+        cache.write(
+            ResourceName::VehicleResource,
+            2,
+            make_vehicle(2, 2002, "BA-02-PA-2002", None),
+        );
+
+        let mut bill = make_bill(1, "2001", "BA-02-PA-2001", "2082/2083", "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = bill.inner_content {
+            m.remove("fiscalYearId");
+            m.insert("fiscalYear".to_string(), json!("2082/2083"));
+        }
+        cache.write(ResourceName::BillResource, 1, bill);
+
+        let stats = compute_statistics(None, &cache, &[], test_date());
+        assert_eq!(stats.fiscal_year, "2082/2083");
+        assert_eq!(stats.total_users_year, 2);
+        assert_eq!(stats.total_active_users_year, 1);
+        assert_eq!(stats.new_users_year, 1);
+        assert_eq!(stats.total_inactive_users_year, 1);
+    }
+
+    #[test]
+    fn test_schema_v1_setting_resource_active_fiscal_years_strings() {
+        let mut cache = Cache::new();
+        cache.write(
+            ResourceName::SettingResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(json!({
+                    "fiscalYear": {
+                        "selector": { "yearsBack": 4, "yearsForward": 1 },
+                        "activeFiscalYears": ["2082/2083"]
+                    },
+                    "schemaVersion": 1
+                })),
+                external_content: None,
+            },
+        );
+
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 3001, "GA-01-PA-3001", None),
+        );
+        cache.write(
+            ResourceName::VehicleResource,
+            2,
+            make_vehicle(2, 3002, "GA-01-PA-3002", None),
+        );
+
+        let mut b1 = make_bill(1, "3001", "GA-01-PA-3001", "2082/2083", "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = b1.inner_content {
+            m.remove("fiscalYearId");
+            m.insert("fiscalYear".to_string(), json!("2082/2083"));
+        }
+        cache.write(ResourceName::BillResource, 1, b1);
+
+        let mut b2 = make_bill(2, "3002", "GA-01-PA-3002", "2082/83", "Fee", "1", None);
+        if let Some(Value::Object(ref mut m)) = b2.inner_content {
+            m.remove("fiscalYearId");
+            m.insert("fiscalYear".to_string(), json!("2082/83"));
+        }
+        cache.write(ResourceName::BillResource, 2, b2);
+
+        let stats = compute_statistics(None, &cache, &[], test_date());
+        assert_eq!(stats.fiscal_year, "2082/2083");
+        assert_eq!(stats.total_users_year, 2);
+        assert_eq!(stats.total_active_users_year, 2);
+        assert_eq!(stats.new_users_year, 2);
+        assert_eq!(stats.total_inactive_users_year, 0);
     }
 }

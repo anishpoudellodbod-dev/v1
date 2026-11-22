@@ -112,10 +112,14 @@ pub struct CreatedByInfo {
 
 // LODBOD API Specific Models
 
+pub const REQUIRED_STHANIYA_BRANCH: &str = "Loadboard sthaniya";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LodbodVehicleQuery {
     #[serde(rename = "vehicleId")]
     pub vehicle_id: String,
+    #[serde(rename = "sthaniyaBranch")]
+    pub sthaniya_branch: String,
     #[serde(rename = "vehicleNumber")]
     pub vehicle_number: String,
 }
@@ -1213,11 +1217,17 @@ fn collect_branch_values(val: Option<&Value>, out: &mut Vec<String>) {
         return;
     };
     match v {
-        Value::String(s) => push_unique_branch(out, s),
+        Value::String(s) => {
+            for part in s.split(',') {
+                push_unique_branch(out, part);
+            }
+        }
         Value::Array(arr) => {
             for entry in arr {
                 if let Some(s) = entry.as_str() {
-                    push_unique_branch(out, s);
+                    for part in s.split(',') {
+                        push_unique_branch(out, part);
+                    }
                 }
             }
         }
@@ -1279,6 +1289,18 @@ pub fn extract_vehicle_sangh_branches(vehicle_inner: &Value) -> Vec<String> {
     }
 
     branches
+}
+
+/// Returns true if `expected_branch` matches at least one extracted `SanghBranch` entry
+/// (including comma-separated values like `"Loadboard sthaniya, Lumbini sangh, ..."`).
+pub fn vehicle_has_sangh_branch(vehicle_inner: &Value, expected_branch: &str) -> bool {
+    let target = expected_branch.trim();
+    if target.is_empty() {
+        return false;
+    }
+    extract_vehicle_sangh_branches(vehicle_inner)
+        .iter()
+        .any(|b| branch_matches(b, target))
 }
 
 fn vehicle_has_explicit_sangh_branch_field(vehicle_inner: &Value) -> bool {
@@ -1551,7 +1573,7 @@ async fn resolve_single_vehicle_billing_details(
     q_norm: &str,
     tqms_vehicle: Option<Value>,
     s_data: &ServerData,
-) -> VehicleBillingDetails {
+) -> Result<VehicleBillingDetails, String> {
     let q_id_i64 = q_id.parse::<i64>().ok();
     let q_id_u64 = q_id.parse::<u64>().ok();
 
@@ -1659,15 +1681,19 @@ async fn resolve_single_vehicle_billing_details(
 
     let Some((inner, actual_id, actual_num, cached_is_blacklisted, history)) = resolved_outcome
     else {
-        return VehicleBillingDetails {
+        return Ok(VehicleBillingDetails {
             vehicle_id: q_id.to_string(),
             vehicle_number: q_num.to_string(),
             vehicle_status: "NOT_FOUND".to_string(),
             owners: None,
             fees: vec![],
             payment_history: vec![],
-        };
+        });
     };
+
+    if !vehicle_has_sangh_branch(&inner, REQUIRED_STHANIYA_BRANCH) {
+        return Err("branch unavailable".to_string());
+    }
 
     let is_deregistered = inner
         .get("Registration")
@@ -1695,14 +1721,14 @@ async fn resolve_single_vehicle_billing_details(
         vec![]
     };
 
-    VehicleBillingDetails {
+    Ok(VehicleBillingDetails {
         vehicle_id: actual_id,
         vehicle_number: actual_num,
         vehicle_status,
         owners,
         fees,
         payment_history: history,
-    }
+    })
 }
 
 /// API 1: Get vehicle billing details
@@ -1745,6 +1771,28 @@ pub async fn get_vehicle_billing_details(
         });
     }
 
+    if body
+        .vehicles
+        .iter()
+        .any(|q| q.sthaniya_branch.trim() != REQUIRED_STHANIYA_BRANCH)
+    {
+        return HttpResponse::BadRequest().json(ApiErrorResponse {
+            success: false,
+            error: ApiErrorDetails {
+                code: "INVALID_REQUEST".to_string(),
+                message: format!(
+                    "Invalid sthaniyaBranch: only '{}' is supported",
+                    REQUIRED_STHANIYA_BRANCH
+                ),
+                details: vec![format!(
+                    "Every vehicle entry must specify sthaniyaBranch as '{}'",
+                    REQUIRED_STHANIYA_BRANCH
+                )],
+            },
+            request_id: req_id,
+        });
+    }
+
     let mut results: Vec<VehicleBillingDetails> = Vec::with_capacity(body.vehicles.len());
 
     for query in &body.vehicles {
@@ -1769,10 +1817,12 @@ pub async fn get_vehicle_billing_details(
             Err(_) => None,
         };
 
-        results.push(
-            resolve_single_vehicle_billing_details(q_id, q_num, &q_norm, tqms_vehicle, &s_data)
-                .await,
-        );
+        match resolve_single_vehicle_billing_details(q_id, q_num, &q_norm, tqms_vehicle, &s_data)
+            .await
+        {
+            Ok(details) => results.push(details),
+            Err(_) => return branch_unavailable_response(req_id),
+        }
     }
 
     HttpResponse::Ok().json(ApiResponse {
@@ -3009,6 +3059,7 @@ mod tests {
             "vehicles": [
                 {
                     "vehicleId": "VH-101",
+                    "sthaniyaBranch": "Loadboard sthaniya",
                     "vehicleNumber": "BA-00-PA-0000"
                 }
             ]
@@ -3018,11 +3069,13 @@ mod tests {
             serde_json::from_str(valid_json).expect("deserialization failed");
         assert_eq!(parsed.vehicles.len(), 1);
         assert_eq!(parsed.vehicles[0].vehicle_id, "VH-101");
+        assert_eq!(parsed.vehicles[0].sthaniya_branch, "Loadboard sthaniya");
         assert_eq!(parsed.vehicles[0].vehicle_number, "BA-00-PA-0000");
 
         let missing_id_json = r#"{
             "vehicles": [
                 {
+                    "sthaniyaBranch": "Loadboard sthaniya",
                     "vehicleNumber": "BA-01-PA-9999"
                 }
             ]
@@ -3032,11 +3085,22 @@ mod tests {
         let missing_num_json = r#"{
             "vehicles": [
                 {
-                    "vehicleId": "VH-101"
+                    "vehicleId": "VH-101",
+                    "sthaniyaBranch": "Loadboard sthaniya"
                 }
             ]
         }"#;
         assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(missing_num_json).is_err());
+
+        let missing_branch_json = r#"{
+            "vehicles": [
+                {
+                    "vehicleId": "VH-101",
+                    "vehicleNumber": "BA-00-PA-0000"
+                }
+            ]
+        }"#;
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(missing_branch_json).is_err());
     }
 
     #[test]
@@ -4375,6 +4439,7 @@ mod tests {
                     "VehicleId": 901,
                     "VehicleNumber": "NA-01-KHA-9001",
                     "VehicleType": "Bus",
+                    "SanghBranch": "Loadboard sthaniya, Lumbini sangh",
                     "Owners": [{ "Name": "Krishna Prasad", "Phone": "9855000000" }]
                 })),
                 external_content: None,
@@ -4388,10 +4453,12 @@ mod tests {
             vehicles: vec![
                 LodbodVehicleQuery {
                     vehicle_id: "901".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                     vehicle_number: "NA-01-KHA-9001".to_string(),
                 },
                 LodbodVehicleQuery {
                     vehicle_id: "UNKNOWN-VH".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                     vehicle_number: "ZZ-99-ZZ-9999".to_string(),
                 },
             ],
@@ -4423,6 +4490,7 @@ mod tests {
                     "VehicleNumber": "Ba Pra-53-01-0-2256",
                     "NormalizedVehicleNumber": "Ba Pra-53-01-0-2256",
                     "VehicleType": "22 dimensional",
+                    "SanghBranch": "Loadboard sthaniya",
                     "Registration": { "Status": "ACTIVE" },
                     "Owners": [{ "Name": "Addidas vandari", "Phone": "9863000032" }],
                     "metadata": {
@@ -4441,6 +4509,7 @@ mod tests {
         let query_body = GetVehicleBillingDetailsRequest {
             vehicles: vec![LodbodVehicleQuery {
                 vehicle_id: "35903".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "Ba Pra-53-01-0-2256".to_string(),
             }],
         };
@@ -4465,6 +4534,7 @@ mod tests {
         let query_body = GetVehicleBillingDetailsRequest {
             vehicles: vec![LodbodVehicleQuery {
                 vehicle_id: "   ".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "BA-01-PA-1234".to_string(),
             }],
         };
@@ -4513,27 +4583,33 @@ mod tests {
         let invalid_cases = vec![
             vec![LodbodVehicleQuery {
                 vehicle_id: "".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "BA-01-PA-1234".to_string(),
             }],
             vec![LodbodVehicleQuery {
                 vehicle_id: "   \t\n ".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "BA-01-PA-1234".to_string(),
             }],
             vec![LodbodVehicleQuery {
                 vehicle_id: "35903".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "".to_string(),
             }],
             vec![LodbodVehicleQuery {
                 vehicle_id: "35903".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "   ".to_string(),
             }],
             vec![
                 LodbodVehicleQuery {
                     vehicle_id: "35903".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                     vehicle_number: "BA-01-PA-1234".to_string(),
                 },
                 LodbodVehicleQuery {
                     vehicle_id: "35904".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                     vehicle_number: "   ".to_string(),
                 },
             ],
@@ -4557,10 +4633,10 @@ mod tests {
         }
 
         // Null vehicleId or vehicleNumber must fail deserialization
-        let null_id_json = r#"{"vehicles":[{"vehicleId":null,"vehicleNumber":"BA-01-PA-1234"}]}"#;
+        let null_id_json = r#"{"vehicles":[{"vehicleId":null,"sthaniyaBranch":"Loadboard sthaniya","vehicleNumber":"BA-01-PA-1234"}]}"#;
         assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(null_id_json).is_err());
 
-        let null_num_json = r#"{"vehicles":[{"vehicleId":"101","vehicleNumber":null}]}"#;
+        let null_num_json = r#"{"vehicles":[{"vehicleId":"101","sthaniyaBranch":"Loadboard sthaniya","vehicleNumber":null}]}"#;
         assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(null_num_json).is_err());
     }
 
@@ -4699,6 +4775,7 @@ mod tests {
             "VehicleId": 35903,
             "VehicleNumber": "Ba Pra-53-01-0-2256",
             "VehicleType": "22 dimensional",
+            "SanghBranch": "Loadboard sthaniya",
             "Registration": { "Status": "ACTIVE" },
             "Owners": [{ "Name": "Fresh TQMS Owner", "Phone": "9863000032" }]
         });
@@ -4710,7 +4787,8 @@ mod tests {
             Some(fresh_tqms),
             &s_data,
         )
-        .await;
+        .await
+        .unwrap();
 
         // Must reflect fresh TQMS owner while staying INELIGIBLE due to preserved blacklist metadata
         assert_eq!(details.vehicle_status, "INELIGIBLE");
@@ -4763,6 +4841,7 @@ mod tests {
             "VehicleId": 5001,
             "VehicleNumber": "BA-01-PA-5001",
             "VehicleType": "Deluxe Bus",
+            "SanghBranch": "Loadboard sthaniya",
             "Registration": { "Status": "ACTIVE" },
             "Owners": [{ "Name": "Fresh Owner", "Phone": "9811111111" }]
         });
@@ -4774,7 +4853,8 @@ mod tests {
             Some(fresh_cached_tqms),
             &s_data,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(details_updated.vehicle_status, "ELIGIBLE");
         assert_eq!(details_updated.fees.len(), 2);
         assert_eq!(
@@ -4800,6 +4880,7 @@ mod tests {
             "VehicleId": 6001,
             "VehicleNumber": "BA-02-PA-6001",
             "VehicleType": "Truck",
+            "SanghBranch": "Loadboard sthaniya, Lumbini sangh",
             "Registration": { "Status": "ACTIVE" },
             "Owners": [{ "Name": "TQMS Only Owner", "Phone": "9822222222" }]
         });
@@ -4810,7 +4891,8 @@ mod tests {
             Some(tqms_only_eligible),
             &s_data,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(details_tqms_only.vehicle_status, "ELIGIBLE");
         assert_eq!(details_tqms_only.fees.len(), 2);
 
@@ -4819,6 +4901,7 @@ mod tests {
             "VehicleId": 6002,
             "VehicleNumber": "BA-02-PA-6002",
             "VehicleType": "Truck",
+            "SanghBranch": "Loadboard sthaniya",
             "Registration": { "Status": "DEREGISTERED" },
             "Owners": [{ "Name": "Deregistered Owner", "Phone": "9833333333" }]
         });
@@ -4829,7 +4912,8 @@ mod tests {
             Some(tqms_only_deregistered),
             &s_data,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(details_deregistered.vehicle_status, "INELIGIBLE");
         assert!(details_deregistered.fees.is_empty());
 
@@ -4838,6 +4922,7 @@ mod tests {
             "VehicleId": 6003,
             "VehicleNumber": "BA-02-PA-6003",
             "VehicleType": "Truck",
+            "SanghBranch": "Loadboard sthaniya",
             "Registration": { "Status": "ACTIVE" },
             "Owners": []
         });
@@ -4848,7 +4933,8 @@ mod tests {
             Some(tqms_only_no_owners),
             &s_data,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(details_no_owners.vehicle_status, "INELIGIBLE");
         assert!(details_no_owners.fees.is_empty());
     }
@@ -4868,6 +4954,7 @@ mod tests {
                     "VehicleId": 7001,
                     "VehicleNumber": "LU-01-KHA-7001",
                     "VehicleType": "Tipper",
+                    "SanghBranch": "Loadboard sthaniya",
                     "Registration": { "Status": "ACTIVE" },
                     "Owners": [{ "Name": "Clean Entry Owner", "Phone": "9844444444" }]
                 })),
@@ -4886,6 +4973,7 @@ mod tests {
                     "VehicleId": 7001,
                     "VehicleNumber": "LU-01-KHA-7001",
                     "VehicleType": "Tipper",
+                    "SanghBranch": "Loadboard sthaniya",
                     "Registration": { "Status": "ACTIVE" },
                     "Owners": [{ "Name": "Blacklisted Entry Owner", "Phone": "9844444444" }],
                     "metadata": { "tags": ["blacklisted"] }
@@ -4900,6 +4988,7 @@ mod tests {
         let query_body = GetVehicleBillingDetailsRequest {
             vehicles: vec![LodbodVehicleQuery {
                 vehicle_id: "7001".to_string(),
+                sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
                 vehicle_number: "LU-01-KHA-7001".to_string(),
             }],
         };
@@ -5880,6 +5969,223 @@ mod tests {
             validate_vehicle_sangh_branch(&legacy_vehicle, Some("Any Branch")),
             Err("branch unavailable".to_string())
         );
+
+        // 5. Comma-separated multi-branch SanghBranch values split into distinct branches
+        let comma_branches_vehicle = serde_json::json!({
+            "SanghBranch": "Loadboard sthaniya, Lumbini sangh, Lumbini Truck Yatayat Byawasayi Sangh"
+        });
+        assert_eq!(
+            extract_vehicle_sangh_branches(&comma_branches_vehicle),
+            vec![
+                "Loadboard sthaniya".to_string(),
+                "Lumbini sangh".to_string(),
+                "Lumbini Truck Yatayat Byawasayi Sangh".to_string(),
+            ]
+        );
+        assert!(vehicle_has_sangh_branch(
+            &comma_branches_vehicle,
+            REQUIRED_STHANIYA_BRANCH
+        ));
+        assert_eq!(
+            validate_vehicle_sangh_branch(&comma_branches_vehicle, Some("Lumbini sangh")),
+            Ok(Some("Lumbini sangh".to_string()))
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_sthaniya_branch_and_comma_separated_sangh_branch() {
+        let s_data = create_mock_server_data().await;
+
+        // Vehicle 24631: comma-separated SanghBranch containing "Loadboard sthaniya"
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            100,
+            DatabaseResource {
+                id: Some(100),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24631,
+                    "VehicleNumber": "Province-0-55-744-CA-8536",
+                    "VehicleType": "Truck",
+                    "SanghBranch": "Loadboard sthaniya, Lumbini sangh, Lumbini Truck Yatayat Byawasayi Sangh",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Owner One", "Phone": "9800000001" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 24632: Loadboard sthaniya appears in owner's comma-separated SanghBranch list (later item)
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            101,
+            DatabaseResource {
+                id: Some(101),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24632,
+                    "VehicleNumber": "BA-01-PA-2463",
+                    "VehicleType": "Bus",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{
+                        "Name": "Owner Two",
+                        "Phone": "9800000002",
+                        "SanghBranch": "Lumbini sangh, Loadboard sthaniya, Lumbini Truck Yatayat Byawasayi Sangh"
+                    }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 24633: comma-separated SanghBranch WITHOUT "Loadboard sthaniya"
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            102,
+            DatabaseResource {
+                id: Some(102),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24633,
+                    "VehicleNumber": "BA-01-PA-9991",
+                    "VehicleType": "Bus",
+                    "SanghBranch": "Lumbini sangh, Lumbini Truck Yatayat Byawasayi Sangh",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Other Branch Owner", "Phone": "9800000003" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 24634: no SanghBranch key at all
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            103,
+            DatabaseResource {
+                id: Some(103),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24634,
+                    "VehicleNumber": "BA-01-PA-9992",
+                    "VehicleType": "Bus",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "No Branch Owner", "Phone": "9800000004" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. Valid request matching "Loadboard sthaniya" succeeds for both comma-separated vehicles
+        let req_ok = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let body_ok: GetVehicleBillingDetailsRequest = serde_json::from_str(
+            r#"{
+                "vehicles": [
+                    {
+                        "vehicleId": "24631",
+                        "sthaniyaBranch": "Loadboard sthaniya",
+                        "vehicleNumber": "Province-0-55-744-CA-8536"
+                    },
+                    {
+                        "vehicleId": "24632",
+                        "sthaniyaBranch": "Loadboard sthaniya",
+                        "vehicleNumber": "BA-01-PA-2463"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let resp_ok = get_vehicle_billing_details(req_ok, web::Json(body_ok), s_data.clone()).await;
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+        let bytes_ok = actix_web::body::to_bytes(resp_ok.into_body()).await.unwrap();
+        let parsed_ok: ApiResponse<Vec<VehicleBillingDetails>> =
+            serde_json::from_slice(&bytes_ok).unwrap();
+        assert_eq!(parsed_ok.data.len(), 2);
+        assert_eq!(parsed_ok.data[0].vehicle_status, "ELIGIBLE");
+        assert_eq!(parsed_ok.data[1].vehicle_status, "ELIGIBLE");
+
+        // 2. Invalid / empty / wrong-case sthaniyaBranch in request throws 400 INVALID_REQUEST
+        for bad_branch in ["Lumbini sangh", "", "   ", "loadboard sthaniya"] {
+            let req_bad = actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request();
+            let resp_bad = get_vehicle_billing_details(
+                req_bad,
+                web::Json(GetVehicleBillingDetailsRequest {
+                    vehicles: vec![LodbodVehicleQuery {
+                        vehicle_id: "24631".to_string(),
+                        sthaniya_branch: bad_branch.to_string(),
+                        vehicle_number: "Province-0-55-744-CA-8536".to_string(),
+                    }],
+                }),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(
+                resp_bad.status(),
+                StatusCode::BAD_REQUEST,
+                "bad_branch={bad_branch:?}"
+            );
+            let bytes = actix_web::body::to_bytes(resp_bad.into_body()).await.unwrap();
+            let err: ApiErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(err.error.code, "INVALID_REQUEST");
+        }
+
+        // Missing or null sthaniyaBranch fails deserialization
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(
+            r#"{"vehicles":[{"vehicleId":"24631","vehicleNumber":"Province-0-55-744-CA-8536"}]}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<GetVehicleBillingDetailsRequest>(
+            r#"{"vehicles":[{"vehicleId":"24631","sthaniyaBranch":null,"vehicleNumber":"Province-0-55-744-CA-8536"}]}"#,
+        )
+        .is_err());
+
+        // 3. Vehicle without "Loadboard sthaniya" in SanghBranch (only other branches) throws 400 BRANCH_UNAVAILABLE
+        let req_other = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_other = get_vehicle_billing_details(
+            req_other,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24633".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
+                    vehicle_number: "BA-01-PA-9991".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_other.status(), StatusCode::BAD_REQUEST);
+        let bytes_other = actix_web::body::to_bytes(resp_other.into_body()).await.unwrap();
+        let err_other: ApiErrorResponse = serde_json::from_slice(&bytes_other).unwrap();
+        assert_eq!(err_other.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_other.error.message, "branch unavailable");
+
+        // 4. Vehicle omitting SanghBranch key altogether throws 400 BRANCH_UNAVAILABLE
+        let req_missing = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_missing = get_vehicle_billing_details(
+            req_missing,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24634".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
+                    vehicle_number: "BA-01-PA-9992".to_string(),
+                }],
+            }),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_missing.status(), StatusCode::BAD_REQUEST);
+        let bytes_missing = actix_web::body::to_bytes(resp_missing.into_body())
+            .await
+            .unwrap();
+        let err_missing: ApiErrorResponse = serde_json::from_slice(&bytes_missing).unwrap();
+        assert_eq!(err_missing.error.code, "BRANCH_UNAVAILABLE");
+        assert_eq!(err_missing.error.message, "branch unavailable");
     }
 
     #[test]

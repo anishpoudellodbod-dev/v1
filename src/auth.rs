@@ -5,14 +5,21 @@ use jsonwebtoken::{
     Header, Validation,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-#[derive(Debug, Serialize, Deserialize)]
+static JTI_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String, // Subject (user id)
     pub exp: i64,    // Expiration time
     pub iat: i64,    // Issued at
     pub role: Roles, // User role (admin or user)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 static ENCODING_KEY: OnceLock<EncodingKey> = OnceLock::new();
@@ -32,21 +39,33 @@ fn get_decoding_key() -> &'static DecodingKey {
     })
 }
 
-pub fn create_jwt_with_role(user_id: &str, role: &Roles) -> Result<String, JwtError> {
+pub fn create_jwt_with_role_and_user_id(
+    user_email: &str,
+    role: &Roles,
+    user_id: Option<i32>,
+) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = now
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
         .timestamp();
+    let jti_seq = JTI_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let jti = format!("{}-{}", now.timestamp_nanos_opt().unwrap_or(0), jti_seq);
 
     let claims = Claims {
-        sub: user_id.to_owned(),
+        sub: user_email.to_owned(),
         exp: expiration,
         iat: now.timestamp(),
         role: role.to_owned(),
+        user_id,
+        jti: Some(jti),
     };
 
     encode(&Header::new(Algorithm::RS512), &claims, get_encoding_key())
+}
+
+pub fn create_jwt_with_role(user_id: &str, role: &Roles) -> Result<String, JwtError> {
+    create_jwt_with_role_and_user_id(user_id, role, None)
 }
 
 pub fn verify_jwt(token: &str) -> Result<Claims, JwtError> {
@@ -144,6 +163,8 @@ mod tests {
             exp: (past + Duration::hours(1)).timestamp(),
             iat: past.timestamp(),
             role: Roles::User,
+            user_id: None,
+            jti: None,
         };
 
         let token = encode(&Header::new(Algorithm::RS512), &expired_claims, get_encoding_key())
@@ -172,5 +193,24 @@ mod tests {
         assert!(serialized.contains("test@narayani.com"));
         assert!(serialized.contains("Admin"));
         assert!(serialized.contains("10"));
+    }
+
+    #[test]
+    fn test_create_jwt_with_role_and_user_id_preserves_user_id_and_unique_jti() {
+        let token_1 = create_jwt_with_role_and_user_id("uid@example.com", &Roles::Operator, Some(77))
+            .expect("Token 1 creation failed");
+        let token_2 = create_jwt_with_role_and_user_id("uid@example.com", &Roles::Operator, Some(77))
+            .expect("Token 2 creation failed");
+
+        assert_ne!(token_1, token_2);
+
+        let claims_1 = verify_jwt(&token_1).expect("Token 1 verification failed");
+        let claims_2 = verify_jwt(&token_2).expect("Token 2 verification failed");
+
+        assert_eq!(claims_1.sub, "uid@example.com");
+        assert_eq!(claims_1.role, Roles::Operator);
+        assert_eq!(claims_1.user_id, Some(77));
+        assert!(claims_1.jti.is_some());
+        assert_ne!(claims_1.jti, claims_2.jti);
     }
 }

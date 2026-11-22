@@ -11,11 +11,16 @@ pub async fn search(
     let (resource_name, search_item, search_query, limit) = path.into_inner();
 
     let resource_name: ResourceName = match resource_name.try_into() {
-        Ok(r) => if r == ResourceName::UserResource {
-            return HttpResponse::Forbidden().body("Search forbidden in UserResource is forbidden");
-        } else {
-            r
-        },
+        Ok(r) => {
+            if r == ResourceName::UserResource || r == ResourceName::PermissionResource {
+                return HttpResponse::Forbidden().body(format!(
+                    "Search forbidden in {:?} is forbidden",
+                    r
+                ));
+            } else {
+                r
+            }
+        }
         Err(_) => {
             return HttpResponse::BadRequest().body("Invalid resource name");
         }
@@ -72,10 +77,89 @@ pub async fn update(
     let (resource_name, id) = path.into_inner();
     let db_resource = db_resource.into_inner();
 
+    if resource_name == ResourceName::PermissionResource {
+        if !is_admin(req.clone()) {
+            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+        }
+
+        let Some(inner_val) = db_resource.inner_content.clone() else {
+            return HttpResponse::BadRequest()
+                .body("PermissionResource inner_content is required");
+        };
+        let mut perm_inner: crate::access::PermissionInnerContent =
+            match serde_json::from_value(inner_val) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    return HttpResponse::BadRequest()
+                        .body(format!("Invalid PermissionResource inner_content: {}", err));
+                }
+            };
+        perm_inner.sthaniya_branch =
+            crate::access::normalize_optional_branch(perm_inner.sthaniya_branch);
+
+        match crate::access::find_user_by_id_in_db(&s_data.db, perm_inner.user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return HttpResponse::NotFound().body(format!(
+                    "UserResource with id {} not found",
+                    perm_inner.user_id
+                ));
+            }
+            Err(err) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("Failed to verify user for PermissionResource: {:?}", err));
+            }
+        }
+
+        match crate::access::find_permission_by_user_id_in_db(&s_data.db, perm_inner.user_id).await
+        {
+            Ok(Some(existing)) if existing.id != Some(id) => {
+                return HttpResponse::Conflict().body(format!(
+                    "PermissionResource already exists for userId {} (1:1 mapping enforced)",
+                    perm_inner.user_id
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return HttpResponse::InternalServerError().body(err);
+            }
+        }
+
+        let target_user_id = perm_inner.user_id;
+        let stored_res =
+            crate::access::PermissionResource::new(Some(id), perm_inner, db_resource.external_content)
+                .to_database_resource();
+
+        if let Err(err) = s_data
+            .db
+            .update_resource(resource_name, id, stored_res.clone())
+            .await
+        {
+            return HttpResponse::InternalServerError()
+                .body(format!("Failed to update resource: {:?}", err));
+        }
+
+        {
+            let mut cache = s_data.cache.write().await;
+            if crate::access::is_user_logged_in_cache(&cache, target_user_id) {
+                crate::access::remove_user_permissions_from_cache(&mut cache, target_user_id);
+                cache.write(resource_name, id, stored_res);
+            } else if let Some(entries) = cache.cache.get_mut(&ResourceName::PermissionResource) {
+                entries.remove(&id);
+            }
+        }
+
+        return HttpResponse::Ok().json(format!("Resource updated with id: {}", id));
+    }
+
+    if resource_name == ResourceName::BillingRuleResource && !is_admin(req.clone()) {
+        return HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource");
+    }
+
     if resource_name == ResourceName::UserResource {
         if !is_admin(req.clone()) {
             return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
-        }else{
+        } else {
             //if the admin is trying to update own user resource, then deny it
             let extensions = req.extensions();
             let claims = extensions.get::<crate::auth::Claims>();
@@ -104,18 +188,29 @@ pub async fn update(
             .body(format!("Failed to update resource: {:?}", err));
     }
 
+    let updated_resource = DatabaseResource {
+        id: Some(id),
+        resource_name: Some(resource_name),
+        ..db_resource
+    };
+
     {
         let mut cache = s_data.cache.write().await;
 
-        cache.write(
-            resource_name,
-            id,
-            DatabaseResource {
-                id: Some(id),
-                resource_name: Some(resource_name),
-                ..db_resource
-            },
-        );
+        cache.write(resource_name, id, updated_resource.clone());
+    }
+
+    if resource_name == ResourceName::UserResource {
+        if let Some(ref inner_content) = updated_resource.inner_content {
+            if let Err(err) =
+                crate::access::sync_permission_on_user_update(&s_data, id, inner_content).await
+            {
+                eprintln!(
+                    "Failed to sync PermissionResource on UserResource {} update: {}",
+                    id, err
+                );
+            }
+        }
     }
 
     HttpResponse::Ok().json(format!("Resource updated with id: {}", id))
@@ -127,13 +222,93 @@ pub async fn write(
     req: actix_web::HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
-    let db_resource = db_resource.into_inner();
+    let mut db_resource = db_resource.into_inner();
     let resource_name = path.into_inner();
+
+    if resource_name == ResourceName::PermissionResource {
+        if !is_admin(req.clone()) {
+            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+        }
+
+        let Some(inner_val) = db_resource.inner_content.clone() else {
+            return HttpResponse::BadRequest()
+                .body("PermissionResource inner_content is required");
+        };
+        let mut perm_inner: crate::access::PermissionInnerContent =
+            match serde_json::from_value(inner_val) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    return HttpResponse::BadRequest()
+                        .body(format!("Invalid PermissionResource inner_content: {}", err));
+                }
+            };
+
+        let resolved_branch = crate::access::resolve_branch_for_new_creation(
+            &req,
+            &s_data,
+            perm_inner.sthaniya_branch.clone(),
+        )
+        .await;
+        perm_inner.sthaniya_branch = resolved_branch;
+
+        return match crate::access::create_permission_in_db_strict(
+            &s_data.db,
+            perm_inner,
+            db_resource.external_content.clone(),
+        )
+        .await
+        {
+            Ok(created) => {
+                if let Some(perm_id) = created.id {
+                    let mut cache = s_data.cache.write().await;
+                    if crate::access::is_user_logged_in_cache(
+                        &cache,
+                        created.inner_content.user_id,
+                    ) {
+                        crate::access::remove_user_permissions_from_cache(
+                            &mut cache,
+                            created.inner_content.user_id,
+                        );
+                        cache.write(
+                            ResourceName::PermissionResource,
+                            perm_id,
+                            created.to_database_resource(),
+                        );
+                    }
+                }
+                HttpResponse::Ok().json(created.to_database_resource())
+            }
+            Err(err) => err.to_http_response(),
+        };
+    }
+
+    if resource_name == ResourceName::BillingRuleResource && !is_admin(req.clone()) {
+        return HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource");
+    }
+
+    let mut effective_user_branch: Option<String> = None;
+
     if resource_name == ResourceName::UserResource {
-        if !is_admin(req) {
+        if !is_admin(req.clone()) {
             return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
         }
+        let payload_branch = db_resource
+            .inner_content
+            .as_ref()
+            .and_then(crate::access::extract_sangh_branch);
+        effective_user_branch =
+            crate::access::resolve_branch_for_new_creation(&req, &s_data, payload_branch).await;
+
+        if let Some(ref branch) = effective_user_branch {
+            if let Some(serde_json::Value::Object(ref mut map)) = db_resource.inner_content {
+                map.insert(
+                    "SanghBranch".to_string(),
+                    serde_json::Value::String(branch.clone()),
+                );
+            }
+        }
     }
+
     let id = match s_data
         .db
         .create_resource(resource_name.clone(), db_resource.clone())
@@ -145,6 +320,24 @@ pub async fn write(
                 .body(format!("Failed to write resource: {:?}", err));
         }
     };
+
+    if resource_name == ResourceName::UserResource {
+        if let Some(ref inner_content) = db_resource.inner_content {
+            if let Err(err) = crate::access::ensure_permission_in_db_for_user(
+                &s_data.db,
+                id,
+                inner_content,
+                effective_user_branch,
+            )
+            .await
+            {
+                eprintln!(
+                    "Failed to create paired PermissionResource for UserResource {}: {}",
+                    id, err
+                );
+            }
+        }
+    }
 
     {
         let mut cache = s_data.cache.write().await;
@@ -182,9 +375,64 @@ pub async fn read(
     };
 
     if resource_name == ResourceName::UserResource {
-        if !is_admin(req) {
+        if !is_admin(req.clone()) {
             return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
         }
+    }
+
+    if resource_name == ResourceName::PermissionResource {
+        if !is_admin(req) {
+            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+        }
+
+        if id == Some("all".into()) {
+            let db_resources = match s_data
+                .db
+                .read_all_resource(ResourceName::PermissionResource)
+                .await
+            {
+                Ok(resources) => resources,
+                Err(err) => {
+                    return HttpResponse::InternalServerError()
+                        .body(format!("Failed to read PermissionResource: {:?}", err));
+                }
+            };
+
+            if db_resources.is_empty() {
+                return HttpResponse::NotFound()
+                    .body("No resources found for resource name: PermissionResource in database");
+            }
+            return HttpResponse::Ok().json(db_resources);
+        }
+
+        let parsed_id: i32 = match id {
+            Some(id_str) => match id_str.parse() {
+                Ok(i) => i,
+                Err(_) => return HttpResponse::BadRequest().body("Invalid ID format"),
+            },
+            None => {
+                return HttpResponse::BadRequest().body("ID is required for reading a resource");
+            }
+        };
+
+        let db_resource = match s_data
+            .db
+            .read_resource(ResourceName::PermissionResource, parsed_id)
+            .await
+        {
+            Ok(resource) => resource,
+            Err(err) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("Failed to read PermissionResource: {:?}", err));
+            }
+        };
+
+        if db_resource.id.is_none() {
+            return HttpResponse::NotFound()
+                .body(format!("Resource not found for id: {}", parsed_id));
+        }
+
+        return HttpResponse::Ok().json(db_resource);
     }
 
     let cache = s_data.cache.read().await;
@@ -311,6 +559,15 @@ pub async fn delete(
         });
     }
 
+    if resource_name == ResourceName::UserResource {
+        if let Err(err) = crate::access::delete_permission_for_user(&s_data, id).await {
+            eprintln!(
+                "Failed to delete paired PermissionResource for UserResource {}: {}",
+                id, err
+            );
+        }
+    }
+
     HttpResponse::Ok().json(format!("Resource deleted with id: {}", id))
 }
 
@@ -326,6 +583,8 @@ mod tests {
             exp: 9999999999,
             iat: 1000000000,
             role: crate::roles::Roles::Admin,
+            user_id: None,
+            jti: None,
         });
 
         assert!(is_admin(req));
@@ -339,6 +598,8 @@ mod tests {
             exp: 9999999999,
             iat: 1000000000,
             role: crate::roles::Roles::User,
+            user_id: None,
+            jti: None,
         });
 
         assert!(!is_admin(req));
@@ -352,6 +613,8 @@ mod tests {
             exp: 9999999999,
             iat: 1000000000,
             role: crate::roles::Roles::Operator,
+            user_id: None,
+            jti: None,
         });
 
         assert!(!is_admin(req));
@@ -475,5 +738,209 @@ mod tests {
             .expect("updated resource should exist in cache");
         assert_eq!(cached.id, Some(42));
         assert_eq!(cached.resource_name, Some(ResourceName::SettingResource));
+    }
+
+    fn make_req_with_role(role: Option<crate::roles::Roles>) -> actix_web::HttpRequest {
+        let req = actix_web::test::TestRequest::default().to_http_request();
+        if let Some(r) = role {
+            req.extensions_mut().insert(crate::auth::Claims {
+                sub: "caller@test.com".to_string(),
+                exp: 9999999999,
+                iat: 1000000000,
+                role: r,
+                user_id: Some(1),
+                jti: None,
+            });
+        }
+        req
+    }
+
+    fn sample_billing_rule_payload(branch: Option<&str>) -> DatabaseResource {
+        let mut inner = serde_json::json!({
+            "scope": "COMMON",
+            "amount": 500,
+            "status": "ACTIVE",
+            "fiscalYear": "2082/2083",
+            "resourceType": "BILLING_RULE"
+        });
+        if let Some(b) = branch {
+            inner["sthaniyaBranch"] = serde_json::Value::String(b.to_string());
+        }
+        DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::BillingRuleResource),
+            inner_content: Some(inner),
+            external_content: None,
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_billing_rule_write_only_allowed_for_admin() {
+        let (s_data, db_state) = crate::access::test_helpers::create_mock_server_data_with_state(
+            crate::access::test_helpers::MockDbState::default(),
+        )
+        .await;
+
+        for role in [
+            None,
+            Some(crate::roles::Roles::User),
+            Some(crate::roles::Roles::Operator),
+        ] {
+            let resp = write(
+                web::Path::from(ResourceName::BillingRuleResource),
+                web::Json(sample_billing_rule_payload(Some("Loadboard sthaniya"))),
+                make_req_with_role(role),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+        }
+
+        let admin_resp = write(
+            web::Path::from(ResourceName::BillingRuleResource),
+            web::Json(sample_billing_rule_payload(Some("Loadboard sthaniya"))),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(admin_resp.status(), actix_web::http::StatusCode::OK);
+
+        let guard = db_state.lock().await;
+        assert_eq!(
+            guard.tables.get("billingruleresource").map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_billing_rule_update_only_allowed_for_admin() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(12),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "amount": 2000,
+                    "status": "ACTIVE",
+                    "fiscalYear": "2082/83",
+                    "resourceType": "BILLING_RULE"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, db_state) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        for role in [
+            None,
+            Some(crate::roles::Roles::User),
+            Some(crate::roles::Roles::Operator),
+        ] {
+            let resp = update(
+                web::Path::from((ResourceName::BillingRuleResource, 12)),
+                web::Json(sample_billing_rule_payload(Some("Loadboard sthaniya"))),
+                make_req_with_role(role),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+        }
+
+        let admin_resp = update(
+            web::Path::from((ResourceName::BillingRuleResource, 12)),
+            web::Json(sample_billing_rule_payload(Some("Loadboard sthaniya"))),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(admin_resp.status(), actix_web::http::StatusCode::OK);
+
+        let guard = db_state.lock().await;
+        let updated = &guard.tables.get("billingruleresource").unwrap()[0];
+        assert_eq!(
+            updated
+                .inner_content
+                .as_ref()
+                .and_then(|v| v.get("sthaniyaBranch"))
+                .and_then(|v| v.as_str()),
+            Some("Loadboard sthaniya")
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_billing_rule_delete_only_allowed_for_admin() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(29),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({ "name": "Entry" })),
+                external_content: None,
+            },
+        );
+        let (s_data, db_state) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        for role in [
+            None,
+            Some(crate::roles::Roles::User),
+            Some(crate::roles::Roles::Operator),
+        ] {
+            let resp = delete(
+                web::Path::from((ResourceName::BillingRuleResource, 29)),
+                s_data.clone(),
+                make_req_with_role(role),
+            )
+            .await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+        }
+
+        let admin_resp = delete(
+            web::Path::from((ResourceName::BillingRuleResource, 29)),
+            s_data.clone(),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+        )
+        .await;
+        assert_eq!(admin_resp.status(), actix_web::http::StatusCode::OK);
+
+        let guard = db_state.lock().await;
+        assert_eq!(
+            guard.tables.get("billingruleresource").map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_billing_rule_read_allowed_for_non_admin() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(29),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "name": "Entry",
+                    "sthaniyaBranch": "Loadboard sthaniya"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        for role in [
+            Some(crate::roles::Roles::User),
+            Some(crate::roles::Roles::Operator),
+        ] {
+            let resp = read(
+                web::Path::from(("BillingRuleResource".to_string(), Some("29".to_string()))),
+                s_data.clone(),
+                make_req_with_role(role),
+            )
+            .await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        }
     }
 }

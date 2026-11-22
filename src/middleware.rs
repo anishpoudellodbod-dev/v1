@@ -107,6 +107,10 @@ where
             }
         };
 
+        if crate::access::is_token_revoked(token) {
+            return Box::pin(async { Err(ErrorUnauthorized("Token has been logged out")) });
+        }
+
         /*
         * Verify the JWT.
         *

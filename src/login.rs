@@ -128,7 +128,30 @@ pub async fn login(
         }
     };
 
-    let token = match auth::create_jwt_with_role(&credentials.email, &role) {
+    let Some(user_id) = user.id else {
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "success": false,
+            "message": "User resource is missing id"
+        }));
+    };
+
+    let permission_resource =
+        match crate::access::load_permission_on_login(&s_data, user, &role).await {
+            Ok(perm) => perm,
+            Err(error) => {
+                eprintln!("Failed to load PermissionResource on login: {}", error);
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "success": false,
+                    "message": "Failed to load user permissions"
+                }));
+            }
+        };
+
+    let token = match auth::create_jwt_with_role_and_user_id(
+        &credentials.email,
+        &role,
+        Some(user_id),
+    ) {
         Ok(token) => token,
         Err(error) => {
             eprintln!("Failed to create RS512 JWT: {:?}", error);
@@ -140,6 +163,12 @@ pub async fn login(
         }
     };
 
+    response_data
+        .entry("id".to_owned())
+        .or_insert_with(|| serde_json::json!(user_id));
+    if let Ok(perm_json) = serde_json::to_value(&permission_resource) {
+        response_data.insert("permissionResource".to_owned(), perm_json);
+    }
     response_data.insert(
         "token".to_owned(),
         serde_json::Value::String(token),

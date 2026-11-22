@@ -3,9 +3,9 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use dotenv::dotenv;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use std::env;
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::env;
 use std::sync::{Arc, RwLock};
 mod db;
 mod login;
@@ -25,7 +25,7 @@ mod api_stream;
 pub mod date;
 pub mod log;
 pub mod sms;
-
+pub mod access;
 
 #[derive(Clone)]
 pub struct ServerData {
@@ -47,6 +47,7 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
     let mut routes = vec![
         "method: GET,       /".to_string(),
         "method: POST,      api/v1/auth/login".to_string(),
+        "method: POST,      api/v1/auth/logout".to_string(),
         "method: GET,       api/v1/dashboard/statistics".to_string(),
         "method: GET,       api/v1/dashboard/statistics/{fiscal_year}".to_string(),
     ];
@@ -105,6 +106,10 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: POST,      api/v1/sms/preview",
             "method: POST,      api/v1/sms/send",
             "method: POST,      api/v1/sms/send-raw",
+            "method: GET,       api/v1/access/me",
+            "method: GET,       api/v1/access/user/{user_id}",
+            "method: POST,      api/v1/access/permission",
+            "method: PUT,       api/v1/access/user/{user_id}",
         ]
         .into_iter()
         .map(String::from),
@@ -125,30 +130,220 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
 pub async fn create_admin_user_if_not_exists(db: &Database) {
     let email = "admin@narayanisangh.com";
     let password = "Admin@123";
+    let setting_branch = access::get_setting_sangh_branch_from_db(db).await;
 
     let db_user = db.read_all_resource(resource::ResourceName::UserResource).await;
     if let Ok(users) = db_user {
         if !users.is_empty() {
             println!("Admin user already exists");
+            if let Some(admin) = users.iter().find(|u| {
+                u.inner_content
+                    .as_ref()
+                    .and_then(|c| c.get("email"))
+                    .and_then(|e| e.as_str())
+                    .map(|e| e.eq_ignore_ascii_case(email))
+                    .unwrap_or(false)
+            }) {
+                if let (Some(admin_id), Some(admin_inner)) = (admin.id, &admin.inner_content) {
+                    if let Err(err) = access::ensure_permission_in_db_for_user(
+                        db,
+                        admin_id,
+                        admin_inner,
+                        setting_branch,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "Failed to ensure PermissionResource for existing admin user {}: {}",
+                            admin_id, err
+                        );
+                    }
+                }
+            }
             return;
         }
     }
+    let mut admin_map = serde_json::Map::new();
+    admin_map.insert(
+        "email".to_string(),
+        serde_json::Value::String(email.to_string()),
+    );
+    admin_map.insert(
+        "password".to_string(),
+        serde_json::Value::String(password.to_string()),
+    );
+    admin_map.insert(
+        "role".to_string(),
+        serde_json::Value::String("Admin".to_string()),
+    );
+    if let Some(ref branch) = setting_branch {
+        admin_map.insert(
+            "SanghBranch".to_string(),
+            serde_json::Value::String(branch.clone()),
+        );
+    }
+    let admin_inner = serde_json::Value::Object(admin_map);
+
     let resource = DatabaseResource {
         id: None,
-        inner_content: Some(serde_json::json!({
-            "email": email,
-            "password": password,
-            "role": "Admin",
-        })),
+        inner_content: Some(admin_inner.clone()),
         external_content: None,
         resource_name: Some(resource::ResourceName::UserResource),
     };
-    let result = db.create_resource(resource::ResourceName::UserResource, resource);
+    match db
+        .create_resource(resource::ResourceName::UserResource, resource)
+        .await
+    {
+        Ok(admin_id) => {
+            println!("Admin user created successfully");
+            if let Err(err) = access::ensure_permission_in_db_for_user(
+                db,
+                admin_id,
+                &admin_inner,
+                setting_branch,
+            )
+            .await
+            {
+                eprintln!(
+                    "Failed to create 1:1 PermissionResource for admin user {}: {}",
+                    admin_id, err
+                );
+            }
+        }
+        Err(err) => {
+            println!("Failed to create admin user: {:?}", err);
+        }
+    }
+}
 
-    if result.await.is_ok() {
-        println!("Admin user created successfully");
-    } else {
-        println!("Failed to create admin user");
+pub async fn add_sthaniya_branch_to_billing_rule_resources(db: &Database) {
+    let items = match db
+        .read_all_resource(resource::ResourceName::BillingRuleResource)
+        .await
+    {
+        Ok(items) => items,
+        Err(err) => {
+            eprintln!(
+                "Failed to read BillingRuleResource for sthaniyaBranch migration: {:?}",
+                err
+            );
+            return;
+        }
+    };
+
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+
+    for mut item in items {
+        let Some(id) = item.id else {
+            continue;
+        };
+
+        let Some(serde_json::Value::Object(ref mut map)) = item.inner_content else {
+            continue;
+        };
+
+        if map.get("sthaniyaBranch").and_then(|v| v.as_str()) == Some("Loadboard sthaniya") {
+            skipped += 1;
+            continue;
+        }
+
+        map.insert(
+            "sthaniyaBranch".to_string(),
+            serde_json::Value::String("Loadboard sthaniya".to_string()),
+        );
+
+        match db
+            .update_resource(resource::ResourceName::BillingRuleResource, id, item)
+            .await
+        {
+            Ok(()) => updated += 1,
+            Err(err) => {
+                eprintln!(
+                    "Failed to update BillingRuleResource {} with sthaniyaBranch: {:?}",
+                    id, err
+                );
+            }
+        }
+    }
+
+    println!(
+        "BillingRuleResource sthaniyaBranch migration complete: {} updated, {} already up-to-date",
+        updated, skipped
+    );
+}
+
+pub async fn migrate_fiscal_year_id_to_fiscal_year(db: &Database) {
+    for resource_name in [
+        resource::ResourceName::BillingRuleResource,
+        resource::ResourceName::BillResource,
+    ] {
+        let items = match db.read_all_resource(resource_name).await {
+            Ok(items) => items,
+            Err(err) => {
+                eprintln!(
+                    "Failed to read {:?} for fiscalYearId migration: {:?}",
+                    resource_name, err
+                );
+                continue;
+            }
+        };
+
+        let mut updated = 0usize;
+        let mut skipped = 0usize;
+
+        for mut item in items {
+            let Some(id) = item.id else {
+                continue;
+            };
+
+            let Some(serde_json::Value::Object(ref map)) = item.inner_content else {
+                continue;
+            };
+
+            let has_fiscal_year_id = map.keys().any(|k| k.eq_ignore_ascii_case("fiscalyearid"));
+            if !has_fiscal_year_id {
+                skipped += 1;
+                continue;
+            }
+
+            let mut new_map = serde_json::Map::with_capacity(map.len());
+            let mut inserted_fiscal_year = false;
+
+            for (k, v) in map.iter() {
+                if k.eq_ignore_ascii_case("fiscalyearid") {
+                    if !inserted_fiscal_year {
+                        new_map.insert(
+                            "fiscalYear".to_string(),
+                            serde_json::Value::String("2082/2083".to_string()),
+                        );
+                        inserted_fiscal_year = true;
+                    }
+                    continue;
+                }
+                if k.eq_ignore_ascii_case("fiscalyear") {
+                    continue;
+                }
+                new_map.insert(k.clone(), v.clone());
+            }
+
+            item.inner_content = Some(serde_json::Value::Object(new_map));
+
+            match db.update_resource(resource_name, id, item).await {
+                Ok(()) => updated += 1,
+                Err(err) => {
+                    eprintln!(
+                        "Failed to migrate fiscalYearId on {:?} {}: {:?}",
+                        resource_name, id, err
+                    );
+                }
+            }
+        }
+
+        println!(
+            "{:?} fiscalYearId -> fiscalYear migration complete: {} updated, {} skipped",
+            resource_name, updated, skipped
+        );
     }
 }
 
@@ -200,6 +395,13 @@ async fn main() -> std::io::Result<()> {
     // Create database tables if they don't exist
     let client = Arc::new(client);
     let db = Database::new(client.clone());
+
+    if env::args().any(|arg| arg == "--run-migrations") {
+        add_sthaniya_branch_to_billing_rule_resources(&db).await;
+        migrate_fiscal_year_id_to_fiscal_year(&db).await;
+        println!("One-off migrations finished; exiting (--run-migrations).");
+        return Ok(());
+    }
     
     //Delete previous tables
     //db.delete_tables().await.expect("Failed to delete tables");
@@ -209,6 +411,8 @@ async fn main() -> std::io::Result<()> {
         eprintln!("Error creating tables: {}", e);
     }
     create_admin_user_if_not_exists(&db).await;
+    add_sthaniya_branch_to_billing_rule_resources(&db).await;
+    migrate_fiscal_year_id_to_fiscal_year(&db).await;
 
     let mut cache = cache::Cache::new();
     println!("Loading cache from database...");
@@ -235,7 +439,20 @@ async fn main() -> std::io::Result<()> {
             //.app_data(web::Data::new(server_data.clone()))
             .app_data(web::Data::new(Arc::new(server_data.clone())))
             .route("/", web::get().to(server_routes))
-            .service(web::scope("/api/v1/auth").route("/login", web::post().to(login::login)))
+            .service(
+                web::scope("/api/v1/auth")
+                    .route("/login", web::post().to(login::login))
+                    .route("/logout", web::post().to(access::logout)),
+            )
+            .service(
+                web::scope("/api/v1/access")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .configure(access::configure_routes),
+            )
             // .service(
             //     web::scope("/api/v1/Developer")
             //     .route("/create/user", web::post().to(routes::create_user))
@@ -390,4 +607,266 @@ async fn main() -> std::io::Result<()> {
     .expect("Failed to bind to port")
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::test_helpers::{create_mock_server_data_with_state, MockDbState};
+    use crate::resource::ResourceName;
+
+    #[actix_web::test]
+    async fn test_add_sthaniya_branch_to_billing_rule_resources_updates_all_existing_items() {
+        let mut state = MockDbState::default();
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(29),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "code": "",
+                    "name": "Entry",
+                    "status": "ACTIVE",
+                    "fiscalYear": "2082/2083",
+                    "displayOrder": 11,
+                    "resourceType": "FEE_HEAD"
+                })),
+                external_content: None,
+            },
+        );
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(16),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "scope": "COMMON",
+                    "amount": 0,
+                    "status": "ACTIVE",
+                    "fiscalYear": "2082/2083",
+                    "resourceType": "BILLING_RULE",
+                    "billingEntityId": 1
+                })),
+                external_content: Some(serde_json::json!({ "createdTime": "2026-11-16T10:11:27Z" })),
+            },
+        );
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(26),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "scope": "COMMON",
+                    "amount": 0,
+                    "sthaniyaBranch": "Loadboard sthaniya"
+                })),
+                external_content: None,
+            },
+        );
+
+        let (s_data, db_state) = create_mock_server_data_with_state(state).await;
+
+        add_sthaniya_branch_to_billing_rule_resources(&s_data.db).await;
+
+        {
+            let guard = db_state.lock().await;
+            let rows = guard.tables.get("billingruleresource").unwrap();
+            assert_eq!(rows.len(), 3);
+            for row in rows {
+                let inner = row.inner_content.as_ref().unwrap();
+                assert_eq!(
+                    inner.get("sthaniyaBranch").and_then(|v| v.as_str()),
+                    Some("Loadboard sthaniya")
+                );
+            }
+            let row_29 = rows.iter().find(|r| r.id == Some(29)).unwrap();
+            assert_eq!(row_29.inner_content.as_ref().unwrap()["name"], "Entry");
+            let row_16 = rows.iter().find(|r| r.id == Some(16)).unwrap();
+            assert_eq!(
+                row_16.external_content,
+                Some(serde_json::json!({ "createdTime": "2026-11-16T10:11:27Z" }))
+            );
+        }
+
+        // Second run is idempotent
+        add_sthaniya_branch_to_billing_rule_resources(&s_data.db).await;
+        let guard = db_state.lock().await;
+        for row in guard.tables.get("billingruleresource").unwrap() {
+            assert_eq!(
+                row.inner_content
+                    .as_ref()
+                    .unwrap()
+                    .get("sthaniyaBranch")
+                    .and_then(|v| v.as_str()),
+                Some("Loadboard sthaniya")
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_migrate_fiscal_year_id_to_fiscal_year_in_billing_rule_and_bill_resources() {
+        let mut state = MockDbState::default();
+
+        // BillResource rows
+        state.seed(
+            ResourceName::BillResource,
+            DatabaseResource {
+                id: Some(149),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(serde_json::json!({
+                    "total": 565,
+                    "vehicle": { "id": "36010", "vehicleNumber": "PROVINCE-4-56-02-JHA-8241" },
+                    "items": [{ "title": "Entry", "amount": 500 }],
+                    "fiscalYearId": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                    "paymentMethod": "नगद"
+                })),
+                external_content: Some(serde_json::json!({ "createdTime": "2026-11-17T09:55:09Z" })),
+            },
+        );
+        state.seed(
+            ResourceName::BillResource,
+            DatabaseResource {
+                id: Some(150),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(serde_json::json!({
+                    "total": 100,
+                    "fiscalyearid": "any-value"
+                })),
+                external_content: None,
+            },
+        );
+        state.seed(
+            ResourceName::BillResource,
+            DatabaseResource {
+                id: Some(151),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(serde_json::json!({
+                    "total": 200,
+                    "fiscalYear": "2083/2084"
+                })),
+                external_content: None,
+            },
+        );
+
+        // BillingRuleResource rows
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(24),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "scope": "COMMON",
+                    "amount": 0,
+                    "fiscalYearId": "15f21721-50e8-41af-9596-9d8cdb8d6a16",
+                    "resourceType": "BILLING_RULE"
+                })),
+                external_content: None,
+            },
+        );
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(25),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "name": "Fee Head",
+                    "fiscalYearId": null,
+                    "resourceType": "FEE_HEAD"
+                })),
+                external_content: None,
+            },
+        );
+        state.seed(
+            ResourceName::BillingRuleResource,
+            DatabaseResource {
+                id: Some(29),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "name": "Entry",
+                    "fiscalYear": "2082/2083",
+                    "resourceType": "FEE_HEAD"
+                })),
+                external_content: None,
+            },
+        );
+
+        let (s_data, db_state) = create_mock_server_data_with_state(state).await;
+
+        migrate_fiscal_year_id_to_fiscal_year(&s_data.db).await;
+
+        {
+            let guard = db_state.lock().await;
+            let bill_rows = guard.tables.get("billresource").unwrap();
+            assert_eq!(bill_rows.len(), 3);
+
+            let b149 = bill_rows.iter().find(|r| r.id == Some(149)).unwrap();
+            let b149_inner = b149.inner_content.as_ref().unwrap().as_object().unwrap();
+            assert!(!b149_inner.keys().any(|k| k.eq_ignore_ascii_case("fiscalyearid")));
+            assert_eq!(b149_inner.get("fiscalYear").and_then(|v| v.as_str()), Some("2082/2083"));
+            assert_eq!(b149_inner.get("total").and_then(|v| v.as_i64()), Some(565));
+            assert_eq!(
+                b149.external_content,
+                Some(serde_json::json!({ "createdTime": "2026-11-17T09:55:09Z" }))
+            );
+
+            let b150 = bill_rows.iter().find(|r| r.id == Some(150)).unwrap();
+            let b150_inner = b150.inner_content.as_ref().unwrap().as_object().unwrap();
+            assert!(!b150_inner.keys().any(|k| k.eq_ignore_ascii_case("fiscalyearid")));
+            assert_eq!(b150_inner.get("fiscalYear").and_then(|v| v.as_str()), Some("2082/2083"));
+            assert_eq!(b150_inner.get("total").and_then(|v| v.as_i64()), Some(100));
+
+            let b151 = bill_rows.iter().find(|r| r.id == Some(151)).unwrap();
+            assert_eq!(
+                b151.inner_content
+                    .as_ref()
+                    .unwrap()
+                    .get("fiscalYear")
+                    .and_then(|v| v.as_str()),
+                Some("2083/2084")
+            );
+
+            let rule_rows = guard.tables.get("billingruleresource").unwrap();
+            assert_eq!(rule_rows.len(), 3);
+
+            for rule_id in [24, 25] {
+                let row = rule_rows.iter().find(|r| r.id == Some(rule_id)).unwrap();
+                let obj = row.inner_content.as_ref().unwrap().as_object().unwrap();
+                assert!(!obj.keys().any(|k| k.eq_ignore_ascii_case("fiscalyearid")));
+                assert_eq!(obj.get("fiscalYear").and_then(|v| v.as_str()), Some("2082/2083"));
+            }
+
+            let r29 = rule_rows.iter().find(|r| r.id == Some(29)).unwrap();
+            assert_eq!(
+                r29.inner_content
+                    .as_ref()
+                    .unwrap()
+                    .get("fiscalYear")
+                    .and_then(|v| v.as_str()),
+                Some("2082/2083")
+            );
+        }
+
+        // Second run is idempotent
+        migrate_fiscal_year_id_to_fiscal_year(&s_data.db).await;
+        let guard = db_state.lock().await;
+        for row in guard.tables.get("billresource").unwrap() {
+            let obj = row.inner_content.as_ref().unwrap().as_object().unwrap();
+            assert!(!obj.keys().any(|k| k.eq_ignore_ascii_case("fiscalyearid")));
+        }
+        let b151 = guard
+            .tables
+            .get("billresource")
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(151))
+            .unwrap();
+        assert_eq!(
+            b151.inner_content
+                .as_ref()
+                .unwrap()
+                .get("fiscalYear")
+                .and_then(|v| v.as_str()),
+            Some("2083/2084")
+        );
+    }
 }

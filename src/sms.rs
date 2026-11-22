@@ -19,15 +19,6 @@ pub const MAX_SMS_CHAR_LEN: usize = 720;
 /// SamayaSMS rate limit: 2 requests per second per user (500ms minimum spacing).
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
-pub const PAID_TEMPLATE: &str =
-    "तपाईंको सवारी नम्बर {vehicle_number} को रकम रु {amount} प्राप्त भएको छ। धन्यवाद। {sangh_branch} म्याद सकिने मिति: {expiry_bs}";
-
-pub const PAYMENT_REMAINDER_TEMPLATE: &str =
-    "नमस्ते तपाईंको सवारी नम्बर {vehicle_number} को मासिक शुल्कको म्याद सकिएकोले {due_day_bs} गते भित्रमा मासिक नवीकरण गर्नुहोस्। {sangh_branch}";
-
-pub const URGENT_TEMPLATE: &str =
-    "नमस्ते तपाईंको सवारी नम्बर {vehicle_number} को मासिक शुल्कको म्याद सकिएकोले {due_day_bs} गते भित्रमा मासिक नवीकरण गर्नुहोस्। {sangh_branch}";
-
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SmsType {
@@ -44,14 +35,6 @@ pub enum SmsType {
 }
 
 impl SmsType {
-    pub const fn default_format(&self) -> &'static str {
-        match self {
-            Self::PAID => PAID_TEMPLATE,
-            Self::PAYMENT_REMAINDER => PAYMENT_REMAINDER_TEMPLATE,
-            Self::URGENT => URGENT_TEMPLATE,
-        }
-    }
-
     pub fn setting_template_ids(&self) -> &'static [&'static str] {
         match self {
             Self::PAID => &["payment-received", "paid", "payment_received"],
@@ -209,8 +192,6 @@ pub struct SmsTemplate {
     pub sms_type: SmsType,
     #[serde(default)]
     pub template_id: Option<String>,
-    #[serde(default)]
-    pub sms_format: Option<String>,
     pub vehicle_number: String,
     pub sangh_branch: String,
     #[serde(default)]
@@ -236,7 +217,6 @@ impl SmsTemplate {
             receiver: receiver.into(),
             sms_type: SmsType::PAID,
             template_id: None,
-            sms_format: None,
             vehicle_number: vehicle_number.into(),
             sangh_branch: sangh_branch.into(),
             expiry_bs: Some(expiry_bs.into()),
@@ -256,7 +236,6 @@ impl SmsTemplate {
             receiver: receiver.into(),
             sms_type: SmsType::PAYMENT_REMAINDER,
             template_id: None,
-            sms_format: None,
             vehicle_number: vehicle_number.into(),
             sangh_branch: sangh_branch.into(),
             expiry_bs: None,
@@ -276,7 +255,6 @@ impl SmsTemplate {
             receiver: receiver.into(),
             sms_type: SmsType::URGENT,
             template_id: None,
-            sms_format: None,
             vehicle_number: vehicle_number.into(),
             sangh_branch: sangh_branch.into(),
             expiry_bs: None,
@@ -296,11 +274,6 @@ impl SmsTemplate {
         self
     }
 
-    pub fn with_custom_format(mut self, format: impl Into<String>) -> Self {
-        self.sms_format = Some(format.into());
-        self
-    }
-
     pub fn with_scheduled_time(mut self, time: impl Into<String>) -> Self {
         self.scheduled_time = Some(time.into());
         self
@@ -311,10 +284,9 @@ impl SmsTemplate {
         normalize_contacts(&self.receiver)
     }
 
-    /// Renders the final SMS text using `sms_format` (if provided and non-empty), otherwise
-    /// `format_override` (e.g. from `SettingResource`), otherwise the default format for `sms_type`,
+    /// Renders the final SMS text using a template string loaded from `SettingResource`,
     /// substituting both snake_case and camelCase placeholders and enforcing the 720-character limit.
-    pub fn render_with_format(&self, format_override: Option<&str>) -> Result<String> {
+    pub fn render_with_template(&self, template_content: &str) -> Result<String> {
         let vehicle_number = self.vehicle_number.trim();
         if vehicle_number.is_empty() {
             bail!("vehicle_number is required");
@@ -324,13 +296,10 @@ impl SmsTemplate {
             bail!("sangh_branch is required");
         }
 
-        let template = self
-            .sms_format
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| format_override.map(str::trim).filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| self.sms_type.default_format());
+        let template = template_content.trim();
+        if template.is_empty() {
+            bail!("SMS template content in SettingResource is empty");
+        }
 
         let mut msg = template
             .replace("{vehicle_number}", vehicle_number)
@@ -405,28 +374,27 @@ impl SmsTemplate {
         Ok(msg)
     }
 
-    /// Renders the final SMS text using `sms_format` (if provided and non-empty) or the default
-    /// format for `sms_type`, substituting all placeholders and validating required fields and
-    /// the 720-character API limit.
-    pub fn render(&self) -> Result<String> {
-        self.render_with_format(None)
-    }
-
     /// Renders the template using formats configured inside `SettingResource` items.
     pub fn render_with_settings<'a, I>(&self, settings: I) -> Result<String>
     where
         I: IntoIterator<Item = &'a DatabaseResource>,
     {
         let setting_tpl =
-            find_sms_template_in_settings(settings, self.sms_type, self.template_id.as_deref());
-        self.render_with_format(setting_tpl.as_ref().map(|t| t.content.as_str()))
+            find_sms_template_in_settings(settings, self.sms_type, self.template_id.as_deref())
+                .ok_or_else(|| {
+                    anyhow!("SMS template for {:?} not found in SettingResource", self.sms_type)
+                })?;
+        self.render_with_template(&setting_tpl.content)
     }
 
     /// Renders the template using `ResourceName::SettingResource` entries stored in `Cache`.
     pub fn render_with_cache(&self, cache: &Cache) -> Result<String> {
         let setting_tpl =
-            find_sms_template_in_cache(cache, self.sms_type, self.template_id.as_deref());
-        self.render_with_format(setting_tpl.as_ref().map(|t| t.content.as_str()))
+            find_sms_template_in_cache(cache, self.sms_type, self.template_id.as_deref())
+                .ok_or_else(|| {
+                    anyhow!("SMS template for {:?} not found in SettingResource", self.sms_type)
+                })?;
+        self.render_with_template(&setting_tpl.content)
     }
 }
 
@@ -613,14 +581,6 @@ impl SmsClient {
         params
     }
 
-    /// Renders and sends an `SmsTemplate` through the SamayaSMS HTTP POST API.
-    pub async fn send_template(&self, template: &SmsTemplate) -> Result<SmsSendResult> {
-        let contacts = template.normalized_contacts()?;
-        let message = template.render()?;
-        self.send_raw(&contacts, &message, template.scheduled_time.as_deref())
-            .await
-    }
-
     /// Renders an `SmsTemplate` using `ResourceName::SettingResource` stored in `Cache`
     /// and sends it through the SamayaSMS HTTP POST API.
     pub async fn send_template_with_cache(
@@ -642,23 +602,19 @@ impl SmsClient {
         s_data: &ServerData,
     ) -> Result<SmsSendResult> {
         let contacts = template.normalized_contacts()?;
-        let setting_tpl = if template
-            .sms_format
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            find_sms_template_in_server_data(
-                s_data,
-                template.sms_type,
-                template.template_id.as_deref(),
+        let setting_tpl = find_sms_template_in_server_data(
+            s_data,
+            template.sms_type,
+            template.template_id.as_deref(),
+        )
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "SMS template for {:?} not found in SettingResource",
+                template.sms_type
             )
-            .await
-        } else {
-            None
-        };
-        let message =
-            template.render_with_format(setting_tpl.as_ref().map(|t| t.content.as_str()))?;
+        })?;
+        let message = template.render_with_template(&setting_tpl.content)?;
         self.send_raw(&contacts, &message, template.scheduled_time.as_deref())
             .await
     }
@@ -769,7 +725,7 @@ pub struct SendRawSmsRequest {
     pub time: Option<String>,
 }
 
-/// POST /api/v1/sms/preview — Renders and validates an `SmsTemplate` without sending.
+/// POST /api/v1/sms/preview — Renders and validates an `SmsTemplate` using `SettingResource` without sending.
 pub async fn preview_sms_template(
     template: web::Json<SmsTemplate>,
     s_data: web::Data<Arc<ServerData>>,
@@ -780,32 +736,20 @@ pub async fn preview_sms_template(
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e.to_string() })),
     };
 
-    let has_custom_format = tpl
-        .sms_format
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
-
-    let setting_tpl = if has_custom_format {
-        None
-    } else {
+    let Some(setting_tpl) =
         find_sms_template_in_server_data(&s_data, tpl.sms_type, tpl.template_id.as_deref()).await
+    else {
+        return HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("SMS template for {:?} not found in SettingResource", tpl.sms_type)
+        }));
     };
 
-    let template_source = if has_custom_format {
-        "custom"
-    } else if setting_tpl.is_some() {
-        "setting_resource"
-    } else {
-        "default"
-    };
-
-    match tpl.render_with_format(setting_tpl.as_ref().map(|t| t.content.as_str())) {
+    match tpl.render_with_template(&setting_tpl.content) {
         Ok(message) => HttpResponse::Ok().json(serde_json::json!({
             "contacts": contacts,
             "sms_type": tpl.sms_type,
-            "template_id": tpl.template_id.or_else(|| setting_tpl.map(|t| t.id)),
-            "template_source": template_source,
+            "template_id": setting_tpl.id,
+            "template_source": "setting_resource",
             "message": message,
             "char_count": message.chars().count(),
             "scheduled_time": tpl.scheduled_time,
@@ -825,7 +769,12 @@ pub async fn send_template_sms(
         Ok(result) => HttpResponse::Ok().json(result),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("is required") || msg.contains("exceeds maximum length") || msg.contains("empty") {
+            if msg.contains("not found in SettingResource") {
+                HttpResponse::NotFound().json(serde_json::json!({ "error": msg }))
+            } else if msg.contains("is required")
+                || msg.contains("exceeds maximum length")
+                || msg.contains("empty")
+            {
                 HttpResponse::BadRequest().json(serde_json::json!({ "error": msg }))
             } else {
                 HttpResponse::BadGateway().json(serde_json::json!({ "error": msg }))
@@ -867,58 +816,15 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn test_render_paid_template() {
-        let tpl = SmsTemplate::new_paid(
-            "9841000000",
-            "BA-01-PA-1234",
-            "Main Branch",
-            2000.0,
-            "2083-08-30",
-        );
-        let rendered = tpl.render().expect("PAID template should render");
-        assert_eq!(
-            rendered,
-            "तपाईंको सवारी नम्बर BA-01-PA-1234 को रकम रु 2000 प्राप्त भएको छ। धन्यवाद। Main Branch म्याद सकिने मिति: 2083-08-30"
-        );
-    }
-
-    #[test]
-    fn test_render_payment_remainder_and_urgent_templates() {
-        let rem = SmsTemplate::new_payment_remainder(
-            "9841000000",
-            "NA-04-KHA-5050",
-            "Hetauda Branch",
-            "15",
-        );
-        assert_eq!(
-            rem.render().unwrap(),
-            "नमस्ते तपाईंको सवारी नम्बर NA-04-KHA-5050 को मासिक शुल्कको म्याद सकिएकोले 15 गते भित्रमा मासिक नवीकरण गर्नुहोस्। Hetauda Branch"
-        );
-
-        let urgent = SmsTemplate::new_urgent(
-            "9841000000, 9801000000",
-            "NA-04-KHA-5050",
-            "Hetauda Branch",
-            "20",
-        );
-        assert_eq!(
-            urgent.render().unwrap(),
-            "नमस्ते तपाईंको सवारी नम्बर NA-04-KHA-5050 को मासिक शुल्कको म्याद सकिएकोले 20 गते भित्रमा मासिक नवीकरण गर्नुहोस्। Hetauda Branch"
-        );
-        assert_eq!(
-            urgent.normalized_contacts().unwrap(),
-            "9841000000,9801000000"
-        );
-    }
-
-    #[test]
     fn test_template_validation_errors() {
+        let mut cache = Cache::new();
+        cache.write(ResourceName::SettingResource, 1, sample_setting_resource());
+
         // Missing amount & expiry_bs for PAID
         let invalid_paid = SmsTemplate {
             receiver: "9841000000".to_string(),
             sms_type: SmsType::PAID,
             template_id: None,
-            sms_format: None,
             vehicle_number: "BA-01-PA-1234".to_string(),
             sangh_branch: "Main Branch".to_string(),
             expiry_bs: None,
@@ -926,14 +832,13 @@ mod tests {
             amount: None,
             scheduled_time: None,
         };
-        assert!(invalid_paid.render().is_err());
+        assert!(invalid_paid.render_with_cache(&cache).is_err());
 
         // Missing due_date_bs for PAYMENT_REMAINDER
         let invalid_rem = SmsTemplate {
             receiver: "9841000000".to_string(),
             sms_type: SmsType::PAYMENT_REMAINDER,
             template_id: None,
-            sms_format: None,
             vehicle_number: "BA-01-PA-1234".to_string(),
             sangh_branch: "Main Branch".to_string(),
             expiry_bs: None,
@@ -941,22 +846,39 @@ mod tests {
             amount: None,
             scheduled_time: None,
         };
-        assert!(invalid_rem.render().is_err());
+        assert!(invalid_rem.render_with_cache(&cache).is_err());
 
-        // Exceeds 720 chars
-        let too_long = SmsTemplate::new_paid(
-            "9841000000",
-            "V1",
-            "Branch",
-            100.0,
-            "2083-01-01",
-        )
-        .with_custom_format("a".repeat(MAX_SMS_CHAR_LEN + 1));
-        assert!(too_long.render().is_err());
+        // Exceeds 720 chars in SettingResource template
+        let mut max_len_cache = Cache::new();
+        max_len_cache.write(
+            ResourceName::SettingResource,
+            2,
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(serde_json::json!({
+                    "smsSettings": {
+                        "templates": [{
+                            "id": "payment-received",
+                            "active": true,
+                            "channel": "SMS",
+                            "content": "a".repeat(MAX_SMS_CHAR_LEN + 1)
+                        }]
+                    }
+                })),
+                external_content: None,
+            },
+        );
+        let too_long =
+            SmsTemplate::new_paid("9841000000", "V1", "Branch", 100.0, "2083-01-01");
+        assert!(too_long.render_with_cache(&max_len_cache).is_err());
     }
 
     #[test]
     fn test_json_deserialization_numeric_or_string_receiver() {
+        let mut cache = Cache::new();
+        cache.write(ResourceName::SettingResource, 1, sample_setting_resource());
+
         let json_num = r#"{
             "receiver": 9841234567,
             "sms_type": "PAID",
@@ -968,18 +890,20 @@ mod tests {
         let tpl: SmsTemplate = serde_json::from_str(json_num).unwrap();
         assert_eq!(tpl.receiver, "9841234567");
         assert_eq!(tpl.sms_type, SmsType::PAID);
-        assert!(tpl.render().is_ok());
+        assert!(tpl.render_with_cache(&cache).is_ok());
 
         let json_alias = r#"{
             "receiver": "9841234567,9801234567",
             "sms_type": "PAYMENT_REMINDER",
             "vehicle_number": "BA-01-PA-1234",
             "sangh_branch": "Main",
+            "amount": 500,
             "due_day_bs": "10"
         }"#;
         let tpl2: SmsTemplate = serde_json::from_str(json_alias).unwrap();
         assert_eq!(tpl2.sms_type, SmsType::PAYMENT_REMAINDER);
         assert_eq!(tpl2.due_date_bs.as_deref(), Some("10"));
+        assert!(tpl2.render_with_cache(&cache).is_ok());
     }
 
     #[test]
@@ -1035,6 +959,9 @@ mod tests {
             sms_api_type: None,
         });
 
+        let mut cache = Cache::new();
+        cache.write(ResourceName::SettingResource, 1, sample_setting_resource());
+
         let tpl = SmsTemplate::new_paid(
             "9841111111",
             "BA-01-PA-9999",
@@ -1044,7 +971,10 @@ mod tests {
         )
         .with_scheduled_time("2026-11-19 14:30");
 
-        let result = client.send_template(&tpl).await.expect("SMS send should succeed");
+        let result = client
+            .send_template_with_cache(&tpl, &cache)
+            .await
+            .expect("SMS send should succeed");
         assert_eq!(result.shoot_id, "SHOOT998877");
         assert_eq!(result.contacts, "9841111111");
         assert_eq!(result.raw_response, "SMS-SHOOT-ID/SHOOT998877");
@@ -1084,39 +1014,6 @@ mod tests {
             .expect_err("HTTP 429 should return Err");
         assert!(err.to_string().contains("429"));
         assert!(err.to_string().contains("Rate limit exceeded"));
-    }
-
-    #[actix_web::test]
-    async fn test_live_send_paid_template_to_lodbod_test_sangh() {
-        dotenv::dotenv().ok();
-
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let random_num = 1000 + (nanos % 9000);
-        let vehicle_number = format!("BA-01-PA-{random_num}");
-
-        let tpl = SmsTemplate::new_paid(
-            "9861282176",
-            &vehicle_number,
-            "lodbod test sangh",
-            0.0,
-            "2083-12-30",
-        );
-
-        let client = SmsClient::from_env();
-        let result = client
-            .send_template(&tpl)
-            .await
-            .expect("Live SamayaSMS PAID template request should succeed");
-
-        println!("Live SMS sent: {result:?}");
-        assert!(!result.shoot_id.is_empty());
-        assert_eq!(result.contacts, "9861282176");
-        assert!(result.message.contains(&vehicle_number));
-        assert!(result.message.contains("रु 0"));
-        assert!(result.message.contains("lodbod test sangh"));
     }
 
     fn sample_setting_resource() -> DatabaseResource {
@@ -1272,22 +1169,23 @@ mod tests {
 
         // URGENT -> urgent-reminder
         let urgent_tpl = SmsTemplate::new_urgent(
-            "9841000000",
+            "9841000000, 9801000000",
             "BA-01-PA-1234",
             "Loadboard sthaniya",
             "2083-09-20",
+        );
+        assert_eq!(
+            urgent_tpl.normalized_contacts().unwrap(),
+            "9841000000,9801000000"
         );
         assert_eq!(
             urgent_tpl.render_with_cache(&cache).unwrap(),
             "अत्यावश्यक सूचना: सवारी नम्बर BA-01-PA-1234 को भुक्तानी म्याद 2083-09-20 मा सकिँदैछ। सेवा निरन्तरताका लागि समयमै भुक्तानी गर्नुहोस्।\nLoadboard sthaniya"
         );
 
-        // Falls back to default template when SettingResource is absent in cache
+        // Errors when SettingResource is absent in cache (no hardcoded fallback)
         let empty_cache = Cache::new();
-        assert_eq!(
-            paid_tpl.render_with_cache(&empty_cache).unwrap(),
-            paid_tpl.render().unwrap()
-        );
+        assert!(paid_tpl.render_with_cache(&empty_cache).is_err());
     }
 
     #[actix_web::test]
