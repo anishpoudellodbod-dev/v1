@@ -26,6 +26,7 @@ pub mod date;
 pub mod log;
 pub mod sms;
 pub mod access;
+pub mod settings;
 
 #[derive(Clone)]
 pub struct ServerData {
@@ -93,6 +94,7 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: GET,       api/v1/tqms/sync/{concurency}",
             "method: GET,       api/v1/read_all/VehicleTypes",
             "method: GET,       api/v1/get_vehicles_tqms",
+            "method: GET,       api/v1/tqms/stream_sync/{batch_size}/{concurrency}",
             "method: GET,       api/v1/streams/search/{resource_name}/{search_query}/{search_item}/{limit}/{offset}",
             "method: POST,      api/integrations/lodbod/v1/vehicles/billing-details",
             "method: POST,      api/integrations/lodbod/v1/payments/vehicle-receipts",
@@ -110,6 +112,17 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: GET,       api/v1/access/user/{user_id}",
             "method: POST,      api/v1/access/permission",
             "method: PUT,       api/v1/access/user/{user_id}",
+            "method: GET,       api/v1/logs/actions",
+            "method: GET,       api/v1/logs/actions/{resource_name}",
+            "method: GET,       api/v1/settings/resolved",
+            "method: POST,      api/v1/settings/billing/calculate-vat",
+            "method: GET,       api/v1/settings/billing/arrears/{vehicle}",
+            "method: POST,      api/v1/settings/billing/linked-fees/evaluate",
+            "method: GET,       api/v1/settings/receipts/cancellation-check/{bill_id}",
+            "method: GET,       api/v1/settings/insurance/eligibility/{vehicle}",
+            "method: GET,       api/v1/settings/fiscal-year/selector",
+            "method: GET,       api/v1/settings/fiscal-year/access/{fiscal_year}",
+            "method: GET,       api/v1/settings/vehicle-management/displaced-tagging",
         ]
         .into_iter()
         .map(String::from),
@@ -424,11 +437,16 @@ async fn main() -> std::io::Result<()> {
         tqms_client,
         cache: Arc::new(tokio::sync::RwLock::new(cache)),
     };
+    log::init_persistent_action_logger(
+        server_data.db.clone(),
+        Some(server_data.cache.clone()),
+    )
+    .await;
     let tls_config = load_tls_config()?;
     let app_port = env::var("APP_PORT").unwrap_or_else(|_| "5001".to_owned());
     println!("Starting server on port {}", app_port);
     // Create and start HTTPS server
-    HttpServer::new(move || {
+    let server_result = HttpServer::new(move || {
         let cors = Cors::default()
             .allow_any_origin()
             .allow_any_method()
@@ -511,6 +529,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/vehicle_details/{vehicle_number}", web::get().to(tqms_integration::get_vehicle_details))
                     .route("/sync", web::get().to(tqms_integration::sync_vehicles_tqms))
                     .route("/sync/{concurency}", web::get().to(tqms_integration::sync_vehicle_tqms_concurrency_limited))
+                    .route("/stream_sync/{batch_size}/{concurrency}", web::get().to(tqms_integration::stream_sync_vehicles_tqms))
             )
             .service(
                 web::scope("/api/v1/streams")
@@ -573,6 +592,20 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
             .service(
+                web::scope("/api/v1/settings")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .configure(settings::configure_routes),
+            )
+            .service(
+                web::scope("/api/v1/logs")
+                    .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin))
+                    .configure(log::configure_routes),
+            )
+            .service(
                 web::scope("/api/v1")
                     .route(
                         "/update/{resource_name}/{id}",
@@ -606,7 +639,10 @@ async fn main() -> std::io::Result<()> {
     .bind(format!("127.0.0.1:{}", app_port))
     .expect("Failed to bind to port")
     .run()
-    .await
+    .await;
+
+    log::flush_action_logs().await;
+    server_result
 }
 
 #[cfg(test)]

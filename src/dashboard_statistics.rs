@@ -445,7 +445,12 @@ impl FiscalYearConfig {
                 }
 
                 // Unified schemaVersion 1 SettingResource sub-objects
-                if let Some(arrears_obj) = map.get("arrears").and_then(Value::as_object) {
+                let billing_obj = map.get("billing").and_then(Value::as_object);
+                if let Some(arrears_obj) = billing_obj
+                    .and_then(|b| b.get("arrears"))
+                    .or_else(|| map.get("arrears"))
+                    .and_then(Value::as_object)
+                {
                     if let Some(monthly_paid) =
                         arrears_obj.get("monthlyPaid").and_then(Value::as_object)
                     {
@@ -465,7 +470,11 @@ impl FiscalYearConfig {
                     }
                 }
 
-                if let Some(linked_obj) = map.get("linkedFeeRules").and_then(Value::as_object) {
+                if let Some(linked_obj) = billing_obj
+                    .and_then(|b| b.get("linkedFeeRules"))
+                    .or_else(|| map.get("linkedFeeRules"))
+                    .and_then(Value::as_object)
+                {
                     let enabled = linked_obj
                         .get("enabled")
                         .and_then(Value::as_bool)
@@ -513,6 +522,7 @@ impl FiscalYearConfig {
                     for (sub_k, sub_v) in fy_obj {
                         if sub_k != "activeFiscalYears"
                             && sub_k != "selector"
+                            && sub_k != "billingAccess"
                             && (sub_v.is_object() || sub_v.is_array())
                         {
                             self.collect_from_value(sub_v);
@@ -614,7 +624,14 @@ impl FiscalYearConfig {
                 for (k, v) in map {
                     if matches!(
                         k.as_str(),
-                        "arrears"
+                        "billing"
+                            | "receipts"
+                            | "insurance"
+                            | "integrations"
+                            | "notifications"
+                            | "vehicleManagement"
+                            | "billingAccess"
+                            | "arrears"
                             | "linkedFeeRules"
                             | "vat"
                             | "smsSettings"
@@ -934,7 +951,7 @@ fn get_bs_ymd_table() -> &'static HashMap<u32, (i32, u32, u32)> {
     })
 }
 
-fn ad_date_str_to_bs_ymd(raw: &str) -> Option<(i32, u32, u32)> {
+pub(crate) fn ad_date_str_to_bs_ymd(raw: &str) -> Option<(i32, u32, u32)> {
     let (year, month, day) = parse_ymd_parts(raw)?;
 
     if (2051..=2095).contains(&year) {
@@ -1344,7 +1361,12 @@ pub fn compute_statistics(
     let members: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::MemberResource)
         .unwrap_or_default();
-    let displaced_users_year = count_displaced_vehicles(members, &index);
+    let displaced_users_year =
+        if crate::settings::is_displaced_tagging_enabled_in_resources(settings.iter().copied()) {
+            count_displaced_vehicles(members, &index)
+        } else {
+            0
+        };
 
     DashBoardStatistics {
         fiscal_year: target_fiscal_year,
@@ -2875,5 +2897,88 @@ mod tests {
         assert_eq!(stats.total_active_users_year, 2);
         assert_eq!(stats.new_users_year, 2);
         assert_eq!(stats.total_inactive_users_year, 0);
+    }
+
+    #[test]
+    fn test_nested_schema_v1_settings_billing_access_ignored_and_displaced_tagging_toggle() {
+        let mut cache = Cache::new();
+        let make_nested_setting = |displaced_enabled: bool| DatabaseResource {
+            id: Some(1),
+            resource_name: Some(ResourceName::SettingResource),
+            inner_content: Some(json!({
+                "billing": {
+                    "vat": { "rate": 13, "enabled": true, "billingEntityIds": ["1"] },
+                    "arrears": {
+                        "monthlyPaid": { "enabled": true, "fiscalYear": "2083/84", "billingRuleId": "45" },
+                        "paidExpired": { "enabled": true, "billingRuleId": "5" }
+                    },
+                    "linkedFeeRules": {
+                        "enabled": true,
+                        "rules": [
+                            { "id": "r1", "active": true, "fiscalYear": "2082/83", "linkedFeeHeadId": "21", "sourceFeeHeadId": "3", "oncePerFiscalYear": true }
+                        ]
+                    }
+                },
+                "fiscalYear": {
+                    "selector": { "yearsBack": 4, "yearsForward": 1, "archivedYears": [] },
+                    "billingAccess": {
+                        "nextYear": null,
+                        "previousYear": {
+                            "status": "CLOSED",
+                            "updatedAt": "2026-11-22T12:08:22.422Z",
+                            "updatedBy": "System Administrator",
+                            "fiscalYear": "2082/83"
+                        }
+                    }
+                },
+                "integrations": { "tqms": { "SanghBranch": "Loadboard sthaniya" } },
+                "vehicleManagement": {
+                    "displacedTagging": { "enabled": displaced_enabled }
+                },
+                "schemaVersion": 1
+            })),
+            external_content: None,
+        };
+
+        cache.write(ResourceName::SettingResource, 1, make_nested_setting(true));
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 4001, "GA-01-PA-4001", Some("2026-11-01T00:00:00Z")),
+        );
+        cache.write(
+            ResourceName::VehicleResource,
+            2,
+            make_vehicle(2, 4002, "GA-01-PA-4002", Some("2025-11-01T00:00:00Z")),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            1,
+            make_bill(1, "4001", "GA-01-PA-4001", "2083/84", "Fee", "1", Some("PAID")),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            2,
+            make_bill(2, "4002", "GA-01-PA-4002", "2082/83", "Fee", "1", Some("PAID")),
+        );
+        cache.write(
+            ResourceName::MemberResource,
+            10,
+            make_member(10, "4002", "GA-01-PA-4002", true, "DISPLACED", Some("2026-11-10T00:00:00Z")),
+        );
+
+        let stats_enabled = compute_statistics(None, &cache, &[], test_date());
+        // billingAccess.previousYear ("2082/83") must NOT override monthlyPaid.fiscalYear ("2083/84")
+        assert_eq!(stats_enabled.fiscal_year, "2083/84");
+        assert_eq!(stats_enabled.total_users_year, 2);
+        assert_eq!(stats_enabled.total_active_users_year, 1);
+        assert_eq!(stats_enabled.total_inactive_users_year, 1);
+        assert_eq!(stats_enabled.displaced_users_year, 1);
+
+        // When displacedTagging is disabled in SettingResource, displaced count must drop to 0
+        cache.write(ResourceName::SettingResource, 1, make_nested_setting(false));
+        let stats_disabled = compute_statistics(None, &cache, &[], test_date());
+        assert_eq!(stats_disabled.fiscal_year, "2083/84");
+        assert_eq!(stats_disabled.displaced_users_year, 0);
     }
 }

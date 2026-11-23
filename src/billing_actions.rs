@@ -1572,6 +1572,7 @@ async fn resolve_single_vehicle_billing_details(
     q_num: &str,
     q_norm: &str,
     tqms_vehicle: Option<Value>,
+    required_branch: &str,
     s_data: &ServerData,
 ) -> Result<VehicleBillingDetails, String> {
     let q_id_i64 = q_id.parse::<i64>().ok();
@@ -1691,7 +1692,7 @@ async fn resolve_single_vehicle_billing_details(
         });
     };
 
-    if !vehicle_has_sangh_branch(&inner, REQUIRED_STHANIYA_BRANCH) {
+    if !vehicle_has_sangh_branch(&inner, required_branch) {
         return Err("branch unavailable".to_string());
     }
 
@@ -1771,10 +1772,16 @@ pub async fn get_vehicle_billing_details(
         });
     }
 
+    let required_branch = {
+        let cache = s_data.cache.read().await;
+        crate::settings::resolve_tqms_sangh_branch_from_cache(&cache)
+    }
+    .unwrap_or_else(|| REQUIRED_STHANIYA_BRANCH.to_string());
+
     if body
         .vehicles
         .iter()
-        .any(|q| q.sthaniya_branch.trim() != REQUIRED_STHANIYA_BRANCH)
+        .any(|q| q.sthaniya_branch.trim() != required_branch)
     {
         return HttpResponse::BadRequest().json(ApiErrorResponse {
             success: false,
@@ -1782,11 +1789,11 @@ pub async fn get_vehicle_billing_details(
                 code: "INVALID_REQUEST".to_string(),
                 message: format!(
                     "Invalid sthaniyaBranch: only '{}' is supported",
-                    REQUIRED_STHANIYA_BRANCH
+                    required_branch
                 ),
                 details: vec![format!(
                     "Every vehicle entry must specify sthaniyaBranch as '{}'",
-                    REQUIRED_STHANIYA_BRANCH
+                    required_branch
                 )],
             },
             request_id: req_id,
@@ -1817,8 +1824,15 @@ pub async fn get_vehicle_billing_details(
             Err(_) => None,
         };
 
-        match resolve_single_vehicle_billing_details(q_id, q_num, &q_norm, tqms_vehicle, &s_data)
-            .await
+        match resolve_single_vehicle_billing_details(
+            q_id,
+            q_num,
+            &q_norm,
+            tqms_vehicle,
+            &required_branch,
+            &s_data,
+        )
+        .await
         {
             Ok(details) => results.push(details),
             Err(_) => return branch_unavailable_response(req_id),
@@ -2451,7 +2465,15 @@ pub async fn create_bill(
         let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(candidate_inner);
         let req_branch = extract_bill_sangh_branch(candidate_inner);
 
-        let (branch_unavailable, duplicate_bill_id) = {
+        enum CreateBillRuleError {
+            BranchUnavailable,
+            DuplicateBill(i32),
+            FiscalYearDenied(crate::settings::FiscalYearBillingAccessResult),
+            LinkedFeeDuplicate(Vec<String>),
+            LinkedFeeMissing(Vec<crate::settings::MissingLinkedFee>),
+        }
+
+        let validation_err: Option<CreateBillRuleError> = {
             let cache = s_data.cache.read().await;
             match resolve_and_validate_cached_vehicle_branch(
                 &cache,
@@ -2459,38 +2481,201 @@ pub async fn create_bill(
                 &cand_vnum,
                 req_branch.as_deref(),
             ) {
-                Err(_) => (true, None),
+                Err(_) => Some(CreateBillRuleError::BranchUnavailable),
                 Ok((_, resolved_branch)) => {
                     if req_branch.is_none() {
                         if let Some(branch) = resolved_branch {
                             candidate_inner["sanghBranch"] = Value::String(branch);
                         }
                     }
-                    let dup_id = cache
-                        .cache
-                        .get(&ResourceName::BillResource)
-                        .and_then(|bills_map| find_duplicate_bill(candidate_inner, bills_map.values()))
-                        .map(|b| b.id.unwrap_or(0));
-                    (false, dup_id)
+
+                    let mut rule_err: Option<CreateBillRuleError> = None;
+
+                    if let Some(app_settings) = crate::settings::load_settings_from_cache(&cache) {
+                        let bill_fy_str = candidate_inner
+                            .get("fiscalYear")
+                            .or_else(|| candidate_inner.get("fiscalYearId"))
+                            .and_then(|v| {
+                                v.as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from)
+                            });
+
+                        if let Some(ref fy) = bill_fy_str {
+                            if crate::dashboard_statistics::parse_fiscal_year_start(fy).is_some() {
+                                let fy_access = crate::settings::check_fiscal_year_billing_access(
+                                    &app_settings.fiscal_year,
+                                    fy,
+                                    crate::settings::current_bs_fiscal_year_start_year(),
+                                );
+                                if !fy_access.allowed {
+                                    rule_err = Some(CreateBillRuleError::FiscalYearDenied(fy_access));
+                                }
+                            }
+                        }
+
+                        if rule_err.is_none() && app_settings.billing.linked_fee_rules.enabled {
+                            if let Some(items) =
+                                candidate_inner.get("items").and_then(Value::as_array)
+                            {
+                                let billing_rules = cache
+                                    .read_all(ResourceName::BillingRuleResource)
+                                    .unwrap_or_default();
+                                let requested_fh =
+                                    crate::settings::extract_requested_fee_head_ids_from_items(
+                                        items,
+                                        &billing_rules,
+                                    );
+                                let cand_norm = normalize_vehicle_number(&cand_vnum);
+                                let vehicle_bills: Vec<&DatabaseResource> = cache
+                                    .read_all(ResourceName::BillResource)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|b| {
+                                        b.inner_content.as_ref().is_some_and(|inner| {
+                                            if crate::dashboard_statistics::is_bill_ignored(inner) {
+                                                return false;
+                                            }
+                                            let (b_vid, b_vnum) = extract_bill_vehicle_identity(inner);
+                                            (!cand_vid.is_empty() && b_vid == cand_vid)
+                                                || (!cand_norm.is_empty()
+                                                    && normalize_vehicle_number(&b_vnum) == cand_norm)
+                                        })
+                                    })
+                                    .collect();
+
+                                let linked_eval = crate::settings::evaluate_linked_fee_rules(
+                                    &app_settings.billing.linked_fee_rules,
+                                    bill_fy_str.as_deref(),
+                                    &requested_fh,
+                                    &vehicle_bills,
+                                    &billing_rules,
+                                );
+                                if !linked_eval.duplicate_once_per_fy_fee_heads.is_empty() {
+                                    rule_err = Some(CreateBillRuleError::LinkedFeeDuplicate(
+                                        linked_eval.duplicate_once_per_fy_fee_heads,
+                                    ));
+                                } else if !linked_eval.missing_linked_fee_heads.is_empty() {
+                                    rule_err = Some(CreateBillRuleError::LinkedFeeMissing(
+                                        linked_eval.missing_linked_fee_heads,
+                                    ));
+                                }
+                            }
+                        }
+
+                        if rule_err.is_none() && candidate_inner.get("vatAmount").is_none() {
+                            if let Some(items) = candidate_inner
+                                .get("items")
+                                .and_then(Value::as_array)
+                                .cloned()
+                            {
+                                let discount = candidate_inner
+                                    .get("discount")
+                                    .and_then(Value::as_f64)
+                                    .unwrap_or(0.0);
+                                let vat_res = crate::settings::calculate_vat(
+                                    &app_settings.billing.vat,
+                                    &items,
+                                    discount,
+                                );
+                                if candidate_inner.get("subtotal").is_none() {
+                                    candidate_inner["subtotal"] = serde_json::json!(vat_res.subtotal);
+                                }
+                                if candidate_inner.get("vatRatePct").is_none() {
+                                    candidate_inner["vatRatePct"] =
+                                        serde_json::json!(vat_res.vat_rate_pct);
+                                }
+                                candidate_inner["vatAmount"] =
+                                    serde_json::json!(vat_res.vat_amount);
+                                if candidate_inner.get("vatBillingEntityIds").is_none() {
+                                    candidate_inner["vatBillingEntityIds"] =
+                                        serde_json::json!(vat_res.vat_billing_entity_ids);
+                                }
+                                if candidate_inner.get("total").is_none() {
+                                    candidate_inner["total"] = serde_json::json!(vat_res.total);
+                                }
+                            }
+                        }
+                    }
+
+                    if rule_err.is_none() {
+                        if let Some(dup_id) = cache
+                            .cache
+                            .get(&ResourceName::BillResource)
+                            .and_then(|bills_map| {
+                                find_duplicate_bill(candidate_inner, bills_map.values())
+                            })
+                            .map(|b| b.id.unwrap_or(0))
+                        {
+                            rule_err = Some(CreateBillRuleError::DuplicateBill(dup_id));
+                        }
+                    }
+
+                    rule_err
                 }
             }
         };
 
-        if branch_unavailable {
-            return branch_unavailable_response(extract_request_id(&req));
-        }
-
-        if let Some(existing_id) = duplicate_bill_id {
-            return HttpResponse::Conflict().json(ApiErrorResponse {
-                success: false,
-                error: ApiErrorDetails {
-                    code: "DUPLICATE_BILL".to_string(),
-                    message: "A bill for the same vehicle, date, and payment already exists"
-                        .to_string(),
-                    details: vec![format!("Duplicate of existing bill ID {}", existing_id)],
-                },
-                request_id: extract_request_id(&req),
-            });
+        if let Some(err) = validation_err {
+            let req_id = extract_request_id(&req);
+            return match err {
+                CreateBillRuleError::BranchUnavailable => branch_unavailable_response(req_id),
+                CreateBillRuleError::FiscalYearDenied(fy_access) => {
+                    HttpResponse::Forbidden().json(ApiErrorResponse {
+                        success: false,
+                        error: ApiErrorDetails {
+                            code: fy_access.code,
+                            message: fy_access.reason,
+                            details: vec![],
+                        },
+                        request_id: req_id,
+                    })
+                }
+                CreateBillRuleError::LinkedFeeDuplicate(fee_ids) => {
+                    HttpResponse::Conflict().json(ApiErrorResponse {
+                        success: false,
+                        error: ApiErrorDetails {
+                            code: "LINKED_FEE_ALREADY_PAID_IN_FISCAL_YEAR".to_string(),
+                            message: "Linked fee is restricted to once per fiscal year and was already paid".to_string(),
+                            details: fee_ids,
+                        },
+                        request_id: req_id,
+                    })
+                }
+                CreateBillRuleError::LinkedFeeMissing(missing) => {
+                    let details: Vec<String> = missing
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "FeeHead {} requires linked FeeHead {}",
+                                m.source_fee_head_id, m.linked_fee_head_id
+                            )
+                        })
+                        .collect();
+                    HttpResponse::BadRequest().json(ApiErrorResponse {
+                        success: false,
+                        error: ApiErrorDetails {
+                            code: "LINKED_FEE_REQUIRED".to_string(),
+                            message: "One or more linked fees are required for the selected fee heads".to_string(),
+                            details,
+                        },
+                        request_id: req_id,
+                    })
+                }
+                CreateBillRuleError::DuplicateBill(existing_id) => {
+                    HttpResponse::Conflict().json(ApiErrorResponse {
+                        success: false,
+                        error: ApiErrorDetails {
+                            code: "DUPLICATE_BILL".to_string(),
+                            message: "A bill for the same vehicle, date, and payment already exists"
+                                .to_string(),
+                            details: vec![format!("Duplicate of existing bill ID {}", existing_id)],
+                        },
+                        request_id: req_id,
+                    })
+                }
+            };
         }
     }
 
@@ -2544,16 +2729,47 @@ pub async fn modify_bill(
     if let Some(ref mut new_inner) = new_resource.inner_content {
         let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(new_inner);
         let req_branch = extract_bill_sangh_branch(new_inner);
-        let branch_res = {
+        let (branch_res, fy_denied) = {
             let cache = s_data.cache.read().await;
-            resolve_and_validate_cached_vehicle_branch(
+            let b_res = resolve_and_validate_cached_vehicle_branch(
                 &cache,
                 &cand_vid,
                 &cand_vnum,
                 req_branch.as_deref(),
             )
-            .map(|(_, b)| b)
+            .map(|(_, b)| b);
+            let mut fy_err = None;
+            if let Some(app_settings) = crate::settings::load_settings_from_cache(&cache) {
+                let fy_str = new_inner
+                    .get("fiscalYear")
+                    .or_else(|| new_inner.get("fiscalYearId"))
+                    .and_then(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()));
+                if let Some(fy) = fy_str {
+                    if crate::dashboard_statistics::parse_fiscal_year_start(fy).is_some() {
+                        let access = crate::settings::check_fiscal_year_billing_access(
+                            &app_settings.fiscal_year,
+                            fy,
+                            crate::settings::current_bs_fiscal_year_start_year(),
+                        );
+                        if !access.allowed {
+                            fy_err = Some(access);
+                        }
+                    }
+                }
+            }
+            (b_res, fy_err)
         };
+        if let Some(access) = fy_denied {
+            return HttpResponse::Forbidden().json(ApiErrorResponse {
+                success: false,
+                error: ApiErrorDetails {
+                    code: access.code,
+                    message: access.reason,
+                    details: vec![],
+                },
+                request_id: extract_request_id(&req),
+            });
+        }
         match branch_res {
             Ok(Some(branch)) => {
                 if req_branch.is_none() {
@@ -2652,6 +2868,37 @@ pub async fn delete_bill(
             _ => return HttpResponse::NotFound().body("Bill not found"),
         },
     };
+
+    let cancel_blocked = {
+        let cache = s_data.cache.read().await;
+        crate::settings::load_settings_from_cache(&cache).and_then(|app_settings| {
+            if !app_settings.receipts.cancellation.enabled {
+                return None;
+            }
+            let check = crate::settings::check_receipt_cancellation(
+                &app_settings.receipts.cancellation,
+                &resource,
+                Utc::now(),
+            );
+            if check.allowed {
+                None
+            } else {
+                Some(check)
+            }
+        })
+    };
+
+    if let Some(check) = cancel_blocked {
+        return HttpResponse::Forbidden().json(ApiErrorResponse {
+            success: false,
+            error: ApiErrorDetails {
+                code: "RECEIPT_CANCELLATION_WINDOW_EXPIRED".to_string(),
+                message: check.reason,
+                details: vec![format!("Cancellation allowed within {} hours", check.window_hours)],
+            },
+            request_id: extract_request_id(&req),
+        });
+    }
 
     let orig_inner = resource.inner_content.clone();
 
@@ -4785,6 +5032,7 @@ mod tests {
             "Ba Pra-53-01-0-2256",
             "BAPRA530102256",
             Some(fresh_tqms),
+            REQUIRED_STHANIYA_BRANCH,
             &s_data,
         )
         .await
@@ -4851,6 +5099,7 @@ mod tests {
             "BA-01-PA-5001",
             "BA01PA5001",
             Some(fresh_cached_tqms),
+            REQUIRED_STHANIYA_BRANCH,
             &s_data,
         )
         .await
@@ -4889,6 +5138,7 @@ mod tests {
             "BA-02-PA-6001",
             "BA02PA6001",
             Some(tqms_only_eligible),
+            REQUIRED_STHANIYA_BRANCH,
             &s_data,
         )
         .await
@@ -4910,6 +5160,7 @@ mod tests {
             "BA-02-PA-6002",
             "BA02PA6002",
             Some(tqms_only_deregistered),
+            REQUIRED_STHANIYA_BRANCH,
             &s_data,
         )
         .await
@@ -4931,6 +5182,7 @@ mod tests {
             "BA-02-PA-6003",
             "BA02PA6003",
             Some(tqms_only_no_owners),
+            REQUIRED_STHANIYA_BRANCH,
             &s_data,
         )
         .await
@@ -6870,5 +7122,250 @@ mod tests {
         assert!(send_payment_update_to_lodbod(&payload, &err_url)
             .await
             .is_err());
+    }
+
+    #[actix_web::test]
+    async fn test_setting_resource_enforcement_in_create_modify_delete_bill_and_tqms_branch() {
+        let s_data = create_mock_server_data().await;
+        let current_fy = crate::settings::format_bs_fiscal_year_short(
+            crate::settings::current_bs_fiscal_year_start_year(),
+        );
+
+        {
+            let mut cache = s_data.cache.write().await;
+            cache.write(
+                ResourceName::SettingResource,
+                1,
+                DatabaseResource {
+                    id: Some(1),
+                    resource_name: Some(ResourceName::SettingResource),
+                    inner_content: Some(serde_json::json!({
+                        "schemaVersion": 1,
+                        "billing": {
+                            "vat": {
+                                "rate": 13,
+                                "enabled": true,
+                                "billingEntityIds": ["1"]
+                            },
+                            "linkedFeeRules": {
+                                "enabled": true,
+                                "rules": [{
+                                    "id": "rule-linked-1",
+                                    "active": true,
+                                    "fiscalYear": current_fy,
+                                    "linkedFeeHeadId": "21",
+                                    "sourceFeeHeadId": "3",
+                                    "oncePerFiscalYear": true
+                                }]
+                            }
+                        },
+                        "receipts": {
+                            "cancellation": {
+                                "hours": 24,
+                                "enabled": true
+                            }
+                        },
+                        "fiscalYear": {
+                            "selector": { "yearsBack": 4, "yearsForward": 1, "archivedYears": [] },
+                            "billingAccess": {
+                                "nextYear": null,
+                                "previousYear": {
+                                    "status": "CLOSED",
+                                    "updatedBy": "System Administrator",
+                                    "fiscalYear": "2081/82"
+                                }
+                            }
+                        },
+                        "integrations": {
+                            "tqms": {
+                                "SanghBranch": "Custom Settings Branch"
+                            }
+                        }
+                    })),
+                    external_content: None,
+                },
+            );
+            cache.write(
+                ResourceName::VehicleResource,
+                10,
+                DatabaseResource {
+                    id: Some(10),
+                    resource_name: Some(ResourceName::VehicleResource),
+                    inner_content: Some(serde_json::json!({
+                        "VehicleId": "7701",
+                        "VehicleNumber": "BA-01-PA-7701",
+                        "SanghBranch": "Custom Settings Branch",
+                        "Registration": { "Status": "ACTIVE" },
+                        "Owners": [{ "Name": "Test Owner", "Phone": "9841000000" }]
+                    })),
+                    external_content: None,
+                },
+            );
+            cache.write(
+                ResourceName::BillResource,
+                990,
+                DatabaseResource {
+                    id: Some(990),
+                    resource_name: Some(ResourceName::BillResource),
+                    inner_content: Some(serde_json::json!({
+                        "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
+                        "paidAt": (Utc::now() - chrono::Duration::hours(30)).to_rfc3339(),
+                        "status": "PAID",
+                        "items": [{ "feeHeadId": "99", "amount": 100 }]
+                    })),
+                    external_content: None,
+                },
+            );
+        }
+
+        // 1. get_vehicle_billing_details enforces SettingResource integrations.tqms.SanghBranch ("Custom Settings Branch")
+        let req_bad_branch = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_bad_branch = get_vehicle_billing_details(
+            req_bad_branch,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "7701".to_string(),
+                    sthaniya_branch: "Loadboard sthaniya".to_string(),
+                    vehicle_number: "BA-01-PA-7701".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_bad_branch.status(), StatusCode::BAD_REQUEST);
+
+        let req_ok_branch = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_ok_branch = get_vehicle_billing_details(
+            req_ok_branch,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "7701".to_string(),
+                    sthaniya_branch: "Custom Settings Branch".to_string(),
+                    vehicle_number: "BA-01-PA-7701".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_ok_branch.status(), StatusCode::OK);
+
+        // 2. create_bill blocked for CLOSED previousYear "2081/82" -> 403 Forbidden
+        let closed_bill = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2024-08-01",
+                "fiscalYear": "2081/82",
+                "paymentMethod": "CASH",
+                "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
+                "items": [{ "feeHeadId": "99", "amount": 500, "billingEntityId": "1" }]
+            })),
+            external_content: None,
+        };
+        let resp_closed = create_bill(
+            web::Json(closed_bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_closed.status(), StatusCode::FORBIDDEN);
+
+        // 3. create_bill blocked when linkedFeeRules missing linkedFeeHeadId "21" -> 400 Bad Request
+        let missing_linked_bill = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-23",
+                "fiscalYear": current_fy,
+                "paymentMethod": "CASH",
+                "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
+                "items": [{ "feeHeadId": "3", "amount": 1000, "billingEntityId": "1" }]
+            })),
+            external_content: None,
+        };
+        let resp_missing_linked = create_bill(
+            web::Json(missing_linked_bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_missing_linked.status(), StatusCode::BAD_REQUEST);
+
+        // 4. create_bill with source "3" + linked "21" succeeds and auto-calculates 13% VAT on taxable items
+        let valid_linked_bill = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-23",
+                "fiscalYear": current_fy,
+                "paymentMethod": "CASH",
+                "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
+                "items": [
+                    { "feeHeadId": "3", "amount": 1000.0, "billingEntityId": "1" },
+                    { "feeHeadId": "21", "amount": 200.0, "billingEntityId": "2" }
+                ]
+            })),
+            external_content: None,
+        };
+        let resp_valid = create_bill(
+            web::Json(valid_linked_bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_valid.status(), StatusCode::CREATED);
+        let created_bytes = actix_web::body::to_bytes(resp_valid.into_body()).await.unwrap();
+        let created_bill: DatabaseResource = serde_json::from_slice(&created_bytes).unwrap();
+        let created_id = created_bill.id.unwrap();
+        let created_inner = created_bill.inner_content.as_ref().unwrap();
+        assert_eq!(created_inner["subtotal"], 1200.0);
+        assert_eq!(created_inner["vatRatePct"], 13.0);
+        assert_eq!(created_inner["vatAmount"], 130.0);
+        assert_eq!(created_inner["total"], 1330.0);
+
+        // 5. Repeat linked fee "21" in same FY blocked by oncePerFiscalYear -> 409 Conflict
+        let repeat_linked_bill = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-24",
+                "fiscalYear": current_fy,
+                "paymentMethod": "CARD",
+                "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
+                "items": [
+                    { "feeHeadId": "3", "amount": 500.0, "billingEntityId": "1" },
+                    { "feeHeadId": "21", "amount": 200.0, "billingEntityId": "2" }
+                ]
+            })),
+            external_content: None,
+        };
+        let resp_repeat = create_bill(
+            web::Json(repeat_linked_bill),
+            actix_web::test::TestRequest::post().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_repeat.status(), StatusCode::CONFLICT);
+
+        // 6. delete_bill: bill 990 (30h old) blocked by 24h cancellation window -> 403; recent created_id allowed -> 200
+        let del_old = delete_bill(
+            web::Path::from(990),
+            actix_web::test::TestRequest::delete().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(del_old.status(), StatusCode::FORBIDDEN);
+
+        let del_recent = delete_bill(
+            web::Path::from(created_id),
+            actix_web::test::TestRequest::delete().to_http_request(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(del_recent.status(), StatusCode::OK);
     }
 }

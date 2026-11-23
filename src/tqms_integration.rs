@@ -1,7 +1,8 @@
 use crate::resource::{DatabaseResource, ResourceName::VehicleResource};
 use crate::ServerData;
-use actix_web::{web, HttpResponse};
+use actix_web::{error::ErrorInternalServerError, http::header, web, Error, HttpResponse};
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,24 @@ impl TQMSClient {
             auth: Arc::new(RwLock::new(TokenState {
                 token,
                 refreshed_at,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_base_url_and_token(base_url: String, token: String) -> Self {
+        let http = Client::builder()
+            .pool_max_idle_per_host(100)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
+        Self {
+            http,
+            base_url: Some(base_url.trim_end_matches('/').to_string()),
+            auth: Arc::new(RwLock::new(TokenState {
+                token: Some(token),
+                refreshed_at: Some(Instant::now()),
             })),
         }
     }
@@ -961,9 +980,20 @@ async fn fetch_tqms_vehicle_page(
     page_size: u32,
     max_attempts: u32,
 ) -> Result<Value> {
-    let mut last_error = None;
+    fetch_tqms_vehicle_page_with_backoff(client, page, page_size, max_attempts, 500).await
+}
 
-    for attempt in 1..=max_attempts {
+async fn fetch_tqms_vehicle_page_with_backoff(
+    client: &TQMSClient,
+    page: u32,
+    page_size: u32,
+    max_attempts: u32,
+    retry_base_delay_ms: u64,
+) -> Result<Value> {
+    let mut last_error = None;
+    let attempts = max_attempts.max(1);
+
+    for attempt in 1..=attempts {
         let result = client
             .search_vehicles(VehicleSearchParameters {
                 page: Some(page),
@@ -996,16 +1026,8 @@ async fn fetch_tqms_vehicle_page(
             }
         }
 
-        if attempt < max_attempts {
-            let delay_ms = 500_u64 * 2_u64.pow(attempt - 1);
-            /*eprintln!(
-                "Retrying TQMS page {} after attempt {}/{} in {} ms: {}",
-                page,
-                attempt,
-                max_attempts,
-                delay_ms,
-                last_error.as_deref().unwrap_or("unknown error")
-            );*/
+        if attempt < attempts && retry_base_delay_ms > 0 {
+            let delay_ms = retry_base_delay_ms * 2_u64.pow(attempt - 1);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
@@ -1013,7 +1035,7 @@ async fn fetch_tqms_vehicle_page(
     bail!(
         "Failed to fetch TQMS page {} after {} attempts: {}",
         page,
-        max_attempts,
+        attempts,
         last_error.unwrap_or_else(|| "unknown error".to_string())
     )
 }
@@ -1281,6 +1303,686 @@ pub async fn get_vehicle_details(
         Err(e) => HttpResponse::InternalServerError()
             .body(format!("Failed to get vehicle details: {e:?}")),
     }
+}
+
+const MAX_STREAM_SYNC_BATCH_SIZE: usize = 500;
+const MAX_STREAM_SYNC_CONCURRENCY: usize = 64;
+const STREAM_SYNC_MAX_ATTEMPTS: u32 = 5;
+const STREAM_SYNC_RETRY_BASE_MS: u64 = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamedVehicleItem {
+    pub id: Option<i32>,
+    pub sync_status: String,
+    pub vehicle: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn ndjson_chunk(value: &Value) -> Result<Bytes, String> {
+    serde_json::to_vec(value)
+        .map(|mut json_bytes| {
+            json_bytes.push(b'\n');
+            Bytes::from(json_bytes)
+        })
+        .map_err(|e| e.to_string())
+}
+
+struct ExistingVehicleIndex {
+    by_vehicle_id: HashMap<String, DatabaseResource>,
+    by_norm_number: HashMap<String, DatabaseResource>,
+}
+
+impl ExistingVehicleIndex {
+    fn from_resources(resources: Vec<DatabaseResource>) -> Self {
+        let mut index = Self {
+            by_vehicle_id: HashMap::with_capacity(resources.len()),
+            by_norm_number: HashMap::with_capacity(resources.len()),
+        };
+        for res in resources {
+            index.upsert(res);
+        }
+        index
+    }
+
+    fn find(&self, vid: Option<&str>, norm_num: &str) -> Option<&DatabaseResource> {
+        if let Some(id) = vid {
+            if let Some(found) = self.by_vehicle_id.get(id) {
+                return Some(found);
+            }
+        }
+        if !norm_num.is_empty() {
+            if let Some(found) = self.by_norm_number.get(norm_num) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn upsert(&mut self, res: DatabaseResource) {
+        if let Some(ref inner) = res.inner_content {
+            if let Some(vid) = extract_vehicle_id_str(inner) {
+                self.by_vehicle_id.insert(vid, res.clone());
+            }
+            let norm = extract_vehicle_norm_num(inner);
+            if !norm.is_empty() {
+                self.by_norm_number.insert(norm, res);
+            }
+        }
+    }
+}
+
+fn merge_local_metadata(fresh: &mut Value, existing_inner: &Value) {
+    if let Some(existing_meta) = existing_inner.get("metadata").filter(|m| !m.is_null()) {
+        if let Some(map) = fresh.as_object_mut() {
+            let has_fresh_meta = map.get("metadata").is_some_and(|m| !m.is_null());
+            if !has_fresh_meta {
+                map.insert("metadata".to_string(), existing_meta.clone());
+            }
+        }
+    }
+}
+
+enum PendingVehicleDbOp {
+    Create {
+        idx: usize,
+        resource: DatabaseResource,
+    },
+    Update {
+        idx: usize,
+        id: i32,
+        resource: DatabaseResource,
+    },
+}
+
+struct BatchSyncOutcome {
+    created: usize,
+    updated: usize,
+    skipped: usize,
+    failed: usize,
+    duplicates_filtered: usize,
+    streamed_vehicles: Vec<StreamedVehicleItem>,
+}
+
+async fn sync_stream_batch(
+    s_data: &Arc<ServerData>,
+    batch: Vec<Value>,
+    existing_index: &mut ExistingVehicleIndex,
+    seen_ids: &mut HashSet<String>,
+    seen_nums: &mut HashSet<String>,
+    concurrency: usize,
+) -> BatchSyncOutcome {
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut duplicates_filtered = 0usize;
+
+    let mut ops: Vec<PendingVehicleDbOp> = Vec::with_capacity(batch.len());
+    let mut ordered_slots: Vec<Option<StreamedVehicleItem>> = Vec::with_capacity(batch.len());
+    let mut unchanged_for_cache: Vec<(i32, DatabaseResource)> = Vec::new();
+    let now_str = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    for raw_vehicle in batch {
+        let mut clean_vehicle = clean_tqms_vehicle_value(&raw_vehicle);
+        let vid = extract_vehicle_id_str(&clean_vehicle);
+        let norm_num = extract_vehicle_norm_num(&clean_vehicle);
+
+        let dup_by_id = vid.as_ref().is_some_and(|id| seen_ids.contains(id));
+        let dup_by_num = !norm_num.is_empty() && seen_nums.contains(&norm_num);
+        if dup_by_id || dup_by_num {
+            duplicates_filtered += 1;
+            continue;
+        }
+        if let Some(ref id) = vid {
+            seen_ids.insert(id.clone());
+        }
+        if !norm_num.is_empty() {
+            seen_nums.insert(norm_num.clone());
+        }
+
+        let slot_idx = ordered_slots.len();
+        ordered_slots.push(None);
+
+        if let Some(existing_res) = existing_index.find(vid.as_deref(), &norm_num).cloned() {
+            if let (Some(existing_id), Some(existing_inner)) =
+                (existing_res.id, existing_res.inner_content.as_ref())
+            {
+                merge_local_metadata(&mut clean_vehicle, existing_inner);
+                if &clean_vehicle == existing_inner {
+                    skipped += 1;
+                    unchanged_for_cache.push((existing_id, existing_res.clone()));
+                    ordered_slots[slot_idx] = Some(StreamedVehicleItem {
+                        id: Some(existing_id),
+                        sync_status: "skipped".to_string(),
+                        vehicle: clean_vehicle,
+                        error: None,
+                    });
+                } else {
+                    ops.push(PendingVehicleDbOp::Update {
+                        idx: slot_idx,
+                        id: existing_id,
+                        resource: DatabaseResource {
+                            id: Some(existing_id),
+                            resource_name: Some(VehicleResource),
+                            inner_content: Some(clean_vehicle),
+                            external_content: existing_res.external_content.clone(),
+                        },
+                    });
+                }
+                continue;
+            }
+        }
+
+        ops.push(PendingVehicleDbOp::Create {
+            idx: slot_idx,
+            resource: DatabaseResource {
+                id: None,
+                resource_name: Some(VehicleResource),
+                inner_content: Some(clean_vehicle),
+                external_content: Some(json!({ "createdTime": now_str })),
+            },
+        });
+    }
+
+    let op_results: Vec<(
+        usize,
+        Result<(bool, DatabaseResource, StreamedVehicleItem), StreamedVehicleItem>,
+    )> = stream::iter(ops)
+        .map(|op| {
+            let db = s_data.db.clone();
+            async move {
+                match op {
+                    PendingVehicleDbOp::Create { idx, mut resource } => {
+                        match db.create_resource(VehicleResource, resource.clone()).await {
+                            Ok(new_id) => {
+                                resource.id = Some(new_id);
+                                let vehicle_val =
+                                    resource.inner_content.clone().unwrap_or(Value::Null);
+                                let item = StreamedVehicleItem {
+                                    id: Some(new_id),
+                                    sync_status: "created".to_string(),
+                                    vehicle: vehicle_val,
+                                    error: None,
+                                };
+                                (idx, Ok((true, resource, item)))
+                            }
+                            Err(err) => {
+                                let vehicle_val =
+                                    resource.inner_content.unwrap_or(Value::Null);
+                                let item = StreamedVehicleItem {
+                                    id: None,
+                                    sync_status: "failed".to_string(),
+                                    vehicle: vehicle_val,
+                                    error: Some(format!("{err:?}")),
+                                };
+                                (idx, Err(item))
+                            }
+                        }
+                    }
+                    PendingVehicleDbOp::Update { idx, id, resource } => {
+                        match db.update_resource(VehicleResource, id, resource.clone()).await {
+                            Ok(()) => {
+                                let vehicle_val =
+                                    resource.inner_content.clone().unwrap_or(Value::Null);
+                                let item = StreamedVehicleItem {
+                                    id: Some(id),
+                                    sync_status: "updated".to_string(),
+                                    vehicle: vehicle_val,
+                                    error: None,
+                                };
+                                (idx, Ok((false, resource, item)))
+                            }
+                            Err(err) => {
+                                let vehicle_val =
+                                    resource.inner_content.unwrap_or(Value::Null);
+                                let item = StreamedVehicleItem {
+                                    id: Some(id),
+                                    sync_status: "failed".to_string(),
+                                    vehicle: vehicle_val,
+                                    error: Some(format!("{err:?}")),
+                                };
+                                (idx, Err(item))
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let mut cache_updates: Vec<(i32, DatabaseResource)> = Vec::new();
+    let mut index_upserts: Vec<DatabaseResource> = Vec::new();
+
+    for (idx, res) in op_results {
+        match res {
+            Ok((is_create, stored_res, item)) => {
+                if is_create {
+                    created += 1;
+                } else {
+                    updated += 1;
+                }
+                if let Some(db_id) = stored_res.id {
+                    cache_updates.push((db_id, stored_res.clone()));
+                }
+                index_upserts.push(stored_res);
+                ordered_slots[idx] = Some(item);
+            }
+            Err(failed_item) => {
+                failed += 1;
+                ordered_slots[idx] = Some(failed_item);
+            }
+        }
+    }
+
+    if !cache_updates.is_empty() || !unchanged_for_cache.is_empty() {
+        let mut cache = s_data.cache.write().await;
+        for (db_id, res) in cache_updates {
+            cache.write(VehicleResource, db_id, res);
+        }
+        for (db_id, res) in unchanged_for_cache {
+            if cache.read(VehicleResource, db_id).is_none() {
+                cache.write(VehicleResource, db_id, res);
+            }
+        }
+    }
+
+    for res in index_upserts {
+        existing_index.upsert(res);
+    }
+
+    let streamed_vehicles: Vec<StreamedVehicleItem> =
+        ordered_slots.into_iter().flatten().collect();
+
+    BatchSyncOutcome {
+        created,
+        updated,
+        skipped,
+        failed,
+        duplicates_filtered,
+        streamed_vehicles,
+    }
+}
+
+/// Streams TQMS vehicles page-by-page in bounded NDJSON batches while concurrently
+/// fetching TQMS pages and persisting deltas to PostgreSQL and the in-memory cache.
+/// `GET /api/v1/tqms/stream_sync/{batch_size}/{concurrency}`
+pub async fn stream_sync_vehicles_tqms(
+    path: web::Path<(usize, usize)>,
+    s_data: web::Data<Arc<ServerData>>,
+) -> HttpResponse {
+    let (batch_size, concurrency) = path.into_inner();
+    stream_sync_vehicles_tqms_with_retry(
+        batch_size,
+        concurrency,
+        s_data.get_ref().clone(),
+        STREAM_SYNC_MAX_ATTEMPTS,
+        STREAM_SYNC_RETRY_BASE_MS,
+    )
+    .await
+}
+
+async fn stream_sync_vehicles_tqms_with_retry(
+    batch_size: usize,
+    concurrency: usize,
+    s_data: Arc<ServerData>,
+    max_attempts: u32,
+    retry_base_delay_ms: u64,
+) -> HttpResponse {
+    if batch_size == 0 || concurrency == 0 {
+        return HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "message": "batch_size and concurrency must both be greater than zero"
+        }));
+    }
+
+    let effective_batch_size = batch_size.min(MAX_STREAM_SYNC_BATCH_SIZE);
+    let effective_concurrency = concurrency.min(MAX_STREAM_SYNC_CONCURRENCY);
+    let page_size = effective_batch_size as u32;
+
+    if let Err(err) = s_data.tqms_client.ensure_token().await {
+        return HttpResponse::BadGateway().json(json!({
+            "success": false,
+            "message": format!("TQMS authentication failed: {err}")
+        }));
+    }
+
+    let mut first_page = match fetch_tqms_vehicle_page_with_backoff(
+        &s_data.tqms_client,
+        1,
+        page_size,
+        max_attempts,
+        retry_base_delay_ms,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(err) => {
+            return HttpResponse::BadGateway().json(json!({
+                "success": false,
+                "message": format!("Failed to fetch initial TQMS vehicle page: {err}")
+            }));
+        }
+    };
+
+    if let Err(err) = validate_tqms_response(&first_page, 1) {
+        return HttpResponse::BadGateway().json(json!({
+            "success": false,
+            "message": format!("Invalid initial TQMS response: {err}")
+        }));
+    }
+
+    let total_items = first_page
+        .pointer("/Data/Paging/TotalItems")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_pages = first_page
+        .pointer("/Data/Paging/TotalPages")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let first_page_vehicles = if total_items > 0 && total_pages > 0 {
+        match take_vehicles(&mut first_page) {
+            Ok(v) => v,
+            Err(err) => {
+                return HttpResponse::BadGateway().json(json!({
+                    "success": false,
+                    "message": format!("Failed to parse initial TQMS vehicles: {err}")
+                }));
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let existing_db_vehicles = match s_data.db.read_all_resource(VehicleResource).await {
+        Ok(v) => v,
+        Err(err) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "success": false,
+                "message": format!("Failed to read existing vehicles from database: {err:?}")
+            }));
+        }
+    };
+    let mut existing_index = ExistingVehicleIndex::from_resources(existing_db_vehicles);
+
+    let channel_cap = (effective_concurrency * 2).clamp(4, 64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(channel_cap);
+
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        let mut batch_number = 0usize;
+        let mut pages_completed = 0u64;
+        let mut failed_pages: Vec<u64> = Vec::new();
+        let mut total_fetched = 0usize;
+        let mut total_created = 0usize;
+        let mut total_updated = 0usize;
+        let mut total_skipped = 0usize;
+        let mut total_failed = 0usize;
+        let mut total_duplicates = 0usize;
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(total_items as usize);
+        let mut seen_nums: HashSet<String> = HashSet::with_capacity(total_items as usize);
+        let mut pending: Vec<Value> = Vec::with_capacity(effective_batch_size * 2);
+
+        let started_event = json!({
+            "event": "started",
+            "totalItems": total_items,
+            "totalPages": total_pages,
+            "batchSize": effective_batch_size,
+            "concurrency": effective_concurrency,
+        });
+        if tx.send(ndjson_chunk(&started_event)).await.is_err() {
+            return;
+        }
+
+        struct StreamState<'a> {
+            s_data: &'a Arc<ServerData>,
+            existing_index: &'a mut ExistingVehicleIndex,
+            seen_ids: &'a mut HashSet<String>,
+            seen_nums: &'a mut HashSet<String>,
+            batch_number: &'a mut usize,
+            total_fetched: &'a mut usize,
+            total_created: &'a mut usize,
+            total_updated: &'a mut usize,
+            total_skipped: &'a mut usize,
+            total_failed: &'a mut usize,
+            total_duplicates: &'a mut usize,
+            tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, String>>,
+        }
+
+        async fn drain_and_emit(
+            pending: &mut Vec<Value>,
+            flush_remainder: bool,
+            effective_batch_size: usize,
+            effective_concurrency: usize,
+            pages_completed: u64,
+            total_pages: u64,
+            st: &mut StreamState<'_>,
+        ) -> bool {
+            while pending.len() >= effective_batch_size
+                || (flush_remainder && !pending.is_empty())
+            {
+                let take_len = pending.len().min(effective_batch_size);
+                let batch: Vec<Value> = pending.drain(..take_len).collect();
+                *st.total_fetched += batch.len();
+
+                let outcome = sync_stream_batch(
+                    st.s_data,
+                    batch,
+                    st.existing_index,
+                    st.seen_ids,
+                    st.seen_nums,
+                    effective_concurrency,
+                )
+                .await;
+
+                *st.batch_number += 1;
+                *st.total_created += outcome.created;
+                *st.total_updated += outcome.updated;
+                *st.total_skipped += outcome.skipped;
+                *st.total_failed += outcome.failed;
+                *st.total_duplicates += outcome.duplicates_filtered;
+
+                let event = json!({
+                    "event": "batch",
+                    "batchNumber": *st.batch_number,
+                    "pagesCompleted": pages_completed,
+                    "totalPages": total_pages,
+                    "batchCount": outcome.streamed_vehicles.len(),
+                    "created": outcome.created,
+                    "updated": outcome.updated,
+                    "skipped": outcome.skipped,
+                    "failed": outcome.failed,
+                    "duplicatesFiltered": outcome.duplicates_filtered,
+                    "totals": {
+                        "fetched": *st.total_fetched,
+                        "created": *st.total_created,
+                        "updated": *st.total_updated,
+                        "skipped": *st.total_skipped,
+                        "failed": *st.total_failed,
+                        "duplicatesFiltered": *st.total_duplicates,
+                    },
+                    "vehicles": outcome.streamed_vehicles,
+                });
+
+                if st.tx.send(ndjson_chunk(&event)).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut st = StreamState {
+            s_data: &s_data,
+            existing_index: &mut existing_index,
+            seen_ids: &mut seen_ids,
+            seen_nums: &mut seen_nums,
+            batch_number: &mut batch_number,
+            total_fetched: &mut total_fetched,
+            total_created: &mut total_created,
+            total_updated: &mut total_updated,
+            total_skipped: &mut total_skipped,
+            total_failed: &mut total_failed,
+            total_duplicates: &mut total_duplicates,
+            tx: &tx,
+        };
+
+        if total_items > 0 && total_pages > 0 {
+            pages_completed = 1;
+            pending.extend(first_page_vehicles);
+            if !drain_and_emit(
+                &mut pending,
+                false,
+                effective_batch_size,
+                effective_concurrency,
+                pages_completed,
+                total_pages,
+                &mut st,
+            )
+            .await
+            {
+                return;
+            }
+        }
+
+        if total_pages > 1 {
+            let mut page_stream = stream::iter(2..=total_pages)
+                .map(|page| {
+                    let client = s_data.tqms_client.clone();
+                    let tx_check = tx.clone();
+                    async move {
+                        if tx_check.is_closed() {
+                            return (page, Err("Client disconnected".to_string()));
+                        }
+                        let res = fetch_tqms_vehicle_page_with_backoff(
+                            &client,
+                            page as u32,
+                            page_size,
+                            max_attempts,
+                            retry_base_delay_ms,
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                        (page, res)
+                    }
+                })
+                .buffer_unordered(effective_concurrency);
+
+            while let Some((requested_page, result)) = page_stream.next().await {
+                if tx.is_closed() {
+                    return;
+                }
+
+                match result {
+                    Ok(mut response) => {
+                        if let Err(err) = validate_tqms_response(&response, requested_page) {
+                            failed_pages.push(requested_page);
+                            let err_event = json!({
+                                "event": "page_error",
+                                "page": requested_page,
+                                "error": err.to_string(),
+                            });
+                            if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        match take_vehicles(&mut response) {
+                            Ok(vehicles) => {
+                                pages_completed += 1;
+                                pending.extend(vehicles);
+                                if !drain_and_emit(
+                                    &mut pending,
+                                    false,
+                                    effective_batch_size,
+                                    effective_concurrency,
+                                    pages_completed,
+                                    total_pages,
+                                    &mut st,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                failed_pages.push(requested_page);
+                                let err_event = json!({
+                                    "event": "page_error",
+                                    "page": requested_page,
+                                    "error": err.to_string(),
+                                });
+                                if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(err_msg) => {
+                        failed_pages.push(requested_page);
+                        let err_event = json!({
+                            "event": "page_error",
+                            "page": requested_page,
+                            "error": err_msg,
+                        });
+                        if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !drain_and_emit(
+            &mut pending,
+            true,
+            effective_batch_size,
+            effective_concurrency,
+            pages_completed,
+            total_pages,
+            &mut st,
+        )
+        .await
+        {
+            return;
+        }
+
+        failed_pages.sort_unstable();
+        let completed_event = json!({
+            "event": "completed",
+            "success": failed_pages.is_empty() && total_failed == 0,
+            "pagesCompleted": pages_completed,
+            "totalPages": total_pages,
+            "totalItems": total_items,
+            "totalFetched": total_fetched,
+            "totalCreated": total_created,
+            "totalUpdated": total_updated,
+            "totalSkipped": total_skipped,
+            "totalFailed": total_failed,
+            "duplicatesFiltered": total_duplicates,
+            "failedPages": failed_pages,
+            "durationMs": started_at.elapsed().as_millis() as u64,
+        });
+        let _ = tx.send(ndjson_chunk(&completed_event)).await;
+    });
+
+    let body_stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|item| (item.map_err(ErrorInternalServerError), rx))
+    });
+
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"))
+        .insert_header((header::CACHE_CONTROL, "no-cache, no-store, no-transform"))
+        .insert_header((header::CONTENT_ENCODING, "identity"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .insert_header(("X-Batch-Size", effective_batch_size.to_string()))
+        .insert_header(("X-Concurrency", effective_concurrency.to_string()))
+        .streaming::<_, Error>(body_stream)
 }
 
 #[cfg(test)]
@@ -1914,5 +2616,394 @@ mod tests {
             "Data": { "IsValid": true }
         });
         assert!(extract_tqms_vehicle_items(&non_vehicle_payload).is_empty());
+    }
+
+    async fn spawn_mock_tqms_server(
+        pages: HashMap<u32, (u16, Value)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock tqms tcp listener");
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let pages = Arc::new(pages);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let pages = Arc::clone(&pages);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req_str.lines().next().unwrap_or("");
+                    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                    let page_num = path
+                        .split('?')
+                        .nth(1)
+                        .and_then(|qs| {
+                            qs.split('&').find_map(|kv| {
+                                let mut it = kv.splitn(2, '=');
+                                if it.next() == Some("page") {
+                                    it.next().and_then(|v| v.parse::<u32>().ok())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or(1);
+
+                    let (status, body_val) = pages.get(&page_num).cloned().unwrap_or_else(|| {
+                        (
+                            404,
+                            json!({ "Code": 404, "Message": "Page not found" }),
+                        )
+                    });
+                    let body = serde_json::to_string(&body_val).unwrap();
+                    let status_text = if status == 200 {
+                        "200 OK"
+                    } else if status == 500 {
+                        "500 Internal Server Error"
+                    } else {
+                        "404 Not Found"
+                    };
+                    let raw_resp = format!(
+                        "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(raw_resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    async fn create_stream_sync_server_data(
+        initial_state: crate::access::test_helpers::MockDbState,
+        tqms_base_url: String,
+    ) -> (
+        web::Data<Arc<ServerData>>,
+        Arc<tokio::sync::Mutex<crate::access::test_helpers::MockDbState>>,
+    ) {
+        let (base_data, db_state) =
+            crate::access::test_helpers::create_mock_server_data_with_state(initial_state).await;
+        let combined = web::Data::new(Arc::new(ServerData {
+            db: base_data.db.clone(),
+            tqms_client: Arc::new(TQMSClient::with_base_url_and_token(
+                tqms_base_url,
+                "mock-tqms-token".to_string(),
+            )),
+            cache: base_data.cache.clone(),
+        }));
+        (combined, db_state)
+    }
+
+    #[actix_web::test]
+    async fn test_stream_sync_rejects_zero_batch_size_or_concurrency() {
+        let (s_data, _) = create_stream_sync_server_data(
+            crate::access::test_helpers::MockDbState::default(),
+            "http://127.0.0.1:1".to_string(),
+        )
+        .await;
+
+        let resp_zero_batch = stream_sync_vehicles_tqms(web::Path::from((0, 4)), s_data.clone()).await;
+        assert_eq!(resp_zero_batch.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        let resp_zero_conc = stream_sync_vehicles_tqms(web::Path::from((10, 0)), s_data).await;
+        assert_eq!(resp_zero_conc.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_stream_sync_streams_ndjson_batches_creates_updates_skips_and_deduplicates() {
+        let unchanged_vehicle = json!({
+            "VehicleId": 1001,
+            "VehicleNumber": "NA-01-KHA-1001",
+            "NormalizedVehicleNumber": "NA01KHA1001",
+            "VehicleType": "Truck",
+            "Owners": [{ "Name": "Unchanged Owner" }]
+        });
+        let existing_outdated_vehicle = json!({
+            "VehicleId": 1002,
+            "VehicleNumber": "NA-01-KHA-1002",
+            "NormalizedVehicleNumber": "NA01KHA1002",
+            "VehicleType": "Old Type",
+            "Owners": [{ "Name": "Old Owner" }],
+            "metadata": { "blacklisted": true }
+        });
+        let fresh_updated_vehicle_1002 = json!({
+            "VehicleId": 1002,
+            "VehicleNumber": "NA-01-KHA-1002",
+            "NormalizedVehicleNumber": "NA01KHA1002",
+            "VehicleType": "New Type",
+            "Owners": [{ "Name": "Updated Owner" }]
+        });
+        let new_vehicle_1003 = json!({
+            "VehicleId": 1003,
+            "VehicleNumber": "NA-01-KHA-1003",
+            "NormalizedVehicleNumber": "NA01KHA1003",
+            "VehicleType": "Tipper",
+            "Owners": [{ "Name": "New Owner 3" }]
+        });
+        let new_vehicle_1004 = json!({
+            "VehicleId": 1004,
+            "VehicleNumber": "NA-01-KHA-1004",
+            "NormalizedVehicleNumber": "NA01KHA1004",
+            "VehicleType": "Mini Truck",
+            "Owners": [{ "Name": "New Owner 4" }]
+        });
+        let new_vehicle_1005 = json!({
+            "VehicleId": 1005,
+            "VehicleNumber": "NA-01-KHA-1005",
+            "NormalizedVehicleNumber": "NA01KHA1005",
+            "VehicleType": "Trailer",
+            "Owners": [{ "Name": "New Owner 5" }]
+        });
+
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            VehicleResource,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(VehicleResource),
+                inner_content: Some(unchanged_vehicle.clone()),
+                external_content: None,
+            },
+        );
+        state.seed(
+            VehicleResource,
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(VehicleResource),
+                inner_content: Some(existing_outdated_vehicle),
+                external_content: Some(json!({ "createdTime": "2026-01-01T00:00:00Z" })),
+            },
+        );
+
+        let mut pages = HashMap::new();
+        pages.insert(
+            1,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [unchanged_vehicle, fresh_updated_vehicle_1002],
+                        "Paging": { "Page": 1, "PageSize": 2, "TotalItems": 6, "TotalPages": 3 }
+                    }
+                }),
+            ),
+        );
+        pages.insert(
+            2,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [new_vehicle_1003.clone(), new_vehicle_1004],
+                        "Paging": { "Page": 2, "PageSize": 2, "TotalItems": 6, "TotalPages": 3 }
+                    }
+                }),
+            ),
+        );
+        // Page 3 includes duplicate 1003 plus new 1005
+        pages.insert(
+            3,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [new_vehicle_1003, new_vehicle_1005],
+                        "Paging": { "Page": 3, "PageSize": 2, "TotalItems": 6, "TotalPages": 3 }
+                    }
+                }),
+            ),
+        );
+
+        let (tqms_url, server_handle) = spawn_mock_tqms_server(pages).await;
+        let (s_data, db_state) = create_stream_sync_server_data(state, tqms_url).await;
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(s_data.clone())
+                .route(
+                    "/api/v1/tqms/stream_sync/{batch_size}/{concurrency}",
+                    web::get().to(stream_sync_vehicles_tqms),
+                ),
+        )
+        .await;
+
+        let req = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2")
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/x-ndjson; charset=utf-8")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Batch-Size")
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("X-Concurrency")
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+
+        let body_bytes = actix_web::test::read_body(resp).await;
+        server_handle.abort();
+
+        let body_text = String::from_utf8(body_bytes.to_vec()).expect("valid utf8 ndjson");
+        let events: Vec<Value> = body_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid json line"))
+            .collect();
+
+        assert_eq!(events.first().unwrap()["event"], "started");
+        assert_eq!(events.last().unwrap()["event"], "completed");
+
+        let batch_events: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event"] == "batch")
+            .collect();
+        assert!(!batch_events.is_empty());
+
+        let completed = events.last().unwrap();
+        assert_eq!(completed["success"], true);
+        assert_eq!(completed["totalPages"], 3);
+        assert_eq!(completed["pagesCompleted"], 3);
+        assert_eq!(completed["totalFetched"], 6);
+        assert_eq!(completed["totalCreated"], 3);
+        assert_eq!(completed["totalUpdated"], 1);
+        assert_eq!(completed["totalSkipped"], 1);
+        assert_eq!(completed["duplicatesFiltered"], 1);
+        assert_eq!(completed["totalFailed"], 0);
+        assert_eq!(completed["failedPages"], json!([]));
+
+        {
+            let guard = db_state.lock().await;
+            let db_rows = guard.tables.get("vehicleresource").unwrap();
+            assert_eq!(db_rows.len(), 5, "should store exactly 5 unique vehicles");
+
+            let updated_1002 = db_rows.iter().find(|r| r.id == Some(2)).unwrap();
+            let u_inner = updated_1002.inner_content.as_ref().unwrap();
+            assert_eq!(u_inner["VehicleType"], "New Type");
+            assert_eq!(u_inner["metadata"]["blacklisted"], true);
+        }
+
+        let cache = s_data.cache.read().await;
+        let cached_all = cache.read_all(VehicleResource).unwrap();
+        assert_eq!(cached_all.len(), 5);
+    }
+
+    #[actix_web::test]
+    async fn test_stream_sync_handles_page_failure_gracefully_and_streams_remaining_pages() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            1,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [{ "VehicleId": 2001, "VehicleNumber": "BA-01-PA-2001" }],
+                        "Paging": { "Page": 1, "PageSize": 1, "TotalItems": 3, "TotalPages": 3 }
+                    }
+                }),
+            ),
+        );
+        pages.insert(2, (500, json!({ "Code": 500, "Message": "TQMS error" })));
+        pages.insert(
+            3,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [{ "VehicleId": 2003, "VehicleNumber": "BA-01-PA-2003" }],
+                        "Paging": { "Page": 3, "PageSize": 1, "TotalItems": 3, "TotalPages": 3 }
+                    }
+                }),
+            ),
+        );
+
+        let (tqms_url, server_handle) = spawn_mock_tqms_server(pages).await;
+        let (s_data, db_state) = create_stream_sync_server_data(
+            crate::access::test_helpers::MockDbState::default(),
+            tqms_url,
+        )
+        .await;
+
+        let resp =
+            stream_sync_vehicles_tqms_with_retry(1, 2, s_data.get_ref().clone(), 2, 0).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body_bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        server_handle.abort();
+
+        let body_text = String::from_utf8(body_bytes.to_vec()).unwrap();
+        let events: Vec<Value> = body_text
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .collect();
+
+        assert!(events
+            .iter()
+            .any(|e| e["event"] == "page_error" && e["page"] == 2));
+
+        let completed = events.last().unwrap();
+        assert_eq!(completed["event"], "completed");
+        assert_eq!(completed["success"], false);
+        assert_eq!(completed["totalCreated"], 2);
+        assert_eq!(completed["pagesCompleted"], 2);
+        assert_eq!(completed["failedPages"], json!([2]));
+
+        let guard = db_state.lock().await;
+        assert_eq!(guard.tables.get("vehicleresource").unwrap().len(), 2);
+    }
+
+    #[actix_web::test]
+    async fn test_stream_sync_returns_502_when_initial_tqms_page_fails() {
+        let mut pages = HashMap::new();
+        pages.insert(1, (500, json!({ "Code": 500, "Message": "Down" })));
+
+        let (tqms_url, server_handle) = spawn_mock_tqms_server(pages).await;
+        let (s_data, _) = create_stream_sync_server_data(
+            crate::access::test_helpers::MockDbState::default(),
+            tqms_url,
+        )
+        .await;
+
+        let resp =
+            stream_sync_vehicles_tqms_with_retry(10, 2, s_data.get_ref().clone(), 1, 0).await;
+        server_handle.abort();
+
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_GATEWAY);
     }
 }

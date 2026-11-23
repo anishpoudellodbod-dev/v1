@@ -36,6 +36,7 @@ impl Database {
             ResourceName::BillingRuleResource,
             ResourceName::BillingEntityResource,
             ResourceName::BranchResource,
+            ResourceName::ActionLogsResource,
         ];
         Database {
             resource_name,
@@ -75,13 +76,13 @@ impl Database {
         } else {
             let row = &rows[0];
             let id: i32 = row.get(0);
-            let inner_content: serde_json::Value = row.get(1);
+            let inner_content: Option<serde_json::Value> = row.get(1);
             let external_content: Option<serde_json::Value> = row.get(2);
             let resource = DatabaseResource {
                 id: Some(id),
                 resource_name: resource_name.into(),
-                inner_content: Some(inner_content),
-                external_content: external_content,
+                inner_content,
+                external_content,
             };
             Ok(resource)
         }
@@ -99,13 +100,13 @@ impl Database {
         let mut resources = Vec::new();
         for row in rows {
             let id: i32 = row.get(0);
-            let inner_content: serde_json::Value = row.get(1);
+            let inner_content: Option<serde_json::Value> = row.get(1);
             let external_content: Option<serde_json::Value> = row.get(2);
             let resource = DatabaseResource {
                 id: Some(id),
                 resource_name: Some(resource_name.into()),
-                inner_content: Some(inner_content),
-                external_content: external_content,
+                inner_content,
+                external_content,
             };
             resources.push(resource);
         }

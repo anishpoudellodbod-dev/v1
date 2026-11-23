@@ -39,6 +39,8 @@ impl SmsType {
         match self {
             Self::PAID => &["payment-received", "paid", "payment_received"],
             Self::PAYMENT_REMAINDER => &[
+                "PAYMENT REMAINDER",
+                "PAYMENT REMINDER",
                 "payment-reminder",
                 "payment-remainder",
                 "payment_reminder",
@@ -90,10 +92,15 @@ where
             continue;
         };
         let Some(templates) = inner
-            .get("smsSettings")
-            .or_else(|| inner.get("sms_settings"))
-            .and_then(|s| s.get("templates"))
+            .pointer("/notifications/sms/templates")
             .and_then(Value::as_array)
+            .or_else(|| {
+                inner
+                    .get("smsSettings")
+                    .or_else(|| inner.get("sms_settings"))
+                    .and_then(|s| s.get("templates"))
+                    .and_then(Value::as_array)
+            })
         else {
             continue;
         };
@@ -164,6 +171,54 @@ pub async fn find_sms_template_in_server_data(
         .await
         .ok()?;
     find_sms_template_in_settings(db_settings.iter(), sms_type, template_id_override)
+}
+
+/// Extracts `SmsNotificationSettings` from `SettingResource` items (preferring `notifications.sms`,
+/// falling back to legacy `smsSettings`).
+pub fn extract_sms_notification_settings<'a, I>(
+    settings: I,
+) -> Option<crate::settings::SmsNotificationSettings>
+where
+    I: IntoIterator<Item = &'a DatabaseResource>,
+{
+    let mut best: Option<(i32, crate::settings::SmsNotificationSettings)> = None;
+    for res in settings {
+        let Some(inner) = res.inner_content.as_ref() else {
+            continue;
+        };
+        if inner.pointer("/notifications/sms").is_some()
+            || inner.get("smsSettings").is_some()
+            || inner.get("sms_settings").is_some()
+        {
+            let res_id = res.id.unwrap_or(0);
+            let parsed = crate::settings::AppSettings::from_inner_value(inner)
+                .notifications
+                .sms;
+            if best.as_ref().is_none_or(|(best_id, _)| res_id >= *best_id) {
+                best = Some((res_id, parsed));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+pub async fn find_sms_notification_settings_in_server_data(
+    s_data: &ServerData,
+) -> Option<crate::settings::SmsNotificationSettings> {
+    {
+        let cache = s_data.cache.read().await;
+        if let Ok(settings) = cache.read_all(ResourceName::SettingResource) {
+            if let Some(found) = extract_sms_notification_settings(settings) {
+                return Some(found);
+            }
+        }
+    }
+    let db_settings = s_data
+        .db
+        .read_all_resource(ResourceName::SettingResource)
+        .await
+        .ok()?;
+    extract_sms_notification_settings(db_settings.iter())
 }
 
 /// Allows `receiver` in JSON to be supplied either as a string (`"9841XXXXXX"` or
@@ -410,16 +465,41 @@ fn format_amount(amount: f64) -> String {
 }
 
 pub fn normalize_contacts(raw: &str) -> Result<String> {
-    let cleaned: Vec<String> = raw
-        .split(',')
-        .map(|part| {
-            part.trim()
-                .trim_start_matches('+')
-                .chars()
+    normalize_contacts_with_country_code(raw, None)
+}
+
+pub fn normalize_contacts_with_country_code(
+    raw: &str,
+    default_country_code: Option<&str>,
+) -> Result<String> {
+    let prefix_digits: Option<String> = default_country_code
+        .map(|cc| {
+            cc.chars()
                 .filter(|c| c.is_ascii_digit())
                 .collect::<String>()
         })
-        .filter(|num| !num.is_empty())
+        .filter(|d| !d.is_empty());
+
+    let cleaned: Vec<String> = raw
+        .split(',')
+        .filter_map(|part| {
+            let digits: String = part
+                .trim()
+                .trim_start_matches('+')
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if digits.is_empty() {
+                return None;
+            }
+            if let Some(ref prefix) = prefix_digits {
+                if !digits.starts_with(prefix) {
+                    let stripped = digits.strip_prefix('0').unwrap_or(&digits);
+                    return Some(format!("{prefix}{stripped}"));
+                }
+            }
+            Some(digits)
+        })
         .collect();
 
     if cleaned.is_empty() {
@@ -440,6 +520,17 @@ pub struct SmsConfig {
     /// Optional explicit override for SamayaSMS `type` parameter (`"text"` or `"unicode"`).
     /// When `None`, automatically uses `"unicode"` for non-ASCII text (e.g. Nepali) and `"text"` for ASCII.
     pub sms_api_type: Option<String>,
+    pub provider: String,
+    pub api_secret: String,
+    pub webhook_url: Option<String>,
+    pub default_country_code: Option<String>,
+    pub enabled: bool,
+}
+
+impl Default for SmsConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
 }
 
 impl SmsConfig {
@@ -483,6 +574,21 @@ impl SmsConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let api_secret = env::var("SMS_API_SECRET")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+
+        let webhook_url = env::var("SMS_WEBHOOK_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let default_country_code = env::var("SMS_DEFAULT_COUNTRY_CODE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         Self {
             base_url,
             api_key,
@@ -491,7 +597,44 @@ impl SmsConfig {
             sender_id,
             response_type,
             sms_api_type,
+            provider: "samayasms".to_string(),
+            api_secret,
+            webhook_url,
+            default_country_code,
+            enabled: true,
         }
+    }
+
+    pub fn from_setting_or_env(
+        setting_sms: Option<&crate::settings::SmsNotificationSettings>,
+    ) -> Self {
+        let mut cfg = Self::from_env();
+        let Some(s) = setting_sms else {
+            return cfg;
+        };
+        cfg.enabled = s.enabled;
+        if !s.provider.trim().is_empty() {
+            cfg.provider = s.provider.trim().to_string();
+        }
+        if !s.base_url.trim().is_empty() {
+            cfg.base_url = s.base_url.trim().to_string();
+        }
+        if !s.api_key.trim().is_empty() {
+            cfg.api_key = s.api_key.trim().to_string();
+        }
+        if !s.sender_id.trim().is_empty() {
+            cfg.sender_id = s.sender_id.trim().to_string();
+        }
+        if !s.api_secret.trim().is_empty() {
+            cfg.api_secret = s.api_secret.trim().to_string();
+        }
+        if !s.webhook_url.trim().is_empty() {
+            cfg.webhook_url = Some(s.webhook_url.trim().to_string());
+        }
+        if !s.default_country_code.trim().is_empty() {
+            cfg.default_country_code = Some(s.default_country_code.trim().to_string());
+        }
+        cfg
     }
 }
 
@@ -558,8 +701,11 @@ impl SmsClient {
                 }
             });
 
-        let mut params: Vec<(&'static str, String)> = Vec::with_capacity(9);
+        let mut params: Vec<(&'static str, String)> = Vec::with_capacity(10);
         params.push(("key", self.config.api_key.clone()));
+        if !self.config.api_secret.trim().is_empty() {
+            params.push(("secret", self.config.api_secret.clone()));
+        }
         if let Some(ref campaign) = self.config.campaign_id {
             params.push(("campaign", campaign.clone()));
         }
@@ -581,27 +727,97 @@ impl SmsClient {
         params
     }
 
+    fn spawn_webhook_notification(
+        &self,
+        contacts: &str,
+        shoot_id: Option<&str>,
+        error_msg: Option<&str>,
+    ) {
+        let Some(ref webhook_url) = self.config.webhook_url else {
+            return;
+        };
+        let url = webhook_url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let http = self.http.clone();
+        let payload = serde_json::json!({
+            "event": if error_msg.is_none() { "sms_sent" } else { "sms_failed" },
+            "provider": self.config.provider,
+            "contacts": contacts,
+            "shootId": shoot_id,
+            "status": if error_msg.is_none() { "SENT" } else { "FAILED" },
+            "error": error_msg,
+        });
+        tokio::spawn(async move {
+            let _ = http.post(&url).json(&payload).send().await;
+        });
+    }
+
     /// Renders an `SmsTemplate` using `ResourceName::SettingResource` stored in `Cache`
-    /// and sends it through the SamayaSMS HTTP POST API.
+    /// and sends it through the configured SMS provider.
     pub async fn send_template_with_cache(
         &self,
         template: &SmsTemplate,
         cache: &Cache,
     ) -> Result<SmsSendResult> {
-        let contacts = template.normalized_contacts()?;
-        let message = template.render_with_cache(cache)?;
-        self.send_raw(&contacts, &message, template.scheduled_time.as_deref())
+        let setting_sms = cache
+            .read_all(ResourceName::SettingResource)
+            .ok()
+            .and_then(extract_sms_notification_settings);
+        if let Some(ref sms_cfg) = setting_sms {
+            if !sms_cfg.enabled {
+                bail!("SMS notifications are disabled in SettingResource");
+            }
+        }
+        let settings = cache
+            .read_all(ResourceName::SettingResource)
+            .ok()
+            .unwrap_or_default();
+        let setting_tpl = find_sms_template_in_settings(
+            settings,
+            template.sms_type,
+            template.template_id.as_deref(),
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "SMS template for {:?} not found in SettingResource",
+                template.sms_type
+            )
+        })?;
+        if !setting_tpl.active {
+            bail!(
+                "SMS template '{}' is inactive in SettingResource",
+                setting_tpl.id
+            );
+        }
+
+        let effective_cc = self.config.default_country_code.as_deref().or_else(|| {
+            setting_sms
+                .as_ref()
+                .map(|s| s.default_country_code.as_str())
+                .filter(|s| !s.trim().is_empty())
+        });
+        let contacts =
+            normalize_contacts_with_country_code(&template.receiver, effective_cc)?;
+        let message = template.render_with_template(&setting_tpl.content)?;
+        self.send_raw_with_contacts(&contacts, &message, template.scheduled_time.as_deref())
             .await
     }
 
     /// Renders an `SmsTemplate` using `ResourceName::SettingResource` from `ServerData`
-    /// (cache first, falling back to DB) and sends it through the SamayaSMS HTTP POST API.
+    /// (cache first, falling back to DB) and sends it through the configured SMS provider.
     pub async fn send_template_with_server_data(
         &self,
         template: &SmsTemplate,
         s_data: &ServerData,
     ) -> Result<SmsSendResult> {
-        let contacts = template.normalized_contacts()?;
+        let setting_sms = find_sms_notification_settings_in_server_data(s_data).await;
+        if let Some(ref sms_cfg) = setting_sms {
+            if !sms_cfg.enabled {
+                bail!("SMS notifications are disabled in SettingResource");
+            }
+        }
         let setting_tpl = find_sms_template_in_server_data(
             s_data,
             template.sms_type,
@@ -614,8 +830,23 @@ impl SmsClient {
                 template.sms_type
             )
         })?;
+        if !setting_tpl.active {
+            bail!(
+                "SMS template '{}' is inactive in SettingResource",
+                setting_tpl.id
+            );
+        }
+
+        let effective_cc = self.config.default_country_code.as_deref().or_else(|| {
+            setting_sms
+                .as_ref()
+                .map(|s| s.default_country_code.as_str())
+                .filter(|s| !s.trim().is_empty())
+        });
+        let contacts =
+            normalize_contacts_with_country_code(&template.receiver, effective_cc)?;
         let message = template.render_with_template(&setting_tpl.content)?;
-        self.send_raw(&contacts, &message, template.scheduled_time.as_deref())
+        self.send_raw_with_contacts(&contacts, &message, template.scheduled_time.as_deref())
             .await
     }
 
@@ -626,7 +857,29 @@ impl SmsClient {
         message: &str,
         scheduled_time: Option<&str>,
     ) -> Result<SmsSendResult> {
-        let normalized_contacts = normalize_contacts(contacts)?;
+        let normalized_contacts = normalize_contacts_with_country_code(
+            contacts,
+            self.config.default_country_code.as_deref(),
+        )?;
+        self.send_raw_with_contacts(&normalized_contacts, message, scheduled_time)
+            .await
+    }
+
+    async fn send_raw_with_contacts(
+        &self,
+        normalized_contacts: &str,
+        message: &str,
+        scheduled_time: Option<&str>,
+    ) -> Result<SmsSendResult> {
+        if !self.config.enabled {
+            bail!("SMS notifications are disabled in SettingResource");
+        }
+        if !self.config.provider.trim().eq_ignore_ascii_case("samayasms") {
+            bail!(
+                "Unsupported SMS provider '{}' configured in SettingResource",
+                self.config.provider
+            );
+        }
         let trimmed_msg = message.trim();
         if trimmed_msg.is_empty() {
             bail!("SMS message cannot be empty");
@@ -638,17 +891,24 @@ impl SmsClient {
             );
         }
 
-        let params = self.build_form_params(&normalized_contacts, trimmed_msg, scheduled_time);
+        let params = self.build_form_params(normalized_contacts, trimmed_msg, scheduled_time);
 
         self.wait_for_rate_limit().await;
 
-        let response = self
+        let response = match self
             .http
             .post(&self.config.base_url)
             .form(&params)
             .send()
             .await
-            .context("Failed to send HTTP request to SamayaSMS API")?;
+        {
+            Ok(res) => res,
+            Err(err) => {
+                let err_str = format!("Failed to send HTTP request to SamayaSMS API: {err}");
+                self.spawn_webhook_notification(normalized_contacts, None, Some(&err_str));
+                bail!("{err_str}");
+            }
+        };
 
         let status = response.status();
         let body = response
@@ -658,16 +918,27 @@ impl SmsClient {
 
         let trimmed_body = body.trim();
         if !status.is_success() {
-            bail!("SamayaSMS API returned HTTP {status}: {trimmed_body}");
+            let err_str = format!("SamayaSMS API returned HTTP {status}: {trimmed_body}");
+            self.spawn_webhook_notification(normalized_contacts, None, Some(&err_str));
+            bail!("{err_str}");
         }
 
-        let shoot_id = parse_samaya_sms_response(trimmed_body)?;
-        Ok(SmsSendResult {
-            shoot_id,
-            contacts: normalized_contacts,
-            message: trimmed_msg.to_string(),
-            raw_response: trimmed_body.to_string(),
-        })
+        match parse_samaya_sms_response(trimmed_body) {
+            Ok(shoot_id) => {
+                self.spawn_webhook_notification(normalized_contacts, Some(&shoot_id), None);
+                Ok(SmsSendResult {
+                    shoot_id,
+                    contacts: normalized_contacts.to_string(),
+                    message: trimmed_msg.to_string(),
+                    raw_response: trimmed_body.to_string(),
+                })
+            }
+            Err(err) => {
+                let err_str = err.to_string();
+                self.spawn_webhook_notification(normalized_contacts, None, Some(&err_str));
+                Err(err)
+            }
+        }
     }
 }
 
@@ -731,7 +1002,12 @@ pub async fn preview_sms_template(
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     let tpl = template.into_inner();
-    let contacts = match tpl.normalized_contacts() {
+    let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
+    let default_cc = setting_sms
+        .as_ref()
+        .map(|s| s.default_country_code.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let contacts = match normalize_contacts_with_country_code(&tpl.receiver, default_cc) {
         Ok(c) => c,
         Err(e) => return HttpResponse::BadRequest().json(serde_json::json!({ "error": e.to_string() })),
     };
@@ -749,6 +1025,8 @@ pub async fn preview_sms_template(
             "contacts": contacts,
             "sms_type": tpl.sms_type,
             "template_id": setting_tpl.id,
+            "template_active": setting_tpl.active,
+            "sms_enabled": setting_sms.as_ref().is_none_or(|s| s.enabled),
             "template_source": "setting_resource",
             "message": message,
             "char_count": message.chars().count(),
@@ -764,16 +1042,20 @@ pub async fn send_template_sms(
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     let tpl = template.into_inner();
-    let client = SmsClient::from_env();
+    let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
+    let client = SmsClient::new(SmsConfig::from_setting_or_env(setting_sms.as_ref()));
     match client.send_template_with_server_data(&tpl, &s_data).await {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("not found in SettingResource") {
+            if msg.contains("disabled") || msg.contains("inactive") {
+                HttpResponse::Forbidden().json(serde_json::json!({ "error": msg }))
+            } else if msg.contains("not found in SettingResource") {
                 HttpResponse::NotFound().json(serde_json::json!({ "error": msg }))
             } else if msg.contains("is required")
                 || msg.contains("exceeds maximum length")
                 || msg.contains("empty")
+                || msg.contains("Unsupported SMS provider")
             {
                 HttpResponse::BadRequest().json(serde_json::json!({ "error": msg }))
             } else {
@@ -784,9 +1066,13 @@ pub async fn send_template_sms(
 }
 
 /// POST /api/v1/sms/send-raw — Sends a raw SMS message to comma-separated contacts via SamayaSMS.
-pub async fn send_raw_sms(req: web::Json<SendRawSmsRequest>) -> HttpResponse {
+pub async fn send_raw_sms(
+    req: web::Json<SendRawSmsRequest>,
+    s_data: web::Data<Arc<ServerData>>,
+) -> HttpResponse {
     let body = req.into_inner();
-    let client = SmsClient::from_env();
+    let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
+    let client = SmsClient::new(SmsConfig::from_setting_or_env(setting_sms.as_ref()));
     match client
         .send_raw(&body.contacts, &body.msg, body.time.as_deref())
         .await
@@ -794,7 +1080,13 @@ pub async fn send_raw_sms(req: web::Json<SendRawSmsRequest>) -> HttpResponse {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("is required") || msg.contains("exceeds maximum length") || msg.contains("empty") {
+            if msg.contains("disabled") {
+                HttpResponse::Forbidden().json(serde_json::json!({ "error": msg }))
+            } else if msg.contains("is required")
+                || msg.contains("exceeds maximum length")
+                || msg.contains("empty")
+                || msg.contains("Unsupported SMS provider")
+            {
                 HttpResponse::BadRequest().json(serde_json::json!({ "error": msg }))
             } else {
                 HttpResponse::BadGateway().json(serde_json::json!({ "error": msg }))
@@ -957,6 +1249,7 @@ mod tests {
             sender_id: "NARAYANI".to_string(),
             response_type: None,
             sms_api_type: None,
+            ..SmsConfig::default()
         });
 
         let mut cache = Cache::new();
@@ -1006,6 +1299,7 @@ mod tests {
             sender_id: "NARAYANI".to_string(),
             response_type: None,
             sms_api_type: None,
+            ..SmsConfig::default()
         });
 
         let err = client
@@ -1225,5 +1519,142 @@ mod tests {
                 "तपाईंको सवारी नम्बर {vehicle_number} को रकम रु 0 प्राप्त भएको छ।\nधन्यवाद। lodbod test sangh\nम्याद सकिने मिति: 2083-12-30"
             )
         );
+    }
+
+    fn nested_notifications_setting(enabled: bool, webhook_url: &str, provider: &str) -> DatabaseResource {
+        DatabaseResource {
+            id: Some(10),
+            resource_name: Some(ResourceName::SettingResource),
+            inner_content: Some(serde_json::json!({
+                "integrations": { "tqms": { "SanghBranch": "Loadboard sthaniya" } },
+                "notifications": {
+                    "sms": {
+                        "apiKey": "36A1291E165814",
+                        "baseUrl": "https://samayasms.com.np/smsapi/index.php",
+                        "enabled": enabled,
+                        "provider": provider,
+                        "senderId": "",
+                        "apiSecret": "SECRET_999",
+                        "templates": [
+                            {
+                                "id": "PAID",
+                                "name": "भुक्तानी प्राप्त",
+                                "active": true,
+                                "content": "Test gariyeko template तपाईंको सवारी नम्बर {vehicleNumber} को रकम रु {amount} प्राप्त भएको छ।\nधन्यवाद। {organizationName}\nम्याद सकिने मिति: {expiryDate}"
+                            },
+                            {
+                                "id": "PAYMENT REMAINDER",
+                                "name": "भुक्तानी रिमाइन्डर",
+                                "active": true,
+                                "content": "नमस्कार, सवारी नम्बर {vehicleNumber} को रु {amount} भुक्तानी बाँकी छ। कृपया {dueDate} भित्र भुक्तानी गर्नुहोस्।\n{organizationName}"
+                            },
+                            {
+                                "id": "URGENT",
+                                "name": "अत्यावश्यक रिमाइन्डर",
+                                "active": false,
+                                "content": "अत्यावश्यक सूचना: सवारी नम्बर {vehicleNumber} को भुक्तानी म्याद {dueDate} मा सकिँदैछ। सेवा निरन्तरताका लागि समयमै भुक्तानी गर्नुहोस्।\n{organizationName}"
+                            }
+                        ],
+                        "webhookUrl": webhook_url,
+                        "defaultCountryCode": "+977"
+                    }
+                }
+            })),
+            external_content: None,
+        }
+    }
+
+    #[test]
+    fn test_nested_notifications_sms_templates_and_country_code() {
+        let mut cache = Cache::new();
+        cache.write(
+            ResourceName::SettingResource,
+            10,
+            nested_notifications_setting(true, "", "samayasms"),
+        );
+
+        let paid = SmsTemplate::new_paid("9841000000", "BA-01-PA-1", "Loadboard", 100.0, "2083-12-30");
+        assert!(paid.render_with_cache(&cache).unwrap().starts_with("Test gariyeko template"));
+
+        let rem = SmsTemplate::new_payment_remainder("9841000000", "BA-01-PA-1", "Loadboard", "2083-12-30")
+            .with_amount(250.0);
+        assert!(rem.render_with_cache(&cache).unwrap().contains("रु 250"));
+
+        let urg = SmsTemplate::new_urgent("9841000000", "BA-01-PA-1", "Loadboard", "2083-12-30");
+        assert!(urg.render_with_cache(&cache).unwrap().contains("अत्यावश्यक सूचना"));
+
+        assert_eq!(
+            normalize_contacts_with_country_code("9861282176, 09841000000, +9779801112233", Some("+977"))
+                .unwrap(),
+            "9779861282176,9779841000000,9779801112233"
+        );
+    }
+
+    #[actix_web::test]
+    async fn test_notifications_sms_enabled_active_provider_secret_and_webhook_enforcement() {
+        let (mock_url, req_rx) = spawn_mock_sms_server("200 OK", "SMS-SHOOT-ID/SHOOT-NESTED").await;
+        let (webhook_url, webhook_rx) = spawn_mock_sms_server("200 OK", "OK").await;
+
+        let mut cache = Cache::new();
+        // 1. Disabled SMS blocks sending (even for active template)
+        cache.write(
+            ResourceName::SettingResource,
+            10,
+            nested_notifications_setting(false, "", "samayasms"),
+        );
+        let client_disabled = SmsClient::new(SmsConfig::from_setting_or_env(
+            extract_sms_notification_settings(cache.read_all(ResourceName::SettingResource).unwrap()).as_ref(),
+        ));
+        let paid = SmsTemplate::new_paid("9861282176", "BA-01-PA-1", "Loadboard", 0.0, "2083-12-30");
+        let disabled_err = client_disabled
+            .send_template_with_cache(&paid, &cache)
+            .await
+            .unwrap_err();
+        assert!(disabled_err.to_string().contains("disabled"));
+
+        // 2. Enabled SMS, inactive template ("URGENT", active: false) blocked on send
+        cache.write(
+            ResourceName::SettingResource,
+            10,
+            nested_notifications_setting(true, &webhook_url, "samayasms"),
+        );
+        let mut cfg = SmsConfig::from_setting_or_env(
+            extract_sms_notification_settings(cache.read_all(ResourceName::SettingResource).unwrap()).as_ref(),
+        );
+        cfg.base_url = mock_url;
+        let client = SmsClient::new(cfg);
+
+        let urg = SmsTemplate::new_urgent("9861282176", "BA-01-PA-1", "Loadboard", "2083-12-30");
+        let inactive_err = client.send_template_with_cache(&urg, &cache).await.unwrap_err();
+        assert!(inactive_err.to_string().contains("inactive"));
+
+        // 3. Unsupported provider rejected
+        let mut bad_provider_cfg = SmsConfig::default();
+        bad_provider_cfg.provider = "twilio".to_string();
+        let bad_provider_err = SmsClient::new(bad_provider_cfg)
+            .send_raw("9861282176", "Hi", None)
+            .await
+            .unwrap_err();
+        assert!(bad_provider_err.to_string().contains("Unsupported SMS provider"));
+
+        // 4. Valid active PAID template sends with +977 country code, apiSecret, and triggers webhook
+        let res = client
+            .send_template_with_cache(&paid, &cache)
+            .await
+            .expect("active PAID template should send");
+        assert_eq!(res.contacts, "9779861282176");
+        assert_eq!(res.shoot_id, "SHOOT-NESTED");
+
+        let raw_http = req_rx.await.unwrap();
+        assert!(raw_http.contains("key=36A1291E165814"));
+        assert!(raw_http.contains("secret=SECRET_999"));
+        assert!(raw_http.contains("contacts=9779861282176"));
+
+        let webhook_http = tokio::time::timeout(Duration::from_secs(2), webhook_rx)
+            .await
+            .expect("webhook should fire")
+            .unwrap();
+        assert!(webhook_http.contains("SHOOT-NESTED"));
+        assert!(webhook_http.contains("9779861282176"));
     }
 }

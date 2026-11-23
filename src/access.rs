@@ -471,7 +471,7 @@ pub fn extract_sangh_branch(value: &Value) -> Option<String> {
             }
         }
     }
-    None
+    crate::settings::resolve_tqms_sangh_branch_from_value(value)
 }
 
 pub fn extract_permission_user_id(inner: &Value) -> Option<i32> {
@@ -975,40 +975,91 @@ pub async fn delete_permission_for_user(
 /// `POST /api/v1/auth/logout` — verifies Bearer token, destroys cached `PermissionResource`,
 /// and revokes the Bearer token.
 pub async fn logout(req: HttpRequest, s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
-    let Some(token) = extract_bearer_token(&req) else {
-        return HttpResponse::Unauthorized().json(serde_json::json!({
-            "success": false,
-            "message": "Missing or invalid Authorization header"
-        }));
+    let started_at = std::time::Instant::now();
+    let (response, email, user_id, role, details) = logout_inner(&req, &s_data).await;
+
+    crate::log::log_logout_async(
+        email,
+        user_id,
+        role,
+        response.status().as_u16(),
+        started_at,
+        details,
+    );
+
+    response
+}
+
+async fn logout_inner(
+    req: &HttpRequest,
+    s_data: &Arc<ServerData>,
+) -> (
+    HttpResponse,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+) {
+    let Some(token) = extract_bearer_token(req) else {
+        return (
+            HttpResponse::Unauthorized().json(serde_json::json!({
+                "success": false,
+                "message": "Missing or invalid Authorization header"
+            })),
+            None,
+            None,
+            None,
+            Some("Missing or invalid Authorization header".to_string()),
+        );
     };
 
     if is_token_revoked(&token) {
-        return HttpResponse::Unauthorized().json(serde_json::json!({
-            "success": false,
-            "message": "Token has already been logged out"
-        }));
+        return (
+            HttpResponse::Unauthorized().json(serde_json::json!({
+                "success": false,
+                "message": "Token has already been logged out"
+            })),
+            None,
+            None,
+            None,
+            Some("Token already logged out".to_string()),
+        );
     }
 
     let claims = match auth::verify_jwt(&token) {
         Ok(claims) => claims,
         Err(error) => {
             eprintln!("Logout JWT verification failed: {error:?}");
-            return HttpResponse::Unauthorized().json(serde_json::json!({
-                "success": false,
-                "message": "Invalid or expired token"
-            }));
+            return (
+                HttpResponse::Unauthorized().json(serde_json::json!({
+                    "success": false,
+                    "message": "Invalid or expired token"
+                })),
+                None,
+                None,
+                None,
+                Some("Invalid or expired token".to_string()),
+            );
         }
     };
 
+    let email = Some(claims.sub.clone());
+    let role = Some(String::from(claims.role.clone()));
     let user_id = resolve_user_id_from_claims(&s_data.db, &claims).await;
-    let destroyed = destroy_permission_on_logout(&s_data, user_id, Some(&token)).await;
+    let destroyed = destroy_permission_on_logout(s_data, user_id, Some(&token)).await;
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "success": true,
-        "message": "Logged out successfully",
-        "userId": user_id,
-        "permissionDestroyed": destroyed
-    }))
+    (
+        HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Logged out successfully",
+            "userId": user_id,
+            "permissionDestroyed": destroyed
+        })),
+        email,
+        user_id,
+        role,
+        Some(format!("Logged out (permissionDestroyed={destroyed})")),
+    )
 }
 
 /// `GET /api/v1/access/me` — returns the caller's active loaded `PermissionResource` from cache.
@@ -2208,5 +2259,46 @@ mod tests {
             let cache = s_data.cache.read().await;
             assert!(!is_user_logged_in_cache(&cache, 402));
         }
+    }
+
+    #[test]
+    fn test_extract_sangh_branch_supports_nested_setting_resource_integrations_tqms() {
+        let nested_setting = serde_json::json!({
+            "integrations": {
+                "tqms": {
+                    "SanghBranch": "Loadboard sthaniya"
+                }
+            }
+        });
+        assert_eq!(
+            extract_sangh_branch(&nested_setting).as_deref(),
+            Some("Loadboard sthaniya")
+        );
+        assert_eq!(
+            crate::settings::resolve_tqms_sangh_branch_from_value(&nested_setting).as_deref(),
+            Some("Loadboard sthaniya")
+        );
+
+        let top_level_override = serde_json::json!({
+            "sthaniyaBranch": "Top Branch",
+            "integrations": {
+                "tqms": {
+                    "SanghBranch": "Loadboard sthaniya"
+                }
+            }
+        });
+        assert_eq!(
+            extract_sangh_branch(&top_level_override).as_deref(),
+            Some("Top Branch")
+        );
+
+        let blank_nested = serde_json::json!({
+            "integrations": {
+                "tqms": {
+                    "SanghBranch": "   "
+                }
+            }
+        });
+        assert_eq!(extract_sangh_branch(&blank_nested), None);
     }
 }

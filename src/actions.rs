@@ -6,49 +6,121 @@ use std::sync::Arc;
 
 pub async fn search(
     path: web::Path<(String, String, String, String)>,
-    s_data: web::Data<Arc<ServerData>>
+    req: actix_web::HttpRequest,
+    s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let (resource_name, search_item, search_query, limit) = path.into_inner();
+    let is_admin_caller = is_admin(req.clone());
+    let (response, resource_label, details, metadata) = search_inner(
+        resource_name,
+        search_item,
+        search_query,
+        limit,
+        is_admin_caller,
+        &s_data,
+    )
+    .await;
 
-    let resource_name: ResourceName = match resource_name.try_into() {
-        Ok(r) => {
+    crate::log::record_http_action_async(
+        Some(&req),
+        crate::log::ResourceActionKind::Search,
+        Some(resource_label),
+        None,
+        response.status().as_u16(),
+        started_at,
+        details,
+        metadata,
+    );
+
+    response
+}
+
+async fn search_inner(
+    resource_name_raw: String,
+    search_item: String,
+    search_query: String,
+    limit: String,
+    is_admin_caller: bool,
+    s_data: &Arc<ServerData>,
+) -> (HttpResponse, String, Option<String>, Option<serde_json::Value>) {
+    let resource_name: ResourceName = match ResourceName::from_str_case_insensitive(&resource_name_raw) {
+        Some(r) => {
             if r == ResourceName::UserResource || r == ResourceName::PermissionResource {
-                return HttpResponse::Forbidden().body(format!(
-                    "Search forbidden in {:?} is forbidden",
-                    r
-                ));
+                return (
+                    HttpResponse::Forbidden().body(format!(
+                        "Search forbidden in {:?} is forbidden",
+                        r
+                    )),
+                    r.to_string(),
+                    Some(format!("Search forbidden in {:?}", r)),
+                    None,
+                );
+            } else if r == ResourceName::ActionLogsResource && !is_admin_caller {
+                return (
+                    HttpResponse::Forbidden().body("Access to ActionLogsResource is forbidden"),
+                    r.to_string(),
+                    Some("Non-admin search ActionLogsResource rejected".to_string()),
+                    None,
+                );
             } else {
                 r
             }
         }
-        Err(_) => {
-            return HttpResponse::BadRequest().body("Invalid resource name");
+        None => {
+            return (
+                HttpResponse::BadRequest().body("Invalid resource name"),
+                resource_name_raw,
+                Some("Invalid resource name".to_string()),
+                None,
+            );
         }
     };
-    let ulimit: usize;
-    if limit == "all"{
-        ulimit = usize::MAX;
-    }
-    else{
-        ulimit = match limit.parse(){
+    let resource_label = resource_name.to_string();
+    let ulimit: usize = if limit == "all" {
+        usize::MAX
+    } else {
+        match limit.parse() {
             Ok(i) => i,
             Err(_) => {
-                return HttpResponse::BadRequest().body("Invalid limit");
+                return (
+                    HttpResponse::BadRequest().body("Invalid limit"),
+                    resource_label,
+                    Some("Invalid limit".to_string()),
+                    None,
+                );
             }
         }
     };
 
     let cache = s_data.cache.read().await;
+    let db_resources =
+        cache.search_innercontent(resource_name, &search_item, &search_query, ulimit);
+    let result_count = db_resources.1;
+    let metadata = Some(serde_json::json!({
+        "searchItem": search_item,
+        "searchQuery": search_query,
+        "limit": limit,
+        "resultCount": result_count,
+    }));
 
-    let db_resources = cache.search_innercontent(resource_name, &search_item, &search_query, ulimit);
-
-    if db_resources.1 == 0 {
-        HttpResponse::NotFound().body(format!(
-            "No resources found for search query: {}",
-            search_query
-        ))
+    if result_count == 0 {
+        (
+            HttpResponse::NotFound().body(format!(
+                "No resources found for search query: {}",
+                search_query
+            )),
+            resource_label,
+            Some(format!("No results for '{}'", search_query)),
+            metadata,
+        )
     } else {
-        HttpResponse::Ok().json(db_resources)
+        (
+            HttpResponse::Ok().json(db_resources),
+            resource_label,
+            Some(format!("Matched {} resource(s)", result_count)),
+            metadata,
+        )
     }
 }
 
@@ -74,24 +146,54 @@ pub async fn update(
     req: actix_web::HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let (resource_name, id) = path.into_inner();
-    let db_resource = db_resource.into_inner();
+    let resource_label = resource_name.to_string();
+    let resource_id = Some(id.to_string());
+    let (response, details) =
+        update_inner(resource_name, id, db_resource.into_inner(), req.clone(), s_data).await;
 
+    crate::log::record_http_action_async(
+        Some(&req),
+        crate::log::ResourceActionKind::Update,
+        Some(resource_label),
+        resource_id,
+        response.status().as_u16(),
+        started_at,
+        details,
+        None,
+    );
+
+    response
+}
+
+async fn update_inner(
+    resource_name: ResourceName,
+    id: i32,
+    db_resource: DatabaseResource,
+    req: actix_web::HttpRequest,
+    s_data: web::Data<Arc<ServerData>>,
+) -> (HttpResponse, Option<String>) {
     if resource_name == ResourceName::PermissionResource {
         if !is_admin(req.clone()) {
-            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to PermissionResource is forbidden"),
+                Some("Non-admin update PermissionResource rejected".to_string()),
+            );
         }
 
         let Some(inner_val) = db_resource.inner_content.clone() else {
-            return HttpResponse::BadRequest()
-                .body("PermissionResource inner_content is required");
+            return (
+                HttpResponse::BadRequest().body("PermissionResource inner_content is required"),
+                Some("PermissionResource inner_content missing".to_string()),
+            );
         };
         let mut perm_inner: crate::access::PermissionInnerContent =
             match serde_json::from_value(inner_val) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    return HttpResponse::BadRequest()
-                        .body(format!("Invalid PermissionResource inner_content: {}", err));
+                    let msg = format!("Invalid PermissionResource inner_content: {}", err);
+                    return (HttpResponse::BadRequest().body(msg.clone()), Some(msg));
                 }
             };
         perm_inner.sthaniya_branch =
@@ -100,28 +202,33 @@ pub async fn update(
         match crate::access::find_user_by_id_in_db(&s_data.db, perm_inner.user_id).await {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return HttpResponse::NotFound().body(format!(
-                    "UserResource with id {} not found",
-                    perm_inner.user_id
-                ));
+                let msg = format!("UserResource with id {} not found", perm_inner.user_id);
+                return (HttpResponse::NotFound().body(msg.clone()), Some(msg));
             }
             Err(err) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to verify user for PermissionResource: {:?}", err));
+                let msg = format!("Failed to verify user for PermissionResource: {:?}", err);
+                return (
+                    HttpResponse::InternalServerError().body(msg.clone()),
+                    Some(msg),
+                );
             }
         }
 
         match crate::access::find_permission_by_user_id_in_db(&s_data.db, perm_inner.user_id).await
         {
             Ok(Some(existing)) if existing.id != Some(id) => {
-                return HttpResponse::Conflict().body(format!(
+                let msg = format!(
                     "PermissionResource already exists for userId {} (1:1 mapping enforced)",
                     perm_inner.user_id
-                ));
+                );
+                return (HttpResponse::Conflict().body(msg.clone()), Some(msg));
             }
             Ok(_) => {}
             Err(err) => {
-                return HttpResponse::InternalServerError().body(err);
+                return (
+                    HttpResponse::InternalServerError().body(err.clone()),
+                    Some(err),
+                );
             }
         }
 
@@ -135,8 +242,11 @@ pub async fn update(
             .update_resource(resource_name, id, stored_res.clone())
             .await
         {
-            return HttpResponse::InternalServerError()
-                .body(format!("Failed to update resource: {:?}", err));
+            let msg = format!("Failed to update resource: {:?}", err);
+            return (
+                HttpResponse::InternalServerError().body(msg.clone()),
+                Some(msg),
+            );
         }
 
         {
@@ -149,16 +259,50 @@ pub async fn update(
             }
         }
 
-        return HttpResponse::Ok().json(format!("Resource updated with id: {}", id));
+        return (
+            HttpResponse::Ok().json(format!("Resource updated with id: {}", id)),
+            Some(format!("Updated PermissionResource {}", id)),
+        );
     }
 
     if resource_name == ResourceName::BillingRuleResource && !is_admin(req.clone()) {
-        return HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource");
+        return (
+            HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource"),
+            Some("Non-admin update BillingRuleResource rejected".to_string()),
+        );
+    }
+
+    if resource_name == ResourceName::ActionLogsResource && !is_admin(req.clone()) {
+        return (
+            HttpResponse::Forbidden().body("Access to ActionLogsResource is forbidden"),
+            Some("Non-admin update ActionLogsResource rejected".to_string()),
+        );
+    }
+
+    if resource_name == ResourceName::MemberResource
+        && db_resource
+            .inner_content
+            .as_ref()
+            .is_some_and(crate::dashboard_statistics::is_member_displaced)
+    {
+        let displaced_enabled = {
+            let cache = s_data.cache.read().await;
+            crate::settings::is_displaced_tagging_enabled_in_cache(&cache)
+        };
+        if !displaced_enabled {
+            return (
+                HttpResponse::Forbidden().body("Displaced tagging is disabled in SettingResource"),
+                Some("Displaced MemberResource update rejected".to_string()),
+            );
+        }
     }
 
     if resource_name == ResourceName::UserResource {
         if !is_admin(req.clone()) {
-            return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to UserResource is forbidden"),
+                Some("Non-admin update UserResource rejected".to_string()),
+            );
         } else {
             //if the admin is trying to update own user resource, then deny it
             let extensions = req.extensions();
@@ -170,7 +314,10 @@ pub async fn update(
                     if let Some(inner_content) = &resource.inner_content {
                         if let Some(email) = inner_content.get("email") {
                             if email == &claims.sub {
-                                return HttpResponse::Forbidden().body("Admin cannot update oneself");
+                                return (
+                                    HttpResponse::Forbidden().body("Admin cannot update oneself"),
+                                    Some("Admin self-update rejected".to_string()),
+                                );
                             }
                         }
                     }
@@ -184,8 +331,11 @@ pub async fn update(
         .update_resource(resource_name.clone(), id, db_resource.clone())
         .await
     {
-        return HttpResponse::InternalServerError()
-            .body(format!("Failed to update resource: {:?}", err));
+        let msg = format!("Failed to update resource: {:?}", err);
+        return (
+            HttpResponse::InternalServerError().body(msg.clone()),
+            Some(msg),
+        );
     }
 
     let updated_resource = DatabaseResource {
@@ -213,7 +363,10 @@ pub async fn update(
         }
     }
 
-    HttpResponse::Ok().json(format!("Resource updated with id: {}", id))
+    (
+        HttpResponse::Ok().json(format!("Resource updated with id: {}", id)),
+        Some(format!("Updated {} with id {}", resource_name.to_string(), id)),
+    )
 }
 
 pub async fn write(
@@ -222,24 +375,58 @@ pub async fn write(
     req: actix_web::HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
-    let mut db_resource = db_resource.into_inner();
+    let started_at = std::time::Instant::now();
     let resource_name = path.into_inner();
+    let resource_label = resource_name.to_string();
+    let (response, created_id, details) =
+        write_inner(resource_name, db_resource.into_inner(), req.clone(), s_data).await;
 
+    crate::log::record_http_action_async(
+        Some(&req),
+        crate::log::ResourceActionKind::Create,
+        Some(resource_label),
+        created_id,
+        response.status().as_u16(),
+        started_at,
+        details,
+        None,
+    );
+
+    response
+}
+
+async fn write_inner(
+    resource_name: ResourceName,
+    mut db_resource: DatabaseResource,
+    req: actix_web::HttpRequest,
+    s_data: web::Data<Arc<ServerData>>,
+) -> (HttpResponse, Option<String>, Option<String>) {
     if resource_name == ResourceName::PermissionResource {
         if !is_admin(req.clone()) {
-            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to PermissionResource is forbidden"),
+                None,
+                Some("Non-admin create PermissionResource rejected".to_string()),
+            );
         }
 
         let Some(inner_val) = db_resource.inner_content.clone() else {
-            return HttpResponse::BadRequest()
-                .body("PermissionResource inner_content is required");
+            return (
+                HttpResponse::BadRequest().body("PermissionResource inner_content is required"),
+                None,
+                Some("PermissionResource inner_content missing".to_string()),
+            );
         };
         let mut perm_inner: crate::access::PermissionInnerContent =
             match serde_json::from_value(inner_val) {
                 Ok(parsed) => parsed,
                 Err(err) => {
-                    return HttpResponse::BadRequest()
-                        .body(format!("Invalid PermissionResource inner_content: {}", err));
+                    let msg = format!("Invalid PermissionResource inner_content: {}", err);
+                    return (
+                        HttpResponse::BadRequest().body(msg.clone()),
+                        None,
+                        Some(msg),
+                    );
                 }
             };
 
@@ -259,6 +446,7 @@ pub async fn write(
         .await
         {
             Ok(created) => {
+                let perm_id_str = created.id.map(|i| i.to_string());
                 if let Some(perm_id) = created.id {
                     let mut cache = s_data.cache.write().await;
                     if crate::access::is_user_logged_in_cache(
@@ -276,21 +464,63 @@ pub async fn write(
                         );
                     }
                 }
-                HttpResponse::Ok().json(created.to_database_resource())
+                (
+                    HttpResponse::Ok().json(created.to_database_resource()),
+                    perm_id_str.clone(),
+                    Some(format!("Created PermissionResource {:?}", perm_id_str)),
+                )
             }
-            Err(err) => err.to_http_response(),
+            Err(err) => {
+                let resp = err.to_http_response();
+                (resp, None, Some(format!("{err:?}")))
+            }
         };
     }
 
     if resource_name == ResourceName::BillingRuleResource && !is_admin(req.clone()) {
-        return HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource");
+        return (
+            HttpResponse::Forbidden().body("Only Admin can modify BillingRuleResource"),
+            None,
+            Some("Non-admin create BillingRuleResource rejected".to_string()),
+        );
+    }
+
+    if resource_name == ResourceName::ActionLogsResource && !is_admin(req.clone()) {
+        return (
+            HttpResponse::Forbidden().body("Access to ActionLogsResource is forbidden"),
+            None,
+            Some("Non-admin create ActionLogsResource rejected".to_string()),
+        );
+    }
+
+    if resource_name == ResourceName::MemberResource
+        && db_resource
+            .inner_content
+            .as_ref()
+            .is_some_and(crate::dashboard_statistics::is_member_displaced)
+    {
+        let displaced_enabled = {
+            let cache = s_data.cache.read().await;
+            crate::settings::is_displaced_tagging_enabled_in_cache(&cache)
+        };
+        if !displaced_enabled {
+            return (
+                HttpResponse::Forbidden().body("Displaced tagging is disabled in SettingResource"),
+                None,
+                Some("Displaced MemberResource create rejected".to_string()),
+            );
+        }
     }
 
     let mut effective_user_branch: Option<String> = None;
 
     if resource_name == ResourceName::UserResource {
         if !is_admin(req.clone()) {
-            return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to UserResource is forbidden"),
+                None,
+                Some("Non-admin create UserResource rejected".to_string()),
+            );
         }
         let payload_branch = db_resource
             .inner_content
@@ -316,8 +546,12 @@ pub async fn write(
     {
         Ok(id) => id,
         Err(err) => {
-            return HttpResponse::InternalServerError()
-                .body(format!("Failed to write resource: {:?}", err));
+            let msg = format!("Failed to write resource: {:?}", err);
+            return (
+                HttpResponse::InternalServerError().body(msg.clone()),
+                None,
+                Some(msg),
+            );
         }
     };
 
@@ -353,11 +587,15 @@ pub async fn write(
         );
     }
 
-    HttpResponse::Ok().json(DatabaseResource {
-        id: Some(id),
-        resource_name: Some(resource_name.into()),
-        ..db_resource
-    })
+    (
+        HttpResponse::Ok().json(DatabaseResource {
+            id: Some(id),
+            resource_name: Some(resource_name.into()),
+            ..db_resource
+        }),
+        Some(id.to_string()),
+        Some(format!("Created {} with id {}", resource_name.to_string(), id)),
+    )
 }
 
 pub async fn read(
@@ -365,24 +603,74 @@ pub async fn read(
     s_data: web::Data<Arc<ServerData>>,
     req: actix_web::HttpRequest,
 ) -> HttpResponse {
-    let (resource_name, id) = path.into_inner();
+    let started_at = std::time::Instant::now();
+    let (resource_name_raw, id_raw) = path.into_inner();
+    let (response, resource_label, resource_id, details) =
+        read_inner(resource_name_raw, id_raw, s_data, req.clone()).await;
 
-    let resource_name: ResourceName = match resource_name.try_into() {
-        Ok(r) => r,
-        Err(_) => {
-            return HttpResponse::BadRequest().body("Invalid resource name");
+    crate::log::record_http_action_async(
+        Some(&req),
+        crate::log::ResourceActionKind::Read,
+        Some(resource_label),
+        resource_id,
+        response.status().as_u16(),
+        started_at,
+        details,
+        None,
+    );
+
+    response
+}
+
+async fn read_inner(
+    resource_name_raw: String,
+    id: Option<String>,
+    s_data: web::Data<Arc<ServerData>>,
+    req: actix_web::HttpRequest,
+) -> (HttpResponse, String, Option<String>, Option<String>) {
+    let resource_id_log = id.clone();
+
+    let resource_name: ResourceName = match ResourceName::from_str_case_insensitive(&resource_name_raw) {
+        Some(r) => r,
+        None => {
+            return (
+                HttpResponse::BadRequest().body("Invalid resource name"),
+                resource_name_raw,
+                resource_id_log,
+                Some("Invalid resource name".to_string()),
+            );
         }
     };
+    let resource_label = resource_name.to_string();
 
     if resource_name == ResourceName::UserResource {
         if !is_admin(req.clone()) {
-            return HttpResponse::Forbidden().body("Access to UserResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to UserResource is forbidden"),
+                resource_label,
+                resource_id_log,
+                Some("Non-admin read UserResource rejected".to_string()),
+            );
         }
+    }
+
+    if resource_name == ResourceName::ActionLogsResource && !is_admin(req.clone()) {
+        return (
+            HttpResponse::Forbidden().body("Access to ActionLogsResource is forbidden"),
+            resource_label,
+            resource_id_log,
+            Some("Non-admin read ActionLogsResource rejected".to_string()),
+        );
     }
 
     if resource_name == ResourceName::PermissionResource {
         if !is_admin(req) {
-            return HttpResponse::Forbidden().body("Access to PermissionResource is forbidden");
+            return (
+                HttpResponse::Forbidden().body("Access to PermissionResource is forbidden"),
+                resource_label,
+                resource_id_log,
+                Some("Non-admin read PermissionResource rejected".to_string()),
+            );
         }
 
         if id == Some("all".into()) {
@@ -393,25 +681,54 @@ pub async fn read(
             {
                 Ok(resources) => resources,
                 Err(err) => {
-                    return HttpResponse::InternalServerError()
-                        .body(format!("Failed to read PermissionResource: {:?}", err));
+                    let msg = format!("Failed to read PermissionResource: {:?}", err);
+                    return (
+                        HttpResponse::InternalServerError().body(msg.clone()),
+                        resource_label,
+                        resource_id_log,
+                        Some(msg),
+                    );
                 }
             };
 
             if db_resources.is_empty() {
-                return HttpResponse::NotFound()
-                    .body("No resources found for resource name: PermissionResource in database");
+                return (
+                    HttpResponse::NotFound().body(
+                        "No resources found for resource name: PermissionResource in database",
+                    ),
+                    resource_label,
+                    resource_id_log,
+                    Some("No PermissionResource rows found".to_string()),
+                );
             }
-            return HttpResponse::Ok().json(db_resources);
+            let count = db_resources.len();
+            return (
+                HttpResponse::Ok().json(db_resources),
+                resource_label,
+                resource_id_log,
+                Some(format!("Read {} PermissionResource row(s)", count)),
+            );
         }
 
         let parsed_id: i32 = match id {
             Some(id_str) => match id_str.parse() {
                 Ok(i) => i,
-                Err(_) => return HttpResponse::BadRequest().body("Invalid ID format"),
+                Err(_) => {
+                    return (
+                        HttpResponse::BadRequest().body("Invalid ID format"),
+                        resource_label,
+                        resource_id_log,
+                        Some("Invalid ID format".to_string()),
+                    );
+                }
             },
             None => {
-                return HttpResponse::BadRequest().body("ID is required for reading a resource");
+                return (
+                    HttpResponse::BadRequest().body("ID is required for reading a resource"),
+                    resource_label,
+                    resource_id_log,
+                    Some("Missing ID".to_string()),
+                );
             }
         };
 
@@ -422,17 +739,31 @@ pub async fn read(
         {
             Ok(resource) => resource,
             Err(err) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to read PermissionResource: {:?}", err));
+                let msg = format!("Failed to read PermissionResource: {:?}", err);
+                return (
+                    HttpResponse::InternalServerError().body(msg.clone()),
+                    resource_label,
+                    resource_id_log,
+                    Some(msg),
+                );
             }
         };
 
         if db_resource.id.is_none() {
-            return HttpResponse::NotFound()
-                .body(format!("Resource not found for id: {}", parsed_id));
+            return (
+                HttpResponse::NotFound().body(format!("Resource not found for id: {}", parsed_id)),
+                resource_label,
+                resource_id_log,
+                Some(format!("PermissionResource {} not found", parsed_id)),
+            );
         }
 
-        return HttpResponse::Ok().json(db_resource);
+        return (
+            HttpResponse::Ok().json(db_resource),
+            resource_label,
+            resource_id_log,
+            Some(format!("Read PermissionResource {}", parsed_id)),
+        );
     }
 
     let cache = s_data.cache.read().await;
@@ -441,19 +772,35 @@ pub async fn read(
         let db_resources = match s_data.db.read_all_resource(resource_name.clone()).await {
             Ok(resources) => resources,
             Err(err) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to read all resources: {:?}", err));
+                let msg = format!("Failed to read all resources: {:?}", err);
+                return (
+                    HttpResponse::InternalServerError().body(msg.clone()),
+                    resource_label,
+                    resource_id_log,
+                    Some(msg),
+                );
             }
         };
 
         if db_resources.is_empty() {
-            return HttpResponse::NotFound().body(format!(
-                "No resources found for resource name : {:?} in the database",
-                resource_name
-            ));
+            return (
+                HttpResponse::NotFound().body(format!(
+                    "No resources found for resource name : {:?} in the database",
+                    resource_name
+                )),
+                resource_label,
+                resource_id_log,
+                Some("No resources found in database".to_string()),
+            );
         }
 
-        return HttpResponse::Ok().json(db_resources);
+        let count = db_resources.len();
+        return (
+            HttpResponse::Ok().json(db_resources),
+            resource_label,
+            resource_id_log,
+            Some(format!("Read {} row(s) from database", count)),
+        );
     };
 
     if id == Some("all".into()) {
@@ -461,19 +808,30 @@ pub async fn read(
             let db_resources = match s_data.db.read_all_resource(resource_name.clone()).await {
                 Ok(resources) => resources,
                 Err(err) => {
-                    return HttpResponse::InternalServerError()
-                        .body(format!("Failed to read all resources: {:?}", err));
+                    let msg = format!("Failed to read all resources: {:?}", err);
+                    return (
+                        HttpResponse::InternalServerError().body(msg.clone()),
+                        resource_label,
+                        resource_id_log,
+                        Some(msg),
+                    );
                 }
             };
 
             if db_resources.is_empty() {
-                return HttpResponse::NotFound().body(format!(
-                    "No resources found for resource name: {:?} in database",
-                    resource_name
-                ));
+                return (
+                    HttpResponse::NotFound().body(format!(
+                        "No resources found for resource name: {:?} in database",
+                        resource_name
+                    )),
+                    resource_label,
+                    resource_id_log,
+                    Some("No resources found in database".to_string()),
+                );
             }
 
             // Cache miss -> populate cache
+            drop(cache);
             {
                 let mut cache = s_data.cache.write().await;
 
@@ -483,9 +841,21 @@ pub async fn read(
                     }
                 }
             }
-            return HttpResponse::Ok().json(db_resources);
+            let count = db_resources.len();
+            return (
+                HttpResponse::Ok().json(db_resources),
+                resource_label,
+                resource_id_log,
+                Some(format!("Read {} row(s) (cache populated)", count)),
+            );
         } else {
-            return HttpResponse::Ok().json(cache_result);
+            let count = cache_result.len();
+            return (
+                HttpResponse::Ok().json(cache_result),
+                resource_label,
+                resource_id_log,
+                Some(format!("Read {} row(s) from cache", count)),
+            );
         }
     }
 
@@ -493,42 +863,71 @@ pub async fn read(
         Some(id_str) => match id_str.parse() {
             Ok(i) => Some(i),
             Err(_) => {
-                return HttpResponse::BadRequest().body("Invalid ID format");
+                return (
+                    HttpResponse::BadRequest().body("Invalid ID format"),
+                    resource_label,
+                    resource_id_log,
+                    Some("Invalid ID format".to_string()),
+                );
             }
         },
         None => None,
     };
 
     match id {
-        None => {
-            return HttpResponse::BadRequest().body("ID is required for reading a resource");
-        }
+        None => (
+            HttpResponse::BadRequest().body("ID is required for reading a resource"),
+            resource_label,
+            resource_id_log,
+            Some("Missing ID".to_string()),
+        ),
 
         Some(id) => {
             if let Some(resource) = cache.read(resource_name.clone(), id) {
-                return HttpResponse::Ok().json(resource);
+                return (
+                    HttpResponse::Ok().json(resource),
+                    resource_label,
+                    resource_id_log,
+                    Some(format!("Cache hit for id {}", id)),
+                );
             }
 
             let db_resource = match s_data.db.read_resource(resource_name.clone(), id).await {
                 Ok(resource) => resource,
                 Err(err) => {
-                    return HttpResponse::InternalServerError()
-                        .body(format!("Failed to read resource: {:?}", err));
+                    let msg = format!("Failed to read resource: {:?}", err);
+                    return (
+                        HttpResponse::InternalServerError().body(msg.clone()),
+                        resource_label,
+                        resource_id_log,
+                        Some(msg),
+                    );
                 }
             };
 
             if db_resource.id.is_none() {
-                return HttpResponse::NotFound().body(format!("Resource not found for id: {}", id));
+                return (
+                    HttpResponse::NotFound().body(format!("Resource not found for id: {}", id)),
+                    resource_label,
+                    resource_id_log,
+                    Some(format!("Resource not found for id {}", id)),
+                );
             }
 
             // Cache miss -> populate cache
+            drop(cache);
             {
                 let mut cache = s_data.cache.write().await;
 
                 cache.write(resource_name, id, db_resource.clone());
             }
 
-            HttpResponse::Ok().json(db_resource)
+            (
+                HttpResponse::Ok().json(db_resource),
+                resource_label,
+                resource_id_log,
+                Some(format!("Read id {} from database", id)),
+            )
         }
     }
 }
@@ -538,16 +937,45 @@ pub async fn delete(
     s_data: web::Data<Arc<ServerData>>,
     req: actix_web::HttpRequest,
 ) -> HttpResponse {
-
+    let started_at = std::time::Instant::now();
     let (resource_name, id) = path.into_inner();
+    let resource_label = resource_name.to_string();
+    let resource_id = Some(id.to_string());
+    let (response, details) = delete_inner(resource_name, id, s_data, req.clone()).await;
 
+    crate::log::record_http_action_async(
+        Some(&req),
+        crate::log::ResourceActionKind::Delete,
+        Some(resource_label),
+        resource_id,
+        response.status().as_u16(),
+        started_at,
+        details,
+        None,
+    );
+
+    response
+}
+
+async fn delete_inner(
+    resource_name: ResourceName,
+    id: i32,
+    s_data: web::Data<Arc<ServerData>>,
+    req: actix_web::HttpRequest,
+) -> (HttpResponse, Option<String>) {
     if !is_admin(req) {
-        return HttpResponse::Forbidden().body("Access to delete resources is forbidden");
+        return (
+            HttpResponse::Forbidden().body("Access to delete resources is forbidden"),
+            Some("Non-admin delete rejected".to_string()),
+        );
     }
 
     if let Err(err) = s_data.db.delete_resource(resource_name.clone(), id).await {
-        return HttpResponse::InternalServerError()
-            .body(format!("Failed to delete resource: {:?}", err));
+        let msg = format!("Failed to delete resource: {:?}", err);
+        return (
+            HttpResponse::InternalServerError().body(msg.clone()),
+            Some(msg),
+        );
     }
 
     {
@@ -568,7 +996,10 @@ pub async fn delete(
         }
     }
 
-    HttpResponse::Ok().json(format!("Resource deleted with id: {}", id))
+    (
+        HttpResponse::Ok().json(format!("Resource deleted with id: {}", id)),
+        Some(format!("Deleted {} with id {}", resource_name.to_string(), id)),
+    )
 }
 
 #[cfg(test)]
@@ -942,5 +1373,501 @@ mod tests {
             .await;
             assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
         }
+    }
+
+    #[actix_web::test]
+    async fn test_all_actions_emit_async_logs_for_resources() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        let actor_email = format!("actions-audit-{}@test.com", crate::log::generate_action_log_id());
+        state.seed(
+            ResourceName::UserResource,
+            DatabaseResource {
+                id: Some(901),
+                resource_name: Some(ResourceName::UserResource),
+                inner_content: Some(serde_json::json!({
+                    "email": actor_email,
+                    "password": "admin-secret-password",
+                    "role": "Admin",
+                    "SanghBranch": "Loadboard sthaniya"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        let admin_req = actix_web::test::TestRequest::default().to_http_request();
+        admin_req.extensions_mut().insert(crate::auth::Claims {
+            sub: actor_email.clone(),
+            exp: 9999999999,
+            iat: 1000000000,
+            role: crate::roles::Roles::Admin,
+            user_id: Some(901),
+            jti: None,
+        });
+
+        let operator_req = actix_web::test::TestRequest::default().to_http_request();
+        operator_req.extensions_mut().insert(crate::auth::Claims {
+            sub: actor_email.clone(),
+            exp: 9999999999,
+            iat: 1000000000,
+            role: crate::roles::Roles::Operator,
+            user_id: Some(902),
+            jti: None,
+        });
+
+        // 1. Write SettingResource
+        let unique_branch = format!("AuditBranch-{}", crate::log::generate_action_log_id());
+        let w_setting = write(
+            web::Path::from(ResourceName::SettingResource),
+            web::Json(DatabaseResource {
+                id: None,
+                resource_name: None,
+                inner_content: Some(serde_json::json!({ "SanghBranch": unique_branch })),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(w_setting.status(), actix_web::http::StatusCode::OK);
+        let w_setting_bytes = actix_web::body::to_bytes(w_setting.into_body())
+            .await
+            .expect("read w_setting body");
+        let created_setting: DatabaseResource =
+            serde_json::from_slice(&w_setting_bytes).expect("parse created_setting");
+        let setting_id = created_setting.id.unwrap();
+
+        // 2. Read SettingResource
+        let r_setting = read(
+            web::Path::from(("SettingResource".to_string(), Some(setting_id.to_string()))),
+            s_data.clone(),
+            admin_req.clone(),
+        )
+        .await;
+        assert_eq!(r_setting.status(), actix_web::http::StatusCode::OK);
+
+        // 3. Search SettingResource
+        let s_setting = search(
+            web::Path::from((
+                "SettingResource".to_string(),
+                "SanghBranch".to_string(),
+                unique_branch.clone(),
+                "10".to_string(),
+            )),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(s_setting.status(), actix_web::http::StatusCode::OK);
+
+        // 4. Update SettingResource
+        let u_setting = update(
+            web::Path::from((ResourceName::SettingResource, setting_id)),
+            web::Json(DatabaseResource {
+                id: None,
+                resource_name: None,
+                inner_content: Some(serde_json::json!({ "SanghBranch": unique_branch })),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(u_setting.status(), actix_web::http::StatusCode::OK);
+
+        // 5. Forbidden BillingRuleResource write by Operator
+        let w_rule_forbidden = write(
+            web::Path::from(ResourceName::BillingRuleResource),
+            web::Json(sample_billing_rule_payload(Some("Loadboard sthaniya"))),
+            operator_req,
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(w_rule_forbidden.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+        // 6. Create + Delete UserResource (verifying no password leaked in logs)
+        let secret_pw = "SuperSecretUserPass987!";
+        let w_user = write(
+            web::Path::from(ResourceName::UserResource),
+            web::Json(DatabaseResource {
+                id: None,
+                resource_name: None,
+                inner_content: Some(serde_json::json!({
+                    "email": "created-audit@test.com",
+                    "password": secret_pw,
+                    "role": "User"
+                })),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(w_user.status(), actix_web::http::StatusCode::OK);
+        let w_user_bytes = actix_web::body::to_bytes(w_user.into_body())
+            .await
+            .expect("read w_user body");
+        let created_user: DatabaseResource =
+            serde_json::from_slice(&w_user_bytes).expect("parse created_user");
+        let created_uid = created_user.id.unwrap();
+
+        let d_setting = delete(
+            web::Path::from((ResourceName::SettingResource, setting_id)),
+            s_data.clone(),
+            admin_req,
+        )
+        .await;
+        assert_eq!(d_setting.status(), actix_web::http::StatusCode::OK);
+
+        crate::log::flush_action_logs().await;
+
+        let actor_logs: Vec<_> = crate::log::get_all_action_logs()
+            .into_iter()
+            .filter(|e| e.performed_by.as_deref() == Some(actor_email.as_str()))
+            .collect();
+
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Create
+                && e.resource_name.as_deref() == Some("SettingResource")
+                && e.resource_id.as_deref() == Some(setting_id.to_string().as_str())
+                && e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Read
+                && e.resource_name.as_deref() == Some("SettingResource")
+                && e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Search
+                && e.resource_name.as_deref() == Some("SettingResource")
+                && e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Update
+                && e.resource_name.as_deref() == Some("SettingResource")
+                && e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Delete
+                && e.resource_name.as_deref() == Some("SettingResource")
+                && e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Create
+                && e.resource_name.as_deref() == Some("BillingRuleResource")
+                && e.status_code == 403
+                && !e.success
+        }));
+        assert!(actor_logs.iter().any(|e| {
+            e.action == crate::log::ResourceActionKind::Create
+                && e.resource_name.as_deref() == Some("UserResource")
+                && e.resource_id.as_deref() == Some(created_uid.to_string().as_str())
+                && e.success
+        }));
+
+        // Password must never appear anywhere in logs
+        for entry in &actor_logs {
+            let serialized = serde_json::to_string(entry).unwrap();
+            assert!(!serialized.contains(secret_pw));
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_displaced_member_resource_create_and_update_respect_setting_resource() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        let initial_setting = DatabaseResource {
+            id: Some(1),
+            resource_name: Some(ResourceName::SettingResource),
+            inner_content: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "vehicleManagement": {
+                    "displacedTagging": { "enabled": false }
+                }
+            })),
+            external_content: None,
+        };
+        state.seed(ResourceName::SettingResource, initial_setting.clone());
+        state.seed(
+            ResourceName::MemberResource,
+            DatabaseResource {
+                id: Some(50),
+                resource_name: Some(ResourceName::MemberResource),
+                inner_content: Some(serde_json::json!({
+                    "vehicleId": "7001",
+                    "vehicleNumber": "NA-01-KA-7001",
+                    "isDisplaced": false,
+                    "status": "ACTIVE"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+        s_data
+            .cache
+            .write()
+            .await
+            .write(ResourceName::SettingResource, 1, initial_setting);
+        let admin_req = make_req_with_role(Some(crate::roles::Roles::Admin));
+
+        let displaced_payload = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "vehicleId": "7002",
+                "vehicleNumber": "NA-01-KA-7002",
+                "isDisplaced": true,
+                "status": "DISPLACED"
+            })),
+            external_content: None,
+        };
+
+        // 1. Displaced MemberResource create is forbidden while disabled
+        let create_blocked = write(
+            web::Path::from(ResourceName::MemberResource),
+            web::Json(displaced_payload.clone()),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(
+            create_blocked.status(),
+            actix_web::http::StatusCode::FORBIDDEN
+        );
+
+        // 2. Displaced MemberResource update is forbidden while disabled
+        let update_blocked = update(
+            web::Path::from((ResourceName::MemberResource, 50)),
+            web::Json(displaced_payload.clone()),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(
+            update_blocked.status(),
+            actix_web::http::StatusCode::FORBIDDEN
+        );
+
+        // 3. Non-displaced MemberResource create is allowed even when disabled
+        let create_regular = write(
+            web::Path::from(ResourceName::MemberResource),
+            web::Json(DatabaseResource {
+                id: None,
+                resource_name: None,
+                inner_content: Some(serde_json::json!({
+                    "vehicleId": "7003",
+                    "vehicleNumber": "NA-01-KA-7003",
+                    "isDisplaced": false,
+                    "status": "ACTIVE"
+                })),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(create_regular.status(), actix_web::http::StatusCode::OK);
+
+        // 4. Enable displacedTagging in SettingResource -> both create and update succeed
+        let enable_setting = update(
+            web::Path::from((ResourceName::SettingResource, 1)),
+            web::Json(DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(serde_json::json!({
+                    "schemaVersion": 1,
+                    "vehicleManagement": {
+                        "displacedTagging": { "enabled": true }
+                    }
+                })),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(enable_setting.status(), actix_web::http::StatusCode::OK);
+
+        let create_allowed = write(
+            web::Path::from(ResourceName::MemberResource),
+            web::Json(displaced_payload.clone()),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(create_allowed.status(), actix_web::http::StatusCode::OK);
+
+        let update_allowed = update(
+            web::Path::from((ResourceName::MemberResource, 50)),
+            web::Json(displaced_payload),
+            admin_req,
+            s_data,
+        )
+        .await;
+        assert_eq!(update_allowed.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_action_logs_resource_admin_only_access_for_all_actions() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::ActionLogsResource,
+            DatabaseResource {
+                id: Some(101),
+                resource_name: Some(ResourceName::ActionLogsResource),
+                inner_content: Some(serde_json::json!({
+                    "id": "ACTLOG-101",
+                    "action": "Create",
+                    "resource_name": "BillResource",
+                    "performed_by": "admin@narayani.com",
+                    "role": "Admin",
+                    "status_code": 200,
+                    "success": true
+                })),
+                external_content: None,
+            },
+        );
+        // Intentionally keep cache empty at first to exercise cache-miss DB read path as well.
+        let (s_data, db_state) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        let sample_log_payload = DatabaseResource {
+            id: None,
+            resource_name: Some(ResourceName::ActionLogsResource),
+            inner_content: Some(serde_json::json!({
+                "id": "ACTLOG-202",
+                "action": "Login",
+                "performed_by": "admin@narayani.com",
+                "role": "Admin",
+                "status_code": 200,
+                "success": true
+            })),
+            external_content: None,
+        };
+
+        // 1. Unauthenticated, User, and Operator roles must be forbidden on all actions
+        for role in [
+            None,
+            Some(crate::roles::Roles::User),
+            Some(crate::roles::Roles::Operator),
+        ] {
+            let read_one = read(
+                web::Path::from(("ActionLogsResource".to_string(), Some("101".to_string()))),
+                s_data.clone(),
+                make_req_with_role(role.clone()),
+            )
+            .await;
+            assert_eq!(read_one.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+            let read_all = read(
+                web::Path::from(("ActionLogsResource".to_string(), Some("all".to_string()))),
+                s_data.clone(),
+                make_req_with_role(role.clone()),
+            )
+            .await;
+            assert_eq!(read_all.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+            let search_resp = search(
+                web::Path::from((
+                    "ActionLogsResource".to_string(),
+                    "role".to_string(),
+                    "Admin".to_string(),
+                    "10".to_string(),
+                )),
+                make_req_with_role(role.clone()),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(search_resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+            let create_resp = write(
+                web::Path::from(ResourceName::ActionLogsResource),
+                web::Json(sample_log_payload.clone()),
+                make_req_with_role(role.clone()),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(create_resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+            let update_resp = update(
+                web::Path::from((ResourceName::ActionLogsResource, 101)),
+                web::Json(sample_log_payload.clone()),
+                make_req_with_role(role.clone()),
+                s_data.clone(),
+            )
+            .await;
+            assert_eq!(update_resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+            let delete_resp = delete(
+                web::Path::from((ResourceName::ActionLogsResource, 101)),
+                s_data.clone(),
+                make_req_with_role(role),
+            )
+            .await;
+            assert_eq!(delete_resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+        }
+
+        // 2. Admin can read (cache-miss -> DB + populates cache without deadlocking),
+        // read all, create, search, update, and delete ActionLogsResource
+        let admin_read_miss = read(
+            web::Path::from(("ActionLogsResource".to_string(), Some("101".to_string()))),
+            s_data.clone(),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+        )
+        .await;
+        assert_eq!(admin_read_miss.status(), actix_web::http::StatusCode::OK);
+
+        let admin_create = write(
+            web::Path::from(ResourceName::ActionLogsResource),
+            web::Json(sample_log_payload.clone()),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(admin_create.status(), actix_web::http::StatusCode::OK);
+
+        let admin_read_all = read(
+            web::Path::from(("ActionLogsResource".to_string(), Some("all".to_string()))),
+            s_data.clone(),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+        )
+        .await;
+        assert_eq!(admin_read_all.status(), actix_web::http::StatusCode::OK);
+
+        let admin_search = search(
+            web::Path::from((
+                "ActionLogsResource".to_string(),
+                "role".to_string(),
+                "Admin".to_string(),
+                "10".to_string(),
+            )),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(admin_search.status(), actix_web::http::StatusCode::OK);
+
+        let admin_update = update(
+            web::Path::from((ResourceName::ActionLogsResource, 101)),
+            web::Json(sample_log_payload),
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(admin_update.status(), actix_web::http::StatusCode::OK);
+
+        let admin_delete = delete(
+            web::Path::from((ResourceName::ActionLogsResource, 101)),
+            s_data,
+            make_req_with_role(Some(crate::roles::Roles::Admin)),
+        )
+        .await;
+        assert_eq!(admin_delete.status(), actix_web::http::StatusCode::OK);
+
+        let guard = db_state.lock().await;
+        let table = ResourceName::ActionLogsResource.to_string().to_lowercase();
+        let remaining = guard.tables.get(&table).cloned().unwrap_or_default();
+        assert_eq!(remaining.len(), 1);
     }
 }

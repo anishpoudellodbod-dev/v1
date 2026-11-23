@@ -272,7 +272,12 @@ pub fn compute_members(
     let members: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::MemberResource)
         .unwrap_or_default();
-    let displaced_users = collect_displaced_vehicles(members, &index);
+    let displaced_users =
+        if crate::settings::is_displaced_tagging_enabled_in_resources(settings.iter().copied()) {
+            collect_displaced_vehicles(members, &index)
+        } else {
+            Vec::new()
+        };
     let total_inactive_users = inactive_year.clone();
 
     DashboardMembers {
@@ -776,5 +781,48 @@ mod tests {
         let list_2081: Vec<DatabaseResource> = actix_test::read_body_json(resp_2081).await;
         assert_eq!(list_2081.len(), 1);
         assert_eq!(list_2081[0].id, Some(1));
+    }
+
+    #[test]
+    fn test_compute_members_respects_vehicle_management_displaced_tagging() {
+        let mut cache = build_sample_cache();
+        let write_displaced_setting = |cache: &mut Cache, enabled: bool| {
+            cache.write(
+                ResourceName::SettingResource,
+                99,
+                DatabaseResource {
+                    id: Some(99),
+                    resource_name: Some(ResourceName::SettingResource),
+                    inner_content: Some(json!({
+                        "schemaVersion": 1,
+                        "vehicleManagement": {
+                            "displacedTagging": {
+                                "enabled": enabled
+                            }
+                        }
+                    })),
+                    external_content: None,
+                },
+            );
+        };
+
+        write_displaced_setting(&mut cache, false);
+        let disabled = compute_members(
+            Some("2083/84"),
+            &cache,
+            &[],
+            DateParams::from("2026-11-16").into(),
+        );
+        assert_eq!(disabled.total_active_users.len(), 3);
+        assert!(disabled.displaced_users.is_empty());
+
+        write_displaced_setting(&mut cache, true);
+        let enabled = compute_members(
+            Some("2083/84"),
+            &cache,
+            &[],
+            DateParams::from("2026-11-16").into(),
+        );
+        assert_eq!(enabled.displaced_users.len(), 1);
     }
 }

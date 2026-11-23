@@ -12,6 +12,7 @@ pub enum ResourceName {
     BillingRuleResource,
     BillingEntityResource,
     BranchResource,
+    ActionLogsResource,
 }
 
 impl ResourceName {
@@ -42,6 +43,8 @@ impl ResourceName {
             Some(Self::BillingEntityResource)
         } else if trimmed.eq_ignore_ascii_case("BranchResource") {
             Some(Self::BranchResource)
+        } else if trimmed.eq_ignore_ascii_case("ActionLogsResource") {
+            Some(Self::ActionLogsResource)
         } else {
             None
         }
@@ -90,6 +93,7 @@ impl ToString for ResourceName {
             ResourceName::BillingRuleResource => "BillingRuleResource".into(),
             ResourceName::BillingEntityResource => "BillingEntityResource".into(),
             ResourceName::BranchResource => "BranchResource".into(),
+            ResourceName::ActionLogsResource => "ActionLogsResource".into(),
         }
     }
 }
@@ -133,6 +137,7 @@ mod tests {
         assert_eq!(ResourceName::BillingRuleResource.to_string(), "BillingRuleResource");
         assert_eq!(ResourceName::BillingEntityResource.to_string(), "BillingEntityResource");
         assert_eq!(ResourceName::BranchResource.to_string(), "BranchResource");
+        assert_eq!(ResourceName::ActionLogsResource.to_string(), "ActionLogsResource");
     }
 
     #[test]
@@ -150,6 +155,7 @@ mod tests {
         assert_eq!(ResourceName::from("BillingRuleResource".to_string()), ResourceName::BillingRuleResource);
         assert_eq!(ResourceName::from("BillingEntityResource".to_string()), ResourceName::BillingEntityResource);
         assert_eq!(ResourceName::from("BranchResource".to_string()), ResourceName::BranchResource);
+        assert_eq!(ResourceName::from("ActionLogsResource".to_string()), ResourceName::ActionLogsResource);
     }
 
     #[test]
@@ -167,6 +173,7 @@ mod tests {
             ("BillingRuleResource", ResourceName::BillingRuleResource),
             ("BillingEntityResource", ResourceName::BillingEntityResource),
             ("BranchResource", ResourceName::BranchResource),
+            ("ActionLogsResource", ResourceName::ActionLogsResource),
         ];
 
         for (pascal, expected) in variants {
