@@ -6,6 +6,7 @@ use actix_web::{
     http::header,
     web,
     Error,
+    HttpRequest,
     HttpResponse,
 };
 
@@ -24,6 +25,7 @@ pub async fn search(
         String,
         Option<String>,
     )>,
+    req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     let (
@@ -34,17 +36,36 @@ pub async fn search(
         offset,
     ) = path.into_inner();
 
-    let resource_name: ResourceName = match resource_name.try_into() {
-        Ok(ResourceName::UserResource) => {
-            return HttpResponse::Forbidden()
-                .body("Search in UserResource is forbidden");
-        }
-        Ok(resource_name) => resource_name,
-        Err(_) => {
+    let resource_name: ResourceName = match ResourceName::from_str_case_insensitive(&resource_name) {
+        Some(resource_name) => resource_name,
+        None => {
             return HttpResponse::BadRequest()
                 .body("Invalid resource name");
         }
     };
+
+    match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        crate::permissions::canonical_resource_name(resource_name),
+        crate::permissions::action::READ,
+        crate::permissions::extract_branch_id_from_req(&req),
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().body(message);
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { .. } => {}
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => {
+            if resource_name == ResourceName::UserResource {
+                return HttpResponse::Forbidden().body("Search in UserResource is forbidden");
+            }
+            if !crate::actions::is_admin(req) {
+                return HttpResponse::Forbidden().body("Admin access required");
+            }
+        }
+    }
 
     let batch_limit: usize = if batch_limit.eq_ignore_ascii_case("all") {
         5000

@@ -1,15 +1,87 @@
 use crate::resource::{DatabaseResource, ResourceName};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct Cache {
     pub cache: HashMap<ResourceName, HashMap<i32, DatabaseResource>>,
+    fully_loaded: HashSet<ResourceName>,
+    /// v1.0 role-per-tenant permission policies keyed by `(normalized_tenant_id, role_lower)`,
+    /// kept isolated from `self.cache` so legacy `PermissionResource` session cache stays clean.
+    pub role_policies: HashMap<(String, String), crate::permissions::RolePermissionResource>,
 }
 
 impl Cache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn upsert_role_policy(&mut self, mut policy: crate::permissions::RolePermissionResource) {
+        let tenant_key = crate::permissions::normalize_tenant_id(&policy.inner_content.tenant_id);
+        let role_key = policy.inner_content.role.trim().to_ascii_lowercase();
+        policy.inner_content.tenant_id = tenant_key.clone();
+        self.role_policies.insert((tenant_key, role_key), policy);
+    }
+
+    pub fn remove_role_policy_by_id(
+        &mut self,
+        id: i32,
+    ) -> Option<crate::permissions::RolePermissionResource> {
+        let target_key = self
+            .role_policies
+            .iter()
+            .find(|(_, v)| v.id == Some(id))
+            .map(|(k, _)| k.clone())?;
+        self.role_policies.remove(&target_key)
+    }
+
+    pub fn get_role_policy(
+        &self,
+        tenant_id: &str,
+        role: &str,
+    ) -> Option<&crate::permissions::RolePermissionResource> {
+        let tenant_key = crate::permissions::normalize_tenant_id(tenant_id);
+        let role_key = role.trim().to_ascii_lowercase();
+        self.role_policies.get(&(tenant_key, role_key))
+    }
+
+    pub fn has_role_policies_for_tenant(&self, tenant_id: &str) -> bool {
+        let tenant_key = crate::permissions::normalize_tenant_id(tenant_id);
+        self.role_policies.keys().any(|(t, _)| t == &tenant_key)
+    }
+
+    pub fn list_role_policies(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Vec<crate::permissions::RolePermissionResource> {
+        let tenant_filter = tenant_id
+            .map(crate::permissions::normalize_tenant_id)
+            .filter(|s| !s.is_empty());
+        let mut items: Vec<_> = self
+            .role_policies
+            .values()
+            .filter(|p| {
+                tenant_filter
+                    .as_ref()
+                    .is_none_or(|t| crate::permissions::normalize_tenant_id(&p.inner_content.tenant_id) == *t)
+            })
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            a.inner_content
+                .tenant_id
+                .cmp(&b.inner_content.tenant_id)
+                .then_with(|| a.inner_content.role.cmp(&b.inner_content.role))
+        });
+        items
+    }
+
+    pub fn is_fully_loaded(&self, resource_name: ResourceName) -> bool {
+        self.fully_loaded.contains(&resource_name)
+    }
+
+    pub fn mark_fully_loaded(&mut self, resource_name: ResourceName) {
+        self.fully_loaded.insert(resource_name);
     }
 
     pub fn read(&self, resource_name: ResourceName, id: i32) -> Option<DatabaseResource> {
@@ -416,6 +488,7 @@ impl Cache {
                             entry.insert(id, resource);
                         }
                     }
+                    self.mark_fully_loaded(resource_name.clone());
                 }
                 Err(e) => {
                     eprintln!("Error loading cache for resource {:?}: {e}", resource_name);

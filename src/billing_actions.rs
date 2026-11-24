@@ -1919,7 +1919,19 @@ pub async fn submit_vehicle_payment(
     body: web::Json<SubmitVehiclePaymentRequest>,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     if let Err(err) = authenticate_lodbod_request(&req) {
+        crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+            req: Some(&req),
+            category: crate::audit::AuditCategory::Integration,
+            action: crate::audit::AuditAction::AccessDenied,
+            status_code: StatusCode::UNAUTHORIZED.as_u16(),
+            started_at: Some(started_at),
+            resource_name: Some("BillResource".to_string()),
+            summary: format!("Unauthorized Lodbod payment submission: {}", err.error.message),
+            metadata: Some(serde_json::json!({ "code": err.error.code })),
+            ..Default::default()
+        });
         return HttpResponse::build(StatusCode::UNAUTHORIZED).json(err);
     }
     let req_id = extract_request_id(&req);
@@ -2179,6 +2191,28 @@ pub async fn submit_vehicle_payment(
         Ok(Ok(id)) => id,
         Ok(Err(err)) => {
             eprintln!("Failed to create BillResource in database: {:?}", err);
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Integration,
+                action: crate::audit::AuditAction::Payment,
+                outcome_override: Some(crate::audit::AuditOutcome::Failure),
+                status_code: StatusCode::OK.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                summary: format!(
+                    "Lodbod payment {} requires reconciliation (BILLING_RECORD_CREATION_FAILED)",
+                    payload.lodbod_payment_reference_id
+                ),
+                branch_override: payload.sangh_branch.clone(),
+                request_id_override: Some(req_id.clone()),
+                metadata: Some(serde_json::json!({
+                    "reasonCode": "BILLING_RECORD_CREATION_FAILED",
+                    "lodbodPaymentReferenceId": payload.lodbod_payment_reference_id,
+                    "esewaTransactionId": payload.esewa_transaction_id,
+                    "vehicleId": payload.vehicle_id,
+                })),
+                ..Default::default()
+            });
             let recon_result = record_reconciliation_and_idempotency(
                 idempotency_key,
                 payload,
@@ -2194,6 +2228,28 @@ pub async fn submit_vehicle_payment(
         }
         Err(_) => {
             eprintln!("Database operation timed out while creating BillResource");
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Integration,
+                action: crate::audit::AuditAction::Payment,
+                outcome_override: Some(crate::audit::AuditOutcome::Failure),
+                status_code: StatusCode::OK.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                summary: format!(
+                    "Lodbod payment {} requires reconciliation (DATABASE_TIMEOUT)",
+                    payload.lodbod_payment_reference_id
+                ),
+                branch_override: payload.sangh_branch.clone(),
+                request_id_override: Some(req_id.clone()),
+                metadata: Some(serde_json::json!({
+                    "reasonCode": "DATABASE_TIMEOUT",
+                    "lodbodPaymentReferenceId": payload.lodbod_payment_reference_id,
+                    "esewaTransactionId": payload.esewa_transaction_id,
+                    "vehicleId": payload.vehicle_id,
+                })),
+                ..Default::default()
+            });
             let recon_result = record_reconciliation_and_idempotency(
                 idempotency_key,
                 payload,
@@ -2212,6 +2268,7 @@ pub async fn submit_vehicle_payment(
     // Update in-memory cache
     let mut db_res_with_id = db_res;
     db_res_with_id.id = Some(created_id);
+    let bill_after_state = db_res_with_id.inner_content.clone();
     s_data.cache.write().await.write(ResourceName::BillResource, created_id, db_res_with_id);
 
     let success_result = VehiclePaymentResult {
@@ -2232,7 +2289,31 @@ pub async fn submit_vehicle_payment(
     get_idempotency_store()
         .write()
         .unwrap()
-        .insert(idempotency_key, (payload, success_result.clone()));
+        .insert(idempotency_key, (payload.clone(), success_result.clone()));
+
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::Integration,
+        action: crate::audit::AuditAction::Payment,
+        status_code: StatusCode::CREATED.as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("BillResource".to_string()),
+        resource_id: Some(created_id.to_string()),
+        summary: format!(
+            "Processed Lodbod vehicle payment {} for vehicle {} (Bill {})",
+            payload.lodbod_payment_reference_id, payload.vehicle_id, created_id
+        ),
+        after_state: bill_after_state,
+        branch_override: payload.sangh_branch,
+        request_id_override: Some(req_id.clone()),
+        metadata: Some(serde_json::json!({
+            "lodbodPaymentReferenceId": payload.lodbod_payment_reference_id,
+            "esewaTransactionId": payload.esewa_transaction_id,
+            "vehicleId": payload.vehicle_id,
+            "receiptNumber": success_result.receipt_number,
+        })),
+        ..Default::default()
+    });
 
     HttpResponse::Created().json(ApiResponse {
         success: true,
@@ -2458,8 +2539,40 @@ pub async fn create_bill(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let mut resource = db_resource.into_inner();
     resource.resource_name = Some(ResourceName::BillResource);
+
+    let req_branch_id = resource
+        .inner_content
+        .as_ref()
+        .and_then(crate::permissions::extract_branch_id_from_value)
+        .or_else(|| crate::permissions::extract_branch_id_from_req(&req));
+    let create_audit_required = match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "BillResource",
+        crate::permissions::action::CREATE,
+        req_branch_id,
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(ApiErrorResponse {
+                success: false,
+                error: ApiErrorDetails {
+                    code: "PERMISSION_DENIED".to_string(),
+                    message,
+                    details: vec![],
+                },
+                request_id: extract_request_id(&req),
+            });
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { audit_required, .. } => {
+            audit_required
+        }
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => false,
+    };
 
     if let Some(ref mut candidate_inner) = resource.inner_content {
         let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(candidate_inner);
@@ -2619,8 +2732,10 @@ pub async fn create_bill(
 
         if let Some(err) = validation_err {
             let req_id = extract_request_id(&req);
-            return match err {
-                CreateBillRuleError::BranchUnavailable => branch_unavailable_response(req_id),
+            let resp = match err {
+                CreateBillRuleError::BranchUnavailable => {
+                    branch_unavailable_response(req_id.clone())
+                }
                 CreateBillRuleError::FiscalYearDenied(fy_access) => {
                     HttpResponse::Forbidden().json(ApiErrorResponse {
                         success: false,
@@ -2629,7 +2744,7 @@ pub async fn create_bill(
                             message: fy_access.reason,
                             details: vec![],
                         },
-                        request_id: req_id,
+                        request_id: req_id.clone(),
                     })
                 }
                 CreateBillRuleError::LinkedFeeDuplicate(fee_ids) => {
@@ -2640,7 +2755,7 @@ pub async fn create_bill(
                             message: "Linked fee is restricted to once per fiscal year and was already paid".to_string(),
                             details: fee_ids,
                         },
-                        request_id: req_id,
+                        request_id: req_id.clone(),
                     })
                 }
                 CreateBillRuleError::LinkedFeeMissing(missing) => {
@@ -2660,7 +2775,7 @@ pub async fn create_bill(
                             message: "One or more linked fees are required for the selected fee heads".to_string(),
                             details,
                         },
-                        request_id: req_id,
+                        request_id: req_id.clone(),
                     })
                 }
                 CreateBillRuleError::DuplicateBill(existing_id) => {
@@ -2672,16 +2787,45 @@ pub async fn create_bill(
                                 .to_string(),
                             details: vec![format!("Duplicate of existing bill ID {}", existing_id)],
                         },
-                        request_id: req_id,
+                        request_id: req_id.clone(),
                     })
                 }
             };
+            let status_code = resp.status().as_u16();
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Billing,
+                action: if status_code == StatusCode::FORBIDDEN.as_u16() {
+                    crate::audit::AuditAction::AccessDenied
+                } else {
+                    crate::audit::AuditAction::Create
+                },
+                status_code,
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                summary: format!("Bill creation rejected with HTTP {}", status_code),
+                after_state: resource.inner_content.clone(),
+                request_id_override: Some(req_id),
+                ..Default::default()
+            });
+            return resp;
         }
     }
 
     let id = match s_data.db.create_resource(ResourceName::BillResource, resource.clone()).await {
         Ok(id) => id,
         Err(err) => {
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Billing,
+                action: crate::audit::AuditAction::Create,
+                status_code: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                summary: format!("Failed to create bill: {:?}", err),
+                after_state: resource.inner_content.clone(),
+                ..Default::default()
+            });
             return HttpResponse::InternalServerError()
                 .body(format!("Failed to create bill: {:?}", err));
         }
@@ -2710,6 +2854,23 @@ pub async fn create_bill(
         rolled_back_at: None,
         rolled_back_by: None,
     });
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::Billing,
+        action: crate::audit::AuditAction::Create,
+        status_code: StatusCode::CREATED.as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("BillResource".to_string()),
+        resource_id: Some(id.to_string()),
+        summary: format!("Created bill {}", id),
+        after_state: resource.inner_content.clone(),
+        metadata: if create_audit_required {
+            Some(serde_json::json!({ "auditRequired": true }))
+        } else {
+            None
+        },
+        ..Default::default()
+    });
     println!("Audit log recorded for bill id: {}", id);
     HttpResponse::Created().json(resource)
 }
@@ -2722,9 +2883,41 @@ pub async fn modify_bill(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let old_id = path.into_inner();
     let mut new_resource = updated_resource.into_inner();
     new_resource.resource_name = Some(ResourceName::BillResource);
+
+    let mod_branch_id = new_resource
+        .inner_content
+        .as_ref()
+        .and_then(crate::permissions::extract_branch_id_from_value)
+        .or_else(|| crate::permissions::extract_branch_id_from_req(&req));
+    let mod_audit_required = match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "BillResource",
+        crate::permissions::action::CORRECT,
+        mod_branch_id,
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(ApiErrorResponse {
+                success: false,
+                error: ApiErrorDetails {
+                    code: "PERMISSION_DENIED".to_string(),
+                    message,
+                    details: vec![],
+                },
+                request_id: extract_request_id(&req),
+            });
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { audit_required, .. } => {
+            audit_required
+        }
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => false,
+    };
 
     if let Some(ref mut new_inner) = new_resource.inner_content {
         let (cand_vid, cand_vnum) = extract_bill_vehicle_identity(new_inner);
@@ -2760,6 +2953,20 @@ pub async fn modify_bill(
             (b_res, fy_err)
         };
         if let Some(access) = fy_denied {
+            let req_id = extract_request_id(&req);
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Billing,
+                action: crate::audit::AuditAction::AccessDenied,
+                status_code: StatusCode::FORBIDDEN.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                resource_id: Some(old_id.to_string()),
+                summary: format!("Bill modify denied: {}", access.reason),
+                request_id_override: Some(req_id.clone()),
+                metadata: Some(serde_json::json!({ "code": access.code })),
+                ..Default::default()
+            });
             return HttpResponse::Forbidden().json(ApiErrorResponse {
                 success: false,
                 error: ApiErrorDetails {
@@ -2767,7 +2974,7 @@ pub async fn modify_bill(
                     message: access.reason,
                     details: vec![],
                 },
-                request_id: extract_request_id(&req),
+                request_id: req_id,
             });
         }
         match branch_res {
@@ -2836,12 +3043,31 @@ pub async fn modify_bill(
         bill_id: old_id,
         performed_by,
         performed_at: Utc::now().to_rfc3339(),
-        previous_state: orig_inner,
+        previous_state: orig_inner.clone(),
         new_state: new_resource.inner_content.clone(),
         details: Some(format!("Modified bill {} (superseded by bill {})", old_id, new_id)),
         is_rolled_back: false,
         rolled_back_at: None,
         rolled_back_by: None,
+    });
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::Billing,
+        action: crate::audit::AuditAction::Modify,
+        status_code: StatusCode::OK.as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("BillResource".to_string()),
+        resource_id: Some(old_id.to_string()),
+        summary: format!("Modified bill {} (superseded by bill {})", old_id, new_id),
+        before_state: orig_inner,
+        after_state: new_resource.inner_content.clone(),
+        metadata: Some(serde_json::json!({
+            "originalBillId": old_id,
+            "newBillId": new_id,
+            "supersedesBillId": old_id,
+            "auditRequired": mod_audit_required,
+        })),
+        ..Default::default()
     });
 
     HttpResponse::Ok().json(new_resource)
@@ -2854,11 +3080,44 @@ pub async fn delete_bill(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let id = path.into_inner();
 
     let existing = {
         let cache = s_data.cache.read().await;
         cache.read(ResourceName::BillResource, id)
+    };
+
+    let del_branch_id = crate::permissions::extract_branch_id_from_req(&req).or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|r| r.inner_content.as_ref())
+            .and_then(crate::permissions::extract_branch_id_from_value)
+    });
+    let del_audit_required = match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "BillResource",
+        crate::permissions::action::CANCEL,
+        del_branch_id,
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(ApiErrorResponse {
+                success: false,
+                error: ApiErrorDetails {
+                    code: "PERMISSION_DENIED".to_string(),
+                    message,
+                    details: vec![],
+                },
+                request_id: extract_request_id(&req),
+            });
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { audit_required, .. } => {
+            audit_required
+        }
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => false,
     };
 
     let mut resource = match existing {
@@ -2889,6 +3148,23 @@ pub async fn delete_bill(
     };
 
     if let Some(check) = cancel_blocked {
+        let req_id = extract_request_id(&req);
+        crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+            req: Some(&req),
+            category: crate::audit::AuditCategory::Billing,
+            action: crate::audit::AuditAction::AccessDenied,
+            status_code: StatusCode::FORBIDDEN.as_u16(),
+            started_at: Some(started_at),
+            resource_name: Some("BillResource".to_string()),
+            resource_id: Some(id.to_string()),
+            summary: format!("Bill {} cancellation denied: {}", id, check.reason),
+            request_id_override: Some(req_id.clone()),
+            metadata: Some(serde_json::json!({
+                "code": "RECEIPT_CANCELLATION_WINDOW_EXPIRED",
+                "windowHours": check.window_hours,
+            })),
+            ..Default::default()
+        });
         return HttpResponse::Forbidden().json(ApiErrorResponse {
             success: false,
             error: ApiErrorDetails {
@@ -2896,7 +3172,7 @@ pub async fn delete_bill(
                 message: check.reason,
                 details: vec![format!("Cancellation allowed within {} hours", check.window_hours)],
             },
-            request_id: extract_request_id(&req),
+            request_id: req_id,
         });
     }
 
@@ -2925,12 +3201,30 @@ pub async fn delete_bill(
         bill_id: id,
         performed_by,
         performed_at: Utc::now().to_rfc3339(),
-        previous_state: orig_inner,
+        previous_state: orig_inner.clone(),
         new_state: resource.inner_content.clone(),
         details: Some(format!("Soft-deleted bill {}", id)),
         is_rolled_back: false,
         rolled_back_at: None,
         rolled_back_by: None,
+    });
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::Billing,
+        action: crate::audit::AuditAction::Delete,
+        status_code: StatusCode::OK.as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("BillResource".to_string()),
+        resource_id: Some(id.to_string()),
+        summary: format!("Soft-deleted bill {}", id),
+        before_state: orig_inner,
+        after_state: resource.inner_content.clone(),
+        metadata: if del_audit_required {
+            Some(serde_json::json!({ "auditRequired": true }))
+        } else {
+            None
+        },
+        ..Default::default()
     });
 
     HttpResponse::Ok().json(format!("Bill {} marked as deleted", id))
@@ -2943,7 +3237,36 @@ pub async fn rollback_bill(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = std::time::Instant::now();
     let log_or_bill_id = path.into_inner();
+
+    let rb_branch_id = crate::permissions::extract_branch_id_from_req(&req);
+    let rb_audit_required = match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "BillResource",
+        crate::permissions::action::VOID,
+        rb_branch_id,
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(ApiErrorResponse {
+                success: false,
+                error: ApiErrorDetails {
+                    code: "PERMISSION_DENIED".to_string(),
+                    message,
+                    details: vec![],
+                },
+                request_id: extract_request_id(&req),
+            });
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { audit_required, .. } => {
+            audit_required
+        }
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => false,
+    };
+
     let admin_user = req
         .extensions()
         .get::<crate::auth::Claims>()
@@ -2951,15 +3274,50 @@ pub async fn rollback_bill(
         .unwrap_or_else(|| "admin@narayanisangh.com".to_string());
 
     match crate::log::rollback_action(&log_or_bill_id, &admin_user, &s_data).await {
-        Ok(restored_resource) => HttpResponse::Ok().json(serde_json::json!({
-            "success": true,
-            "message": format!("Successfully rolled back bill action for '{}'", log_or_bill_id),
-            "data": restored_resource
-        })),
-        Err(err) => HttpResponse::BadRequest().json(serde_json::json!({
-            "success": false,
-            "error": err
-        })),
+        Ok(restored_resource) => {
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Billing,
+                action: crate::audit::AuditAction::Rollback,
+                status_code: StatusCode::OK.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                resource_id: restored_resource
+                    .id
+                    .map(|i| i.to_string())
+                    .or_else(|| Some(log_or_bill_id.clone())),
+                summary: format!("Rolled back bill action for '{}'", log_or_bill_id),
+                after_state: restored_resource.inner_content.clone(),
+                metadata: Some(serde_json::json!({
+                    "targetId": log_or_bill_id,
+                    "auditRequired": rb_audit_required,
+                })),
+                ..Default::default()
+            });
+            HttpResponse::Ok().json(serde_json::json!({
+                "success": true,
+                "message": format!("Successfully rolled back bill action for '{}'", log_or_bill_id),
+                "data": restored_resource
+            }))
+        }
+        Err(err) => {
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::Billing,
+                action: crate::audit::AuditAction::Rollback,
+                status_code: StatusCode::BAD_REQUEST.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("BillResource".to_string()),
+                resource_id: Some(log_or_bill_id.clone()),
+                summary: format!("Rollback failed for '{}': {}", log_or_bill_id, err),
+                metadata: Some(serde_json::json!({ "targetId": log_or_bill_id })),
+                ..Default::default()
+            });
+            HttpResponse::BadRequest().json(serde_json::json!({
+                "success": false,
+                "error": err
+            }))
+        }
     }
 }
 
@@ -7275,11 +7633,15 @@ mod tests {
         assert_eq!(resp_closed.status(), StatusCode::FORBIDDEN);
 
         // 3. create_bill blocked when linkedFeeRules missing linkedFeeHeadId "21" -> 400 Bad Request
+        let today_str = Utc::now().format("%Y-%m-%d").to_string();
+        let tomorrow_str = (Utc::now() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
         let missing_linked_bill = DatabaseResource {
             id: None,
             resource_name: None,
             inner_content: Some(serde_json::json!({
-                "billingDate": "2026-11-23",
+                "billingDate": today_str,
                 "fiscalYear": current_fy,
                 "paymentMethod": "CASH",
                 "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
@@ -7300,7 +7662,7 @@ mod tests {
             id: None,
             resource_name: None,
             inner_content: Some(serde_json::json!({
-                "billingDate": "2026-11-23",
+                "billingDate": today_str,
                 "fiscalYear": current_fy,
                 "paymentMethod": "CASH",
                 "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
@@ -7332,7 +7694,7 @@ mod tests {
             id: None,
             resource_name: None,
             inner_content: Some(serde_json::json!({
-                "billingDate": "2026-11-24",
+                "billingDate": tomorrow_str,
                 "fiscalYear": current_fy,
                 "paymentMethod": "CARD",
                 "vehicle": { "id": "7701", "vehicleNumber": "BA-01-PA-7701" },
@@ -7367,5 +7729,266 @@ mod tests {
         )
         .await;
         assert_eq!(del_recent.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn test_bill_create_modify_and_delete_emit_billing_audit_trail_entries() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::VehicleResource,
+            DatabaseResource {
+                id: Some(71),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "id": "8801",
+                    "vehicleNumber": "BA-01-PA-8801",
+                    "SanghBranch": "Loadboard sthaniya"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+        {
+            let mut cache = s_data.cache.write().await;
+            cache.load_from_db(&s_data.db).await;
+        }
+
+        let actor_email = format!("bill-audit-{}@test.com", crate::audit::generate_audit_id());
+        let make_req = || {
+            let req = actix_web::test::TestRequest::default().to_http_request();
+            req.extensions_mut().insert(crate::auth::Claims {
+                sub: actor_email.clone(),
+                exp: 9999999999,
+                iat: 1000000000,
+                role: crate::roles::Roles::Admin,
+                user_id: Some(77),
+                jti: None,
+                role_name: None,
+                tenant_id: None,
+            });
+            req
+        };
+
+        let bill_1 = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-24T10:00:00Z",
+                "fiscalYear": "2083/84",
+                "paymentMethod": "CASH",
+                "total": 1000.0,
+                "status": "PAID",
+                "vehicle": { "id": "8801", "vehicleNumber": "BA-01-PA-8801" },
+            })),
+            external_content: None,
+        };
+        let c_resp = create_bill(web::Json(bill_1), make_req(), s_data.clone()).await;
+        assert_eq!(c_resp.status(), StatusCode::CREATED);
+        let c_bytes = actix_web::body::to_bytes(c_resp.into_body()).await.unwrap();
+        let created_bill: DatabaseResource = serde_json::from_slice(&c_bytes).unwrap();
+        let bill_id = created_bill.id.unwrap();
+
+        let modified_payload = DatabaseResource {
+            id: None,
+            resource_name: None,
+            inner_content: Some(serde_json::json!({
+                "billingDate": "2026-11-24T10:00:00Z",
+                "fiscalYear": "2083/84",
+                "paymentMethod": "CARD",
+                "total": 1200.0,
+                "status": "PAID",
+                "vehicle": { "id": "8801", "vehicleNumber": "BA-01-PA-8801" },
+            })),
+            external_content: None,
+        };
+        let m_resp = modify_bill(
+            web::Path::from(bill_id),
+            web::Json(modified_payload),
+            make_req(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(m_resp.status(), StatusCode::OK);
+        let m_bytes = actix_web::body::to_bytes(m_resp.into_body()).await.unwrap();
+        let modified_bill: DatabaseResource = serde_json::from_slice(&m_bytes).unwrap();
+        let new_bill_id = modified_bill.id.unwrap();
+
+        let d_resp = delete_bill(web::Path::from(new_bill_id), make_req(), s_data).await;
+        assert_eq!(d_resp.status(), StatusCode::OK);
+
+        crate::audit::flush_audit_trail().await;
+
+        let page = crate::audit::global_audit_logger()
+            .query(&crate::audit::AuditTrailQuery {
+                actor: Some(actor_email),
+                category: Some("BILLING".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(page.items.iter().any(|e| {
+            e.action == crate::audit::AuditAction::Create
+                && e.resource_id.as_deref() == Some(bill_id.to_string().as_str())
+        }));
+
+        let mod_entry = page
+            .items
+            .iter()
+            .find(|e| {
+                e.action == crate::audit::AuditAction::Modify
+                    && e.resource_id.as_deref() == Some(bill_id.to_string().as_str())
+            })
+            .expect("Modify audit entry");
+        assert!(mod_entry.changes.iter().any(|c| {
+            c.path == "total"
+                && c.old_value == Some(serde_json::json!(1000.0))
+                && c.new_value == Some(serde_json::json!(1200.0))
+        }));
+        assert_eq!(
+            mod_entry.metadata.as_ref().and_then(|m| m.get("newBillId")),
+            Some(&serde_json::json!(new_bill_id))
+        );
+
+        let del_entry = page
+            .items
+            .iter()
+            .find(|e| {
+                e.action == crate::audit::AuditAction::Delete
+                    && e.resource_id.as_deref() == Some(new_bill_id.to_string().as_str())
+            })
+            .expect("Delete audit entry");
+        assert!(del_entry.changes.iter().any(|c| {
+            c.path == "status"
+                && c.old_value == Some(serde_json::json!("PAID"))
+                && c.new_value == Some(serde_json::json!("DELETED"))
+        }));
+    }
+
+    #[actix_web::test]
+    async fn test_v1_role_permission_policies_enforce_billing_domain_actions_and_audit_required() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::SettingResource,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::SettingResource),
+                inner_content: Some(serde_json::json!({
+                    "integrations": { "tqms": { "SanghBranch": "Loadboard sthaniya" } }
+                })),
+                external_content: None,
+            },
+        );
+        state.seed(
+            ResourceName::VehicleResource,
+            DatabaseResource {
+                id: Some(81),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "id": "9901",
+                    "vehicleNumber": "BA-01-PA-9901",
+                    "SanghBranch": "Loadboard sthaniya"
+                })),
+                external_content: None,
+            },
+        );
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+        {
+            let mut cache = s_data.cache.write().await;
+            cache.load_from_db(&s_data.db).await;
+        }
+
+        crate::permissions::create_role_policy_in_db(
+            &s_data,
+            crate::permissions::default_admin_policy("loadboard-sthaniya", Some(1)),
+            None,
+        )
+        .await
+        .unwrap();
+        crate::permissions::create_role_policy_in_db(
+            &s_data,
+            crate::permissions::default_cashier_policy("loadboard-sthaniya", vec![1], Some(1)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let cashier_email = format!("cashier-bill-{}@test.com", crate::audit::generate_audit_id());
+        let admin_email = format!("admin-bill-{}@test.com", crate::audit::generate_audit_id());
+        let mk_req = |email: &str, role: crate::roles::Roles, role_name: &str| {
+            let req = actix_web::test::TestRequest::default().to_http_request();
+            req.extensions_mut().insert(crate::auth::Claims {
+                sub: email.to_string(),
+                exp: 9999999999,
+                iat: 1000000000,
+                role,
+                user_id: Some(11),
+                jti: None,
+                role_name: Some(role_name.to_string()),
+                tenant_id: Some("loadboard-sthaniya".to_string()),
+            });
+            req
+        };
+
+        // Cashier can create a bill in branchId 1
+        let c_resp = create_bill(
+            web::Json(DatabaseResource {
+                id: None,
+                resource_name: None,
+                inner_content: Some(serde_json::json!({
+                    "billingDate": "2026-11-24T10:00:00Z",
+                    "fiscalYear": "2083/84",
+                    "paymentMethod": "CASH",
+                    "branchId": 1,
+                    "total": 1000.0,
+                    "status": "PAID",
+                    "vehicle": { "id": "9901", "vehicleNumber": "BA-01-PA-9901" }
+                })),
+                external_content: None,
+            }),
+            mk_req(&cashier_email, crate::roles::Roles::User, "Cashier"),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(c_resp.status(), StatusCode::CREATED);
+        let created: DatabaseResource = serde_json::from_slice(
+            &actix_web::body::to_bytes(c_resp.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        let bill_id = created.id.unwrap();
+
+        // Cashier is denied CANCEL on delete_bill -> 403 + ACCESS_DENIED audit entry
+        let denied_cancel = delete_bill(
+            web::Path::from(bill_id),
+            mk_req(&cashier_email, crate::roles::Roles::User, "Cashier"),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(denied_cancel.status(), StatusCode::FORBIDDEN);
+
+        // Admin is allowed CANCEL on delete_bill and requireAudit marks auditRequired: true
+        let ok_cancel = delete_bill(
+            web::Path::from(bill_id),
+            mk_req(&admin_email, crate::roles::Roles::Admin, "Admin"),
+            s_data,
+        )
+        .await;
+        assert_eq!(ok_cancel.status(), StatusCode::OK);
+
+        crate::audit::flush_audit_trail().await;
+        let admin_logs = crate::audit::global_audit_logger()
+            .query(&crate::audit::AuditTrailQuery {
+                actor: Some(admin_email),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            admin_logs.items[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("auditRequired")),
+            Some(&serde_json::json!(true))
+        );
     }
 }

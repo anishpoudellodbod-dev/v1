@@ -977,15 +977,31 @@ pub async fn delete_permission_for_user(
 pub async fn logout(req: HttpRequest, s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
     let started_at = std::time::Instant::now();
     let (response, email, user_id, role, details) = logout_inner(&req, &s_data).await;
+    let status_code = response.status().as_u16();
 
     crate::log::log_logout_async(
-        email,
+        email.clone(),
         user_id,
-        role,
-        response.status().as_u16(),
+        role.clone(),
+        status_code,
         started_at,
-        details,
+        details.clone(),
     );
+
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::Auth,
+        action: crate::audit::AuditAction::Logout,
+        status_code,
+        started_at: Some(started_at),
+        resource_name: Some("UserResource".to_string()),
+        resource_id: user_id.map(|id| id.to_string()),
+        summary: details.unwrap_or_else(|| "User logout".to_string()),
+        actor_email_override: email,
+        actor_user_id_override: user_id,
+        actor_role_override: role,
+        ..Default::default()
+    });
 
     response
 }
@@ -1124,12 +1140,45 @@ pub async fn create_permission(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
-    if !is_admin(req.clone()) {
-        return HttpResponse::Forbidden().json(serde_json::json!({
-            "success": false,
-            "message": "Admin access required"
-        }));
-    }
+    let started_at = std::time::Instant::now();
+    let assign_audit_required = match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "PermissionResource",
+        crate::permissions::action::ASSIGN,
+        crate::permissions::extract_branch_id_from_req(&req),
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(serde_json::json!({
+                "success": false,
+                "message": message
+            }));
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { audit_required, .. } => {
+            audit_required
+        }
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => {
+            if !is_admin(req.clone()) {
+                crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                    req: Some(&req),
+                    category: crate::audit::AuditCategory::AccessControl,
+                    action: crate::audit::AuditAction::AccessDenied,
+                    status_code: actix_web::http::StatusCode::FORBIDDEN.as_u16(),
+                    started_at: Some(started_at),
+                    resource_name: Some("PermissionResource".to_string()),
+                    summary: "Non-admin create_permission rejected".to_string(),
+                    ..Default::default()
+                });
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "success": false,
+                    "message": "Admin access required"
+                }));
+            }
+            true
+        }
+    };
 
     let body = payload.into_inner();
     let user = match find_user_by_id_in_db(&s_data.db, body.user_id).await {
@@ -1185,6 +1234,26 @@ pub async fn create_permission(
                     );
                 }
             }
+            crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                req: Some(&req),
+                category: crate::audit::AuditCategory::AccessControl,
+                action: crate::audit::AuditAction::PermissionGrant,
+                status_code: actix_web::http::StatusCode::CREATED.as_u16(),
+                started_at: Some(started_at),
+                resource_name: Some("PermissionResource".to_string()),
+                resource_id: created.id.map(|i| i.to_string()),
+                summary: format!(
+                    "Granted PermissionResource {:?} for userId {}",
+                    created.id, created.inner_content.user_id
+                ),
+                after_state: serde_json::to_value(&created.inner_content).ok(),
+                branch_override: created.inner_content.sthaniya_branch.clone(),
+                metadata: Some(serde_json::json!({
+                    "targetUserId": created.inner_content.user_id,
+                    "auditRequired": assign_audit_required,
+                })),
+                ..Default::default()
+            });
             HttpResponse::Created().json(created)
         }
         Err(err) => err.to_http_response(),
@@ -1198,14 +1267,48 @@ pub async fn update_permission_by_user_id(
     req: HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
-    if !is_admin(req) {
-        return HttpResponse::Forbidden().json(serde_json::json!({
-            "success": false,
-            "message": "Admin access required"
-        }));
+    let started_at = std::time::Instant::now();
+    let target_user_id = path.into_inner();
+    match crate::permissions::enforce_request_permission(
+        &req,
+        &s_data,
+        "PermissionResource",
+        crate::permissions::action::ASSIGN,
+        crate::permissions::extract_branch_id_from_req(&req),
+    )
+    .await
+    {
+        crate::permissions::PermissionCheckOutcome::Denied { message, .. } => {
+            return HttpResponse::Forbidden().json(serde_json::json!({
+                "success": false,
+                "message": message
+            }));
+        }
+        crate::permissions::PermissionCheckOutcome::Allowed { .. } => {}
+        crate::permissions::PermissionCheckOutcome::FallbackLegacy => {
+            if !is_admin(req.clone()) {
+                crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+                    req: Some(&req),
+                    category: crate::audit::AuditCategory::AccessControl,
+                    action: crate::audit::AuditAction::AccessDenied,
+                    status_code: actix_web::http::StatusCode::FORBIDDEN.as_u16(),
+                    started_at: Some(started_at),
+                    resource_name: Some("PermissionResource".to_string()),
+                    summary: format!(
+                        "Non-admin update_permission_by_user_id rejected for userId {}",
+                        target_user_id
+                    ),
+                    metadata: Some(serde_json::json!({ "targetUserId": target_user_id })),
+                    ..Default::default()
+                });
+                return HttpResponse::Forbidden().json(serde_json::json!({
+                    "success": false,
+                    "message": "Admin access required"
+                }));
+            }
+        }
     }
 
-    let target_user_id = path.into_inner();
     let body = payload.into_inner();
 
     let mut existing = match find_permission_by_user_id_in_db(&s_data.db, target_user_id).await {
@@ -1223,6 +1326,8 @@ pub async fn update_permission_by_user_id(
             }));
         }
     };
+
+    let before_perm = serde_json::to_value(&existing.inner_content).ok();
 
     if let Some(role) = body.user_role {
         existing.inner_content.user_role = role;
@@ -1273,6 +1378,25 @@ pub async fn update_permission_by_user_id(
             );
         }
     }
+
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&req),
+        category: crate::audit::AuditCategory::AccessControl,
+        action: crate::audit::AuditAction::PermissionUpdate,
+        status_code: actix_web::http::StatusCode::OK.as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("PermissionResource".to_string()),
+        resource_id: Some(perm_id.to_string()),
+        summary: format!(
+            "Updated PermissionResource {} for userId {}",
+            perm_id, target_user_id
+        ),
+        before_state: before_perm,
+        after_state: serde_json::to_value(&existing.inner_content).ok(),
+        branch_override: existing.inner_content.sthaniya_branch.clone(),
+        metadata: Some(serde_json::json!({ "targetUserId": target_user_id })),
+        ..Default::default()
+    });
 
     HttpResponse::Ok().json(existing)
 }
@@ -2177,6 +2301,8 @@ mod tests {
             role: Roles::Admin,
             user_id: Some(401),
             jti: None,
+            role_name: None,
+            tenant_id: None,
         });
 
         // Update logged-out user 402 -> DB PermissionResource syncs, cache stays empty
@@ -2300,5 +2426,96 @@ mod tests {
             }
         });
         assert_eq!(extract_sangh_branch(&blank_nested), None);
+    }
+
+    #[actix_web::test]
+    async fn test_permission_grant_and_update_emit_audit_trail_entries() {
+        let mut state = test_helpers::MockDbState::default();
+        state.seed(
+            ResourceName::UserResource,
+            make_user(
+                Some(801),
+                "target801@test.com",
+                "pw",
+                "User",
+                Some("Loadboard sthaniya"),
+            ),
+        );
+        let (s_data, _) = test_helpers::create_mock_server_data_with_state(state).await;
+
+        let admin_email = format!("perm-audit-{}@test.com", crate::audit::generate_audit_id());
+        let admin_req = actix_web::test::TestRequest::default().to_http_request();
+        admin_req.extensions_mut().insert(crate::auth::Claims {
+            sub: admin_email.clone(),
+            exp: 9999999999,
+            iat: 1000000000,
+            role: Roles::Admin,
+            user_id: Some(1),
+            jti: None,
+            role_name: None,
+            tenant_id: None,
+        });
+
+        let create_resp = create_permission(
+            web::Json(CreatePermissionRequest {
+                user_id: 801,
+                user_role: Some(Roles::User),
+                sthaniya_branch: Some("Loadboard sthaniya".to_string()),
+                user_permissions: Some(serde_json::json!({ "canBill": true })),
+                allowed: Some(vec![AllowedRule {
+                    actions: AllowedScope::Ids(vec![ScopeId::Str("read".to_string())]),
+                    resources: AllowedScope::Ids(vec![ScopeId::Str("BillResource".to_string())]),
+                }]),
+                external_content: None,
+            }),
+            admin_req.clone(),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
+
+        let upd_resp = update_permission_by_user_id(
+            web::Path::from(801),
+            web::Json(UpdatePermissionRequest {
+                user_role: Some(Roles::Operator),
+                user_permissions: None,
+                sthaniya_branch: None,
+                allowed: Some(vec![AllowedRule {
+                    actions: AllowedScope::All,
+                    resources: AllowedScope::All,
+                }]),
+                external_content: None,
+            }),
+            admin_req,
+            s_data,
+        )
+        .await;
+        assert_eq!(upd_resp.status(), actix_web::http::StatusCode::OK);
+
+        crate::audit::flush_audit_trail().await;
+
+        let page = crate::audit::global_audit_logger()
+            .query(&crate::audit::AuditTrailQuery {
+                actor: Some(admin_email),
+                category: Some("ACCESS_CONTROL".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(page.items.iter().any(|e| {
+            e.action == crate::audit::AuditAction::PermissionGrant
+                && e.resource_name.as_deref() == Some("PermissionResource")
+        }));
+
+        let upd_entry = page
+            .items
+            .iter()
+            .find(|e| {
+                e.action == crate::audit::AuditAction::PermissionUpdate
+                    && e.resource_name.as_deref() == Some("PermissionResource")
+            })
+            .expect("PermissionUpdate audit entry");
+        assert!(upd_entry.changes.iter().any(|c| c.path == "userRole"));
+        assert!(upd_entry.changes.iter().any(|c| c.path == "Allowed"));
     }
 }

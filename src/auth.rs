@@ -20,6 +20,22 @@ pub struct Claims {
     pub user_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// Preserves dynamic/custom role names (e.g. "Cashier", "Viewer", "SuperAdmin") alongside base `role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+}
+
+impl Claims {
+    pub fn effective_role_name(&self) -> String {
+        self.role_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| String::from(self.role.clone()))
+    }
 }
 
 static ENCODING_KEY: OnceLock<EncodingKey> = OnceLock::new();
@@ -39,10 +55,12 @@ fn get_decoding_key() -> &'static DecodingKey {
     })
 }
 
-pub fn create_jwt_with_role_and_user_id(
+pub fn create_jwt_with_context(
     user_email: &str,
     role: &Roles,
     user_id: Option<i32>,
+    role_name: Option<String>,
+    tenant_id: Option<String>,
 ) -> Result<String, JwtError> {
     let now = Utc::now();
     let expiration = now
@@ -59,9 +77,19 @@ pub fn create_jwt_with_role_and_user_id(
         role: role.to_owned(),
         user_id,
         jti: Some(jti),
+        role_name,
+        tenant_id,
     };
 
     encode(&Header::new(Algorithm::RS512), &claims, get_encoding_key())
+}
+
+pub fn create_jwt_with_role_and_user_id(
+    user_email: &str,
+    role: &Roles,
+    user_id: Option<i32>,
+) -> Result<String, JwtError> {
+    create_jwt_with_context(user_email, role, user_id, None, None)
 }
 
 pub fn create_jwt_with_role(user_id: &str, role: &Roles) -> Result<String, JwtError> {
@@ -165,6 +193,8 @@ mod tests {
             role: Roles::User,
             user_id: None,
             jti: None,
+            role_name: None,
+            tenant_id: None,
         };
 
         let token = encode(&Header::new(Algorithm::RS512), &expired_claims, get_encoding_key())

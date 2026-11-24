@@ -1,6 +1,6 @@
 use crate::resource::{DatabaseResource, ResourceName::VehicleResource};
 use crate::ServerData;
-use actix_web::{error::ErrorInternalServerError, http::header, web, Error, HttpResponse};
+use actix_web::{error::ErrorInternalServerError, http::header, web, Error, HttpRequest, HttpResponse};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::{stream, StreamExt};
@@ -1309,6 +1309,67 @@ const MAX_STREAM_SYNC_BATCH_SIZE: usize = 500;
 const MAX_STREAM_SYNC_CONCURRENCY: usize = 64;
 const STREAM_SYNC_MAX_ATTEMPTS: u32 = 5;
 const STREAM_SYNC_RETRY_BASE_MS: u64 = 500;
+const STREAM_SYNC_SSE_HEARTBEAT_SECS: u64 = 15;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSyncFormat {
+    Sse,
+    Ndjson,
+}
+
+impl StreamSyncFormat {
+    fn from_request(req: &HttpRequest) -> Self {
+        for pair in req.query_string().split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k.eq_ignore_ascii_case("format") {
+                    let val = v.trim();
+                    if val.eq_ignore_ascii_case("ndjson")
+                        || val.eq_ignore_ascii_case("x-ndjson")
+                        || val.eq_ignore_ascii_case("application/x-ndjson")
+                        || val.eq_ignore_ascii_case("application%2Fx-ndjson")
+                        || val.eq_ignore_ascii_case("application/ndjson")
+                        || val.eq_ignore_ascii_case("application%2Fndjson")
+                    {
+                        return Self::Ndjson;
+                    }
+                    if val.eq_ignore_ascii_case("sse")
+                        || val.eq_ignore_ascii_case("event-stream")
+                        || val.eq_ignore_ascii_case("text/event-stream")
+                        || val.eq_ignore_ascii_case("text%2Fevent-stream")
+                    {
+                        return Self::Sse;
+                    }
+                }
+            }
+        }
+
+        if let Some(accept) = req.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()) {
+            let accept_lower = accept.to_ascii_lowercase();
+            if (accept_lower.contains("application/x-ndjson")
+                || accept_lower.contains("application/ndjson"))
+                && !accept_lower.contains("text/event-stream")
+            {
+                return Self::Ndjson;
+            }
+        }
+
+        Self::Sse
+    }
+
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::Sse => "text/event-stream; charset=utf-8",
+            Self::Ndjson => "application/x-ndjson; charset=utf-8",
+        }
+    }
+
+    const fn header_label(self) -> &'static str {
+        match self {
+            Self::Sse => "sse",
+            Self::Ndjson => "ndjson",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamedVehicleItem {
@@ -1326,6 +1387,25 @@ fn ndjson_chunk(value: &Value) -> Result<Bytes, String> {
             Bytes::from(json_bytes)
         })
         .map_err(|e| e.to_string())
+}
+
+fn sse_chunk(event_name: &str, event_id: u64, value: &Value) -> Result<Bytes, String> {
+    let json = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    Ok(Bytes::from(format!(
+        "id: {event_id}\nevent: {event_name}\ndata: {json}\n\n"
+    )))
+}
+
+fn stream_event_chunk(
+    format: StreamSyncFormat,
+    event_name: &str,
+    event_id: u64,
+    value: &Value,
+) -> Result<Bytes, String> {
+    match format {
+        StreamSyncFormat::Sse => sse_chunk(event_name, event_id, value),
+        StreamSyncFormat::Ndjson => ndjson_chunk(value),
+    }
 }
 
 struct ExistingVehicleIndex {
@@ -1606,17 +1686,21 @@ async fn sync_stream_batch(
     }
 }
 
-/// Streams TQMS vehicles page-by-page in bounded NDJSON batches while concurrently
-/// fetching TQMS pages and persisting deltas to PostgreSQL and the in-memory cache.
+/// Streams TQMS vehicles page-by-page as SSE (`text/event-stream`, default) or NDJSON
+/// (`Accept: application/x-ndjson` / `?format=ndjson`) while concurrently fetching TQMS pages
+/// and persisting deltas to PostgreSQL and the in-memory cache.
 /// `GET /api/v1/tqms/stream_sync/{batch_size}/{concurrency}`
 pub async fn stream_sync_vehicles_tqms(
+    req: HttpRequest,
     path: web::Path<(usize, usize)>,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     let (batch_size, concurrency) = path.into_inner();
+    let format = StreamSyncFormat::from_request(&req);
     stream_sync_vehicles_tqms_with_retry(
         batch_size,
         concurrency,
+        format,
         s_data.get_ref().clone(),
         STREAM_SYNC_MAX_ATTEMPTS,
         STREAM_SYNC_RETRY_BASE_MS,
@@ -1627,6 +1711,7 @@ pub async fn stream_sync_vehicles_tqms(
 async fn stream_sync_vehicles_tqms_with_retry(
     batch_size: usize,
     concurrency: usize,
+    format: StreamSyncFormat,
     s_data: Arc<ServerData>,
     max_attempts: u32,
     retry_base_delay_ms: u64,
@@ -1725,6 +1810,7 @@ async fn stream_sync_vehicles_tqms_with_retry(
         let mut seen_ids: HashSet<String> = HashSet::with_capacity(total_items as usize);
         let mut seen_nums: HashSet<String> = HashSet::with_capacity(total_items as usize);
         let mut pending: Vec<Value> = Vec::with_capacity(effective_batch_size * 2);
+        let mut event_seq: u64 = 0;
 
         let started_event = json!({
             "event": "started",
@@ -1733,7 +1819,12 @@ async fn stream_sync_vehicles_tqms_with_retry(
             "batchSize": effective_batch_size,
             "concurrency": effective_concurrency,
         });
-        if tx.send(ndjson_chunk(&started_event)).await.is_err() {
+        event_seq += 1;
+        if tx
+            .send(stream_event_chunk(format, "started", event_seq, &started_event))
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -1750,6 +1841,26 @@ async fn stream_sync_vehicles_tqms_with_retry(
             total_failed: &'a mut usize,
             total_duplicates: &'a mut usize,
             tx: &'a tokio::sync::mpsc::Sender<Result<Bytes, String>>,
+            format: StreamSyncFormat,
+            event_seq: &'a mut u64,
+        }
+
+        async fn emit_page_error(st: &mut StreamState<'_>, page: u64, err_msg: String) -> bool {
+            *st.event_seq += 1;
+            let err_event = json!({
+                "event": "page_error",
+                "page": page,
+                "error": err_msg,
+            });
+            st.tx
+                .send(stream_event_chunk(
+                    st.format,
+                    "page_error",
+                    *st.event_seq,
+                    &err_event,
+                ))
+                .await
+                .is_ok()
         }
 
         async fn drain_and_emit(
@@ -1807,7 +1918,13 @@ async fn stream_sync_vehicles_tqms_with_retry(
                     "vehicles": outcome.streamed_vehicles,
                 });
 
-                if st.tx.send(ndjson_chunk(&event)).await.is_err() {
+                *st.event_seq += 1;
+                if st
+                    .tx
+                    .send(stream_event_chunk(st.format, "batch", *st.event_seq, &event))
+                    .await
+                    .is_err()
+                {
                     return false;
                 }
             }
@@ -1827,6 +1944,8 @@ async fn stream_sync_vehicles_tqms_with_retry(
             total_failed: &mut total_failed,
             total_duplicates: &mut total_duplicates,
             tx: &tx,
+            format,
+            event_seq: &mut event_seq,
         };
 
         if total_items > 0 && total_pages > 0 {
@@ -1879,12 +1998,7 @@ async fn stream_sync_vehicles_tqms_with_retry(
                     Ok(mut response) => {
                         if let Err(err) = validate_tqms_response(&response, requested_page) {
                             failed_pages.push(requested_page);
-                            let err_event = json!({
-                                "event": "page_error",
-                                "page": requested_page,
-                                "error": err.to_string(),
-                            });
-                            if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                            if !emit_page_error(&mut st, requested_page, err.to_string()).await {
                                 return;
                             }
                             continue;
@@ -1910,12 +2024,8 @@ async fn stream_sync_vehicles_tqms_with_retry(
                             }
                             Err(err) => {
                                 failed_pages.push(requested_page);
-                                let err_event = json!({
-                                    "event": "page_error",
-                                    "page": requested_page,
-                                    "error": err.to_string(),
-                                });
-                                if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                                if !emit_page_error(&mut st, requested_page, err.to_string()).await
+                                {
                                     return;
                                 }
                             }
@@ -1923,12 +2033,7 @@ async fn stream_sync_vehicles_tqms_with_retry(
                     }
                     Err(err_msg) => {
                         failed_pages.push(requested_page);
-                        let err_event = json!({
-                            "event": "page_error",
-                            "page": requested_page,
-                            "error": err_msg,
-                        });
-                        if tx.send(ndjson_chunk(&err_event)).await.is_err() {
+                        if !emit_page_error(&mut st, requested_page, err_msg).await {
                             return;
                         }
                     }
@@ -1966,22 +2071,55 @@ async fn stream_sync_vehicles_tqms_with_retry(
             "failedPages": failed_pages,
             "durationMs": started_at.elapsed().as_millis() as u64,
         });
-        let _ = tx.send(ndjson_chunk(&completed_event)).await;
+        event_seq += 1;
+        let _ = tx
+            .send(stream_event_chunk(
+                format,
+                "completed",
+                event_seq,
+                &completed_event,
+            ))
+            .await;
     });
 
-    let body_stream = stream::unfold(rx, |mut rx| async move {
-        rx.recv()
+    let body_stream = stream::unfold(rx, move |mut rx| async move {
+        match format {
+            StreamSyncFormat::Sse => match tokio::time::timeout(
+                Duration::from_secs(STREAM_SYNC_SSE_HEARTBEAT_SECS),
+                rx.recv(),
+            )
             .await
-            .map(|item| (item.map_err(ErrorInternalServerError), rx))
+            {
+                Ok(Some(item)) => Some((item.map_err(ErrorInternalServerError), rx)),
+                Ok(None) => None,
+                Err(_) => Some((Ok(Bytes::from_static(b": keep-alive\n\n")), rx)),
+            },
+            StreamSyncFormat::Ndjson => rx
+                .recv()
+                .await
+                .map(|item| (item.map_err(ErrorInternalServerError), rx)),
+        }
     });
 
     HttpResponse::Ok()
-        .insert_header((header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"))
-        .insert_header((header::CACHE_CONTROL, "no-cache, no-store, no-transform"))
+        .insert_header((header::CONTENT_TYPE, format.content_type()))
+        .insert_header((
+            header::CACHE_CONTROL,
+            "no-cache, no-store, no-transform, must-revalidate",
+        ))
+        .insert_header((header::PRAGMA, "no-cache"))
+        .insert_header((header::EXPIRES, "0"))
+        .insert_header((header::CONNECTION, "keep-alive"))
         .insert_header((header::CONTENT_ENCODING, "identity"))
+        .insert_header((header::VARY, "Accept"))
         .insert_header(("X-Accel-Buffering", "no"))
+        .insert_header(("X-Content-Type-Options", "nosniff"))
+        .insert_header(("Surrogate-Control", "no-store"))
+        .insert_header(("X-Stream-Format", format.header_label()))
         .insert_header(("X-Batch-Size", effective_batch_size.to_string()))
         .insert_header(("X-Concurrency", effective_concurrency.to_string()))
+        .insert_header(("X-Total-Items", total_items.to_string()))
+        .insert_header(("X-Total-Pages", total_pages.to_string()))
         .streaming::<_, Error>(body_stream)
 }
 
@@ -2711,6 +2849,41 @@ mod tests {
         (combined, db_state)
     }
 
+    fn assert_streaming_headers(
+        headers: &actix_web::http::header::HeaderMap,
+        expected_content_type: &str,
+        expected_format: &str,
+        expected_batch_size: &str,
+        expected_concurrency: &str,
+        expected_total_items: &str,
+        expected_total_pages: &str,
+    ) {
+        let get_str = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(get_str("content-type").as_deref(), Some(expected_content_type));
+        assert_eq!(
+            get_str("cache-control").as_deref(),
+            Some("no-cache, no-store, no-transform, must-revalidate")
+        );
+        assert_eq!(get_str("pragma").as_deref(), Some("no-cache"));
+        assert_eq!(get_str("expires").as_deref(), Some("0"));
+        assert_eq!(get_str("connection").as_deref(), Some("keep-alive"));
+        assert_eq!(get_str("content-encoding").as_deref(), Some("identity"));
+        assert_eq!(get_str("vary").as_deref(), Some("Accept"));
+        assert_eq!(get_str("x-accel-buffering").as_deref(), Some("no"));
+        assert_eq!(get_str("x-content-type-options").as_deref(), Some("nosniff"));
+        assert_eq!(get_str("surrogate-control").as_deref(), Some("no-store"));
+        assert_eq!(get_str("x-stream-format").as_deref(), Some(expected_format));
+        assert_eq!(get_str("x-batch-size").as_deref(), Some(expected_batch_size));
+        assert_eq!(get_str("x-concurrency").as_deref(), Some(expected_concurrency));
+        assert_eq!(get_str("x-total-items").as_deref(), Some(expected_total_items));
+        assert_eq!(get_str("x-total-pages").as_deref(), Some(expected_total_pages));
+    }
+
     #[actix_web::test]
     async fn test_stream_sync_rejects_zero_batch_size_or_concurrency() {
         let (s_data, _) = create_stream_sync_server_data(
@@ -2718,11 +2891,14 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
         )
         .await;
+        let req = actix_web::test::TestRequest::default().to_http_request();
 
-        let resp_zero_batch = stream_sync_vehicles_tqms(web::Path::from((0, 4)), s_data.clone()).await;
+        let resp_zero_batch =
+            stream_sync_vehicles_tqms(req.clone(), web::Path::from((0, 4)), s_data.clone()).await;
         assert_eq!(resp_zero_batch.status(), actix_web::http::StatusCode::BAD_REQUEST);
 
-        let resp_zero_conc = stream_sync_vehicles_tqms(web::Path::from((10, 0)), s_data).await;
+        let resp_zero_conc =
+            stream_sync_vehicles_tqms(req, web::Path::from((10, 0)), s_data).await;
         assert_eq!(resp_zero_conc.status(), actix_web::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2852,26 +3028,18 @@ mod tests {
 
         let req = actix_web::test::TestRequest::get()
             .uri("/api/v1/tqms/stream_sync/2/2")
+            .insert_header((header::ACCEPT, "application/x-ndjson"))
             .to_request();
         let resp = actix_web::test::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/x-ndjson; charset=utf-8")
-        );
-        assert_eq!(
-            resp.headers()
-                .get("X-Batch-Size")
-                .and_then(|v| v.to_str().ok()),
-            Some("2")
-        );
-        assert_eq!(
-            resp.headers()
-                .get("X-Concurrency")
-                .and_then(|v| v.to_str().ok()),
-            Some("2")
+        assert_streaming_headers(
+            resp.headers(),
+            "application/x-ndjson; charset=utf-8",
+            "ndjson",
+            "2",
+            "2",
+            "6",
+            "3",
         );
 
         let body_bytes = actix_web::test::read_body(resp).await;
@@ -2960,8 +3128,15 @@ mod tests {
         )
         .await;
 
-        let resp =
-            stream_sync_vehicles_tqms_with_retry(1, 2, s_data.get_ref().clone(), 2, 0).await;
+        let resp = stream_sync_vehicles_tqms_with_retry(
+            1,
+            2,
+            StreamSyncFormat::Ndjson,
+            s_data.get_ref().clone(),
+            2,
+            0,
+        )
+        .await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
 
         let body_bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
@@ -3000,10 +3175,177 @@ mod tests {
         )
         .await;
 
-        let resp =
-            stream_sync_vehicles_tqms_with_retry(10, 2, s_data.get_ref().clone(), 1, 0).await;
+        let resp = stream_sync_vehicles_tqms_with_retry(
+            10,
+            2,
+            StreamSyncFormat::Sse,
+            s_data.get_ref().clone(),
+            1,
+            0,
+        )
+        .await;
         server_handle.abort();
 
         assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_GATEWAY);
+    }
+
+    #[actix_web::test]
+    async fn test_stream_sync_defaults_to_sse_with_proper_streaming_headers_and_framing() {
+        // 1. Format negotiation checks
+        let req_default = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2")
+            .to_http_request();
+        assert_eq!(StreamSyncFormat::from_request(&req_default), StreamSyncFormat::Sse);
+
+        let req_accept_sse = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2")
+            .insert_header((header::ACCEPT, "text/event-stream"))
+            .to_http_request();
+        assert_eq!(StreamSyncFormat::from_request(&req_accept_sse), StreamSyncFormat::Sse);
+
+        let req_accept_ndjson = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2")
+            .insert_header((header::ACCEPT, "application/x-ndjson"))
+            .to_http_request();
+        assert_eq!(
+            StreamSyncFormat::from_request(&req_accept_ndjson),
+            StreamSyncFormat::Ndjson
+        );
+
+        let req_accept_both = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2")
+            .insert_header((header::ACCEPT, "text/event-stream, application/x-ndjson"))
+            .to_http_request();
+        assert_eq!(StreamSyncFormat::from_request(&req_accept_both), StreamSyncFormat::Sse);
+
+        let req_query_ndjson = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2?format=ndjson")
+            .insert_header((header::ACCEPT, "text/event-stream"))
+            .to_http_request();
+        assert_eq!(
+            StreamSyncFormat::from_request(&req_query_ndjson),
+            StreamSyncFormat::Ndjson
+        );
+
+        let req_query_sse = actix_web::test::TestRequest::get()
+            .uri("/api/v1/tqms/stream_sync/2/2?format=sse")
+            .insert_header((header::ACCEPT, "application/x-ndjson"))
+            .to_http_request();
+        assert_eq!(StreamSyncFormat::from_request(&req_query_sse), StreamSyncFormat::Sse);
+
+        // 2. End-to-end SSE response headers & frame parsing with no Accept header
+        let v1 = json!({
+            "VehicleId": 3001,
+            "VehicleNumber": "BA-01-PA-3001",
+            "NormalizedVehicleNumber": "BA01PA3001",
+            "VehicleType": "Truck",
+            "Owners": [{ "Name": "SSE Owner 1" }]
+        });
+        let v2 = json!({
+            "VehicleId": 3002,
+            "VehicleNumber": "BA-01-PA-3002",
+            "NormalizedVehicleNumber": "BA01PA3002",
+            "VehicleType": "Tipper",
+            "Owners": [{ "Name": "SSE Owner 2" }]
+        });
+        let mut pages = HashMap::new();
+        pages.insert(
+            1,
+            (
+                200,
+                json!({
+                    "Code": 200,
+                    "Message": "Success",
+                    "Data": {
+                        "Data": [v1, v2],
+                        "Paging": { "Page": 1, "PageSize": 2, "TotalItems": 2, "TotalPages": 1 }
+                    }
+                }),
+            ),
+        );
+
+        let (tqms_url, server_handle) = spawn_mock_tqms_server(pages).await;
+        let (s_data, db_state) = create_stream_sync_server_data(
+            crate::access::test_helpers::MockDbState::default(),
+            tqms_url,
+        )
+        .await;
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(s_data)
+                .route(
+                    "/api/v1/tqms/stream_sync/{batch_size}/{concurrency}",
+                    web::get().to(stream_sync_vehicles_tqms),
+                ),
+        )
+        .await;
+
+        let resp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/api/v1/tqms/stream_sync/2/2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        assert_streaming_headers(
+            resp.headers(),
+            "text/event-stream; charset=utf-8",
+            "sse",
+            "2",
+            "2",
+            "2",
+            "1",
+        );
+
+        let body_bytes = actix_web::test::read_body(resp).await;
+        server_handle.abort();
+
+        let body_text = String::from_utf8(body_bytes.to_vec()).expect("valid utf8 sse");
+        let raw_frames: Vec<&str> = body_text
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .collect();
+        assert_eq!(raw_frames.len(), 3, "expected started, batch, completed SSE frames");
+
+        let mut parsed_frames: Vec<(u64, String, Value)> = Vec::new();
+        for frame in raw_frames {
+            let mut id_val: Option<u64> = None;
+            let mut event_val: Option<String> = None;
+            let mut data_val: Option<Value> = None;
+            for line in frame.lines() {
+                if let Some(rest) = line.strip_prefix("id:") {
+                    id_val = rest.trim().parse::<u64>().ok();
+                } else if let Some(rest) = line.strip_prefix("event:") {
+                    event_val = Some(rest.trim().to_string());
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_val = Some(serde_json::from_str(rest.trim()).expect("valid sse json data"));
+                }
+            }
+            parsed_frames.push((
+                id_val.expect("sse frame missing id"),
+                event_val.expect("sse frame missing event"),
+                data_val.expect("sse frame missing data"),
+            ));
+        }
+
+        assert_eq!(parsed_frames[0].0, 1);
+        assert_eq!(parsed_frames[0].1, "started");
+        assert_eq!(parsed_frames[0].2["event"], "started");
+        assert_eq!(parsed_frames[0].2["totalItems"], 2);
+
+        assert_eq!(parsed_frames[1].0, 2);
+        assert_eq!(parsed_frames[1].1, "batch");
+        assert_eq!(parsed_frames[1].2["event"], "batch");
+        assert_eq!(parsed_frames[1].2["created"], 2);
+
+        assert_eq!(parsed_frames[2].0, 3);
+        assert_eq!(parsed_frames[2].1, "completed");
+        assert_eq!(parsed_frames[2].2["event"], "completed");
+        assert_eq!(parsed_frames[2].2["totalCreated"], 2);
+
+        let guard = db_state.lock().await;
+        assert_eq!(guard.tables.get("vehicleresource").unwrap().len(), 2);
     }
 }

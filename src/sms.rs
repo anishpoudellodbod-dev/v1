@@ -1,15 +1,50 @@
 use crate::cache::Cache;
 use crate::resource::{DatabaseResource, ResourceName};
 use crate::ServerData;
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpMessage, HttpResponse};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/*
+
+
+
+Sends a standard text (GSM) SMS to one or more recipients. All parameters are passed as GET query strings or POST fields.
+
+Request Parameters
+Parameter	Required	Description
+key	Required	Your API Key, used to authenticate every request. You can regenerate it from the top of this page.
+campaign	Optional	ID of the campaign to be used, as defined in your account.
+Default CampaignID = 8572
+routeid	Optional	ID of the route to be used, as defined in your account.
+FTTRANS_RTID = 10244
+type	Required	SMS type. Set to text for a standard SMS.
+responsetype	Optional	Response format for the API call: http, json or xml. Defaults to http when omitted.
+contacts	Required	Recipient mobile numbers separated by commas, e.g. 9841XXXXXX,9801XXXXXX.
+senderid	Required	Any sender ID approved for your account.
+msg	Required	URL-encoded SMS text. Maximum length: 720 characters.
+time	Optional	Scheduled delivery time in the format YYYY-MM-DD H:i (e.g. 2025-12-01 14:30). Leave blank to send the SMS immediately.
+API Responses
+API Response	Description
+ERR: {<MESSAGE>}	An error occurred while processing the request. The cause is described inside the braces — for example, ERR: INVALID API KEY means the API key is expired or does not belong to any user. Error messages are plain text and self-explanatory.
+SMS-SHOOT-ID/{<alpha-numeric string>}	The SMS was submitted successfully. The returned shoot ID (the part after the slash) can be used later to fetch delivery reports via the DLR API.
+Sample API Calls
+Send a Text SMS
+
+                                $api_url = "https://samayasms.com.np/smsapi/index.php?key=366979AD75A35B&campaign=XXXXXX&routeid=XXXXXX&type=text&contacts=9841XXXXXX,9801XXXXXX&senderid=XXXXXX&msg=Hello%2C+this+is+a+test+SMS.";
+                            
+Schedule a Text SMS
+
+                                $api_url = "https://samayasms.com.np/smsapi/index.php?key=366979AD75A35B&campaign=XXXXXX&routeid=XXXXXX&type=text&contacts=9841XXXXXX,9801XXXXXX&senderid=XXXXXX&msg=Hello%2C+this+is+a+test+SMS.&time=2026-11-23+14%3A59";
+                            
+ */
 
 pub const DEFAULT_SMS_BASE_URL: &str = "https://samayasms.com.np/smsapi/index.php";
 pub const DEFAULT_SMS_API_KEY: &str = "366979AD75A35B";
@@ -20,34 +55,95 @@ pub const MAX_SMS_CHAR_LEN: usize = 720;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmsType {
-    #[serde(alias = "paid", alias = "Paid")]
     PAID,
-    #[serde(
-        alias = "PAYMENT_REMINDER",
-        alias = "payment_remainder",
-        alias = "payment_reminder"
-    )]
     PAYMENT_REMAINDER,
-    #[serde(alias = "urgent", alias = "Urgent")]
     URGENT,
+    CUSTOM(String),
+}
+
+impl Default for SmsType {
+    fn default() -> Self {
+        Self::CUSTOM(String::new())
+    }
 }
 
 impl SmsType {
-    pub fn setting_template_ids(&self) -> &'static [&'static str] {
+    pub fn from_id(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        let norm: String = trimmed
+            .chars()
+            .map(|c| {
+                if c == ' ' || c == '-' {
+                    '_'
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        match norm.as_str() {
+            "PAID" | "PAYMENT_RECEIVED" => Self::PAID,
+            "PAYMENT_REMAINDER" | "PAYMENT_REMINDER" => Self::PAYMENT_REMAINDER,
+            "URGENT" | "URGENT_REMINDER" => Self::URGENT,
+            _ => Self::CUSTOM(trimmed.to_string()),
+        }
+    }
+
+    pub fn setting_template_ids(&self) -> Vec<&str> {
         match self {
-            Self::PAID => &["payment-received", "paid", "payment_received"],
-            Self::PAYMENT_REMAINDER => &[
+            Self::PAID => vec!["PAID", "payment-received", "paid", "payment_received"],
+            Self::PAYMENT_REMAINDER => vec![
                 "PAYMENT REMAINDER",
                 "PAYMENT REMINDER",
+                "PAYMENT_REMAINDER",
+                "PAYMENT_REMINDER",
                 "payment-reminder",
                 "payment-remainder",
                 "payment_reminder",
                 "payment_remainder",
             ],
-            Self::URGENT => &["urgent-reminder", "urgent", "urgent_reminder"],
+            Self::URGENT => vec!["URGENT", "urgent-reminder", "urgent", "urgent_reminder"],
+            Self::CUSTOM(id) => {
+                let t = id.trim();
+                if t.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![t]
+                }
+            }
         }
+    }
+
+    pub fn matches_template_id(&self, tpl_id: &str) -> bool {
+        let target = tpl_id.trim();
+        self.setting_template_ids()
+            .into_iter()
+            .any(|candidate| target.eq_ignore_ascii_case(candidate))
+    }
+}
+
+impl Serialize for SmsType {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::PAID => serializer.serialize_str("PAID"),
+            Self::PAYMENT_REMAINDER => serializer.serialize_str("PAYMENT_REMAINDER"),
+            Self::URGENT => serializer.serialize_str("URGENT"),
+            Self::CUSTOM(id) => serializer.serialize_str(id),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SmsType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_id(&raw))
     }
 }
 
@@ -69,12 +165,167 @@ pub struct SettingSmsTemplate {
     pub category: Option<String>,
 }
 
+/// Extracts unique `{placeholder}` variable names in appearance order from an SMS template body.
+pub fn extract_template_placeholders(content: &str) -> Vec<String> {
+    let mut placeholders = Vec::new();
+    let mut seen = HashSet::new();
+    let mut rest = content;
+
+    while let Some(open_idx) = rest.find('{') {
+        let after_open = &rest[open_idx + 1..];
+        let Some(close_idx) = after_open.find('}') else {
+            break;
+        };
+        let candidate = &after_open[..close_idx];
+        if let Some(nested_open) = candidate.rfind('{') {
+            rest = &after_open[nested_open..];
+            continue;
+        }
+        if !candidate.is_empty() && !candidate.chars().any(char::is_whitespace) {
+            if seen.insert(candidate.to_string()) {
+                placeholders.push(candidate.to_string());
+            }
+        }
+        rest = &after_open[close_idx + 1..];
+    }
+
+    placeholders
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedSmsTemplate {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub content: String,
+    pub placeholders: Vec<String>,
+    pub sms_type: SmsType,
+}
+
+impl GeneratedSmsTemplate {
+    pub fn from_setting_template(tpl: SettingSmsTemplate) -> Self {
+        let placeholders = extract_template_placeholders(&tpl.content);
+        let sms_type = SmsType::from_id(&tpl.id);
+        Self {
+            id: tpl.id,
+            name: tpl.name,
+            active: tpl.active,
+            channel: tpl.channel,
+            category: tpl.category,
+            content: tpl.content,
+            placeholders,
+            sms_type,
+        }
+    }
+
+    pub fn render_with_variables(&self, variables: &HashMap<String, Value>) -> Result<String> {
+        render_content_with_variables(&self.content, &self.sms_type, variables)
+    }
+}
+
+fn raw_sms_templates_from_value(inner: &Value) -> Option<&Vec<Value>> {
+    inner
+        .pointer("/notifications/sms/templates")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            inner
+                .get("smsSettings")
+                .or_else(|| inner.get("sms_settings"))
+                .and_then(|s| s.get("templates"))
+                .and_then(Value::as_array)
+        })
+}
+
+/// Generates all valid SMS templates configured inside a single `SettingResource` JSON payload
+/// (`notifications.sms.templates` preferred, falling back to `smsSettings.templates`).
+pub fn generate_templates_from_value(inner: &Value) -> Vec<GeneratedSmsTemplate> {
+    let Some(raw_templates) = raw_sms_templates_from_value(inner) else {
+        return Vec::new();
+    };
+
+    raw_templates
+        .iter()
+        .filter_map(|raw_tpl| serde_json::from_value::<SettingSmsTemplate>(raw_tpl.clone()).ok())
+        .filter(|tpl| !tpl.content.trim().is_empty())
+        .filter(|tpl| {
+            tpl.channel
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none_or(|ch| ch.eq_ignore_ascii_case("SMS"))
+        })
+        .map(GeneratedSmsTemplate::from_setting_template)
+        .collect()
+}
+
+/// Generates SMS templates from the latest matching `ResourceName::SettingResource` entry.
+pub fn generate_templates_from_settings<'a, I>(settings: I) -> Vec<GeneratedSmsTemplate>
+where
+    I: IntoIterator<Item = &'a DatabaseResource>,
+{
+    let mut best: Option<(bool, i32, Vec<GeneratedSmsTemplate>)> = None;
+
+    for res in settings {
+        let Some(inner) = res.inner_content.as_ref() else {
+            continue;
+        };
+        if raw_sms_templates_from_value(inner).is_none() {
+            continue;
+        }
+        let generated = generate_templates_from_value(inner);
+        let is_nested = inner.pointer("/notifications/sms/templates").is_some();
+        let res_id = res.id.unwrap_or(0);
+        let replace = match &best {
+            None => true,
+            Some((best_nested, best_id, _)) => (is_nested, res_id) >= (*best_nested, *best_id),
+        };
+        if replace {
+            best = Some((is_nested, res_id, generated));
+        }
+    }
+
+    best.map(|(_, _, list)| list).unwrap_or_default()
+}
+
+pub fn generate_templates_from_cache(cache: &Cache) -> Vec<GeneratedSmsTemplate> {
+    let Ok(settings) = cache.read_all(ResourceName::SettingResource) else {
+        return Vec::new();
+    };
+    generate_templates_from_settings(settings)
+}
+
+pub async fn generate_templates_from_server_data(
+    s_data: &ServerData,
+) -> Vec<GeneratedSmsTemplate> {
+    {
+        let cache = s_data.cache.read().await;
+        let cached = generate_templates_from_cache(&cache);
+        if !cached.is_empty() {
+            return cached;
+        }
+    }
+
+    let Ok(db_settings) = s_data
+        .db
+        .read_all_resource(ResourceName::SettingResource)
+        .await
+    else {
+        return Vec::new();
+    };
+    generate_templates_from_settings(db_settings.iter())
+}
+
 /// Finds the matching SMS template inside a collection of `ResourceName::SettingResource` records
-/// (under `inner_content.smsSettings.templates`). Prefers active templates and newer resource IDs
-/// while falling back to inactive matches if no active template matches.
+/// (`inner_content.notifications.sms.templates`, falling back to `inner_content.smsSettings.templates`).
+/// Prefers active templates and newer resource IDs while falling back to inactive matches if no active template matches.
 pub fn find_sms_template_in_settings<'a, I>(
     settings: I,
-    sms_type: SmsType,
+    sms_type: &SmsType,
     template_id_override: Option<&str>,
 ) -> Option<SettingSmsTemplate>
 where
@@ -83,7 +334,6 @@ where
     let target_override = template_id_override
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let type_ids = sms_type.setting_template_ids();
 
     let mut best: Option<(bool, i32, SettingSmsTemplate)> = None;
 
@@ -91,17 +341,7 @@ where
         let Some(inner) = res.inner_content.as_ref() else {
             continue;
         };
-        let Some(templates) = inner
-            .pointer("/notifications/sms/templates")
-            .and_then(Value::as_array)
-            .or_else(|| {
-                inner
-                    .get("smsSettings")
-                    .or_else(|| inner.get("sms_settings"))
-                    .and_then(|s| s.get("templates"))
-                    .and_then(Value::as_array)
-            })
-        else {
+        let Some(templates) = raw_sms_templates_from_value(inner) else {
             continue;
         };
 
@@ -122,7 +362,7 @@ where
             let tpl_id = tpl.id.trim();
             let matches = match target_override {
                 Some(override_id) => tpl_id.eq_ignore_ascii_case(override_id),
-                None => type_ids.iter().any(|candidate| tpl_id.eq_ignore_ascii_case(candidate)),
+                None => sms_type.matches_template_id(tpl_id),
             };
             if !matches {
                 continue;
@@ -144,7 +384,7 @@ where
 /// Looks up the matching SMS template in `Cache` under `ResourceName::SettingResource`.
 pub fn find_sms_template_in_cache(
     cache: &Cache,
-    sms_type: SmsType,
+    sms_type: &SmsType,
     template_id_override: Option<&str>,
 ) -> Option<SettingSmsTemplate> {
     let settings = cache.read_all(ResourceName::SettingResource).ok()?;
@@ -155,7 +395,7 @@ pub fn find_sms_template_in_cache(
 /// falling back to `s_data.db.read_all_resource(ResourceName::SettingResource)` when cache misses.
 pub async fn find_sms_template_in_server_data(
     s_data: &ServerData,
-    sms_type: SmsType,
+    sms_type: &SmsType,
     template_id_override: Option<&str>,
 ) -> Option<SettingSmsTemplate> {
     {
@@ -244,23 +484,55 @@ where
 pub struct SmsTemplate {
     #[serde(deserialize_with = "deserialize_receiver")]
     pub receiver: String,
+    #[serde(default, alias = "smsType")]
     pub sms_type: SmsType,
-    #[serde(default)]
+    #[serde(default, alias = "templateId", alias = "id")]
     pub template_id: Option<String>,
+    #[serde(default, alias = "vehicleNumber")]
     pub vehicle_number: String,
+    #[serde(
+        default,
+        alias = "sanghBranch",
+        alias = "organizationName",
+        alias = "organization_name"
+    )]
     pub sangh_branch: String,
-    #[serde(default)]
+    #[serde(default, alias = "expiryDate", alias = "expiryBs", alias = "expiry_date")]
     pub expiry_bs: Option<String>,
-    #[serde(default, alias = "due_day_bs")]
+    #[serde(
+        default,
+        alias = "due_day_bs",
+        alias = "dueDate",
+        alias = "dueDayBs",
+        alias = "due_date"
+    )]
     pub due_date_bs: Option<String>,
     #[serde(default)]
     pub amount: Option<f64>,
     /// Optional scheduled delivery time in `YYYY-MM-DD HH:MM` format.
-    #[serde(default, alias = "time")]
+    #[serde(default, alias = "time", alias = "scheduledTime")]
     pub scheduled_time: Option<String>,
+    #[serde(default)]
+    pub variables: HashMap<String, Value>,
 }
 
 impl SmsTemplate {
+    pub fn for_template_id(receiver: impl Into<String>, template_id: impl Into<String>) -> Self {
+        let tid = template_id.into();
+        Self {
+            receiver: receiver.into(),
+            sms_type: SmsType::from_id(&tid),
+            template_id: Some(tid),
+            vehicle_number: String::new(),
+            sangh_branch: String::new(),
+            expiry_bs: None,
+            due_date_bs: None,
+            amount: None,
+            scheduled_time: None,
+            variables: HashMap::new(),
+        }
+    }
+
     pub fn new_paid(
         receiver: impl Into<String>,
         vehicle_number: impl Into<String>,
@@ -278,6 +550,7 @@ impl SmsTemplate {
             due_date_bs: None,
             amount: Some(amount),
             scheduled_time: None,
+            variables: HashMap::new(),
         }
     }
 
@@ -297,6 +570,7 @@ impl SmsTemplate {
             due_date_bs: Some(due_date_bs.into()),
             amount: None,
             scheduled_time: None,
+            variables: HashMap::new(),
         }
     }
 
@@ -316,6 +590,7 @@ impl SmsTemplate {
             due_date_bs: Some(due_date_bs.into()),
             amount: None,
             scheduled_time: None,
+            variables: HashMap::new(),
         }
     }
 
@@ -334,99 +609,84 @@ impl SmsTemplate {
         self
     }
 
+    pub fn with_variable(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.variables.insert(key.into(), value.into());
+        self
+    }
+
     /// Normalizes comma-separated recipient phone numbers and validates that at least one is present.
     pub fn normalized_contacts(&self) -> Result<String> {
         normalize_contacts(&self.receiver)
     }
 
+    fn effective_variables(&self) -> HashMap<String, Value> {
+        let mut vars = self.variables.clone();
+
+        let vn = self.vehicle_number.trim();
+        if !vn.is_empty() {
+            vars.entry("vehicleNumber".to_string())
+                .or_insert_with(|| Value::String(vn.to_string()));
+            vars.entry("vehicle_number".to_string())
+                .or_insert_with(|| Value::String(vn.to_string()));
+        }
+
+        let sb = self.sangh_branch.trim();
+        if !sb.is_empty() {
+            for alias in [
+                "organizationName",
+                "organization_name",
+                "sanghBranch",
+                "sangh_branch",
+            ] {
+                vars.entry(alias.to_string())
+                    .or_insert_with(|| Value::String(sb.to_string()));
+            }
+        }
+
+        if let Some(amount) = self.amount {
+            vars.entry("amount".to_string())
+                .or_insert_with(|| Value::String(format_amount(amount)));
+        }
+
+        if let Some(exp) = self
+            .expiry_bs
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            for alias in ["expiryDate", "expiry_date", "expiryBs", "expiry_bs"] {
+                vars.entry(alias.to_string())
+                    .or_insert_with(|| Value::String(exp.to_string()));
+            }
+        }
+
+        if let Some(due) = self
+            .due_date_bs
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            for alias in [
+                "dueDate",
+                "due_date",
+                "dueDayBs",
+                "due_date_bs",
+                "due_day_bs",
+            ] {
+                vars.entry(alias.to_string())
+                    .or_insert_with(|| Value::String(due.to_string()));
+            }
+        }
+
+        vars
+    }
+
     /// Renders the final SMS text using a template string loaded from `SettingResource`,
-    /// substituting both snake_case and camelCase placeholders and enforcing the 720-character limit.
+    /// substituting both structured fields and dynamic `{placeholder}` variables while enforcing
+    /// the 720-character limit.
     pub fn render_with_template(&self, template_content: &str) -> Result<String> {
-        let vehicle_number = self.vehicle_number.trim();
-        if vehicle_number.is_empty() {
-            bail!("vehicle_number is required");
-        }
-        let sangh_branch = self.sangh_branch.trim();
-        if sangh_branch.is_empty() {
-            bail!("sangh_branch is required");
-        }
-
-        let template = template_content.trim();
-        if template.is_empty() {
-            bail!("SMS template content in SettingResource is empty");
-        }
-
-        let mut msg = template
-            .replace("{vehicle_number}", vehicle_number)
-            .replace("{vehicleNumber}", vehicle_number)
-            .replace("{sangh_branch}", sangh_branch)
-            .replace("{sanghBranch}", sangh_branch)
-            .replace("{organizationName}", sangh_branch)
-            .replace("{organization_name}", sangh_branch);
-
-        if msg.contains("{amount}") {
-            let amount = self
-                .amount
-                .ok_or_else(|| anyhow!("amount is required for {:?} SMS template", self.sms_type))?;
-            msg = msg.replace("{amount}", &format_amount(amount));
-        }
-
-        let has_expiry_placeholder = msg.contains("{expiry_bs}")
-            || msg.contains("{expiryBs}")
-            || msg.contains("{expiryDate}")
-            || msg.contains("{expiry_date}");
-        if has_expiry_placeholder {
-            let expiry_bs = self
-                .expiry_bs
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow!("expiry_bs is required for {:?} SMS template", self.sms_type)
-                })?;
-            msg = msg
-                .replace("{expiry_bs}", expiry_bs)
-                .replace("{expiryBs}", expiry_bs)
-                .replace("{expiryDate}", expiry_bs)
-                .replace("{expiry_date}", expiry_bs);
-        }
-
-        let has_due_placeholder = msg.contains("{due_day_bs}")
-            || msg.contains("{due_date_bs}")
-            || msg.contains("{dueDayBs}")
-            || msg.contains("{dueDate}")
-            || msg.contains("{due_date}");
-        if has_due_placeholder {
-            let due = self
-                .due_date_bs
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "due_date_bs is required for {:?} SMS template",
-                        self.sms_type
-                    )
-                })?;
-            msg = msg
-                .replace("{due_day_bs}", due)
-                .replace("{due_date_bs}", due)
-                .replace("{dueDayBs}", due)
-                .replace("{dueDate}", due)
-                .replace("{due_date}", due);
-        }
-
-        let char_count = msg.chars().count();
-        if char_count == 0 {
-            bail!("rendered SMS message is empty");
-        }
-        if char_count > MAX_SMS_CHAR_LEN {
-            bail!(
-                "rendered SMS message exceeds maximum length of {MAX_SMS_CHAR_LEN} characters (got {char_count})"
-            );
-        }
-
-        Ok(msg)
+        let vars = self.effective_variables();
+        render_content_with_variables(template_content, &self.sms_type, &vars)
     }
 
     /// Renders the template using formats configured inside `SettingResource` items.
@@ -434,23 +694,145 @@ impl SmsTemplate {
     where
         I: IntoIterator<Item = &'a DatabaseResource>,
     {
-        let setting_tpl =
-            find_sms_template_in_settings(settings, self.sms_type, self.template_id.as_deref())
-                .ok_or_else(|| {
-                    anyhow!("SMS template for {:?} not found in SettingResource", self.sms_type)
-                })?;
+        let setting_tpl = find_sms_template_in_settings(
+            settings,
+            &self.sms_type,
+            self.template_id.as_deref(),
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "SMS template for {:?} not found in SettingResource",
+                self.sms_type
+            )
+        })?;
         self.render_with_template(&setting_tpl.content)
     }
 
     /// Renders the template using `ResourceName::SettingResource` entries stored in `Cache`.
     pub fn render_with_cache(&self, cache: &Cache) -> Result<String> {
         let setting_tpl =
-            find_sms_template_in_cache(cache, self.sms_type, self.template_id.as_deref())
+            find_sms_template_in_cache(cache, &self.sms_type, self.template_id.as_deref())
                 .ok_or_else(|| {
-                    anyhow!("SMS template for {:?} not found in SettingResource", self.sms_type)
+                    anyhow!(
+                        "SMS template for {:?} not found in SettingResource",
+                        self.sms_type
+                    )
                 })?;
         self.render_with_template(&setting_tpl.content)
     }
+}
+
+fn format_variable_value(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(n) => Some(n.as_f64().map(format_amount).unwrap_or_else(|| n.to_string())),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn placeholder_aliases(key: &str) -> &'static [&'static str] {
+    match key {
+        "vehicleNumber" | "vehicle_number" => &["vehicleNumber", "vehicle_number"],
+        "organizationName" | "organization_name" | "sanghBranch" | "sangh_branch" => &[
+            "organizationName",
+            "organization_name",
+            "sanghBranch",
+            "sangh_branch",
+        ],
+        "expiryDate" | "expiry_date" | "expiryBs" | "expiry_bs" => {
+            &["expiryDate", "expiry_date", "expiryBs", "expiry_bs"]
+        }
+        "dueDate" | "due_date" | "dueDayBs" | "due_date_bs" | "due_day_bs" => &[
+            "dueDate",
+            "due_date",
+            "dueDayBs",
+            "due_date_bs",
+            "due_day_bs",
+        ],
+        _ => &[],
+    }
+}
+
+fn normalize_var_key(k: &str) -> String {
+    k.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn lookup_variable(key: &str, variables: &HashMap<String, Value>) -> Option<String> {
+    if let Some(val) = variables.get(key).and_then(format_variable_value) {
+        return Some(val);
+    }
+    for alias in placeholder_aliases(key) {
+        if let Some(val) = variables.get(*alias).and_then(format_variable_value) {
+            return Some(val);
+        }
+    }
+    let norm_target = normalize_var_key(key);
+    for (k, v) in variables {
+        if normalize_var_key(k) == norm_target {
+            if let Some(val) = format_variable_value(v) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn missing_variable_error(placeholder: &str, sms_type: &SmsType) -> anyhow::Error {
+    match placeholder {
+        "vehicleNumber" | "vehicle_number" => anyhow!("vehicle_number is required"),
+        "organizationName" | "organization_name" | "sanghBranch" | "sangh_branch" => {
+            anyhow!("sangh_branch is required")
+        }
+        "amount" => anyhow!("amount is required for {:?} SMS template", sms_type),
+        "expiryDate" | "expiry_date" | "expiryBs" | "expiry_bs" => {
+            anyhow!("expiry_bs is required for {:?} SMS template", sms_type)
+        }
+        "dueDate" | "due_date" | "dueDayBs" | "due_date_bs" | "due_day_bs" => {
+            anyhow!("due_date_bs is required for {:?} SMS template", sms_type)
+        }
+        other => anyhow!("template variable '{other}' is required for SMS template"),
+    }
+}
+
+pub fn render_content_with_variables(
+    template_content: &str,
+    sms_type: &SmsType,
+    variables: &HashMap<String, Value>,
+) -> Result<String> {
+    let template = template_content.trim();
+    if template.is_empty() {
+        bail!("SMS template content in SettingResource is empty");
+    }
+
+    let mut msg = template.to_string();
+    for placeholder in extract_template_placeholders(template) {
+        let value = lookup_variable(&placeholder, variables)
+            .ok_or_else(|| missing_variable_error(&placeholder, sms_type))?;
+        msg = msg.replace(&format!("{{{placeholder}}}"), &value);
+    }
+
+    let char_count = msg.chars().count();
+    if char_count == 0 {
+        bail!("rendered SMS message is empty");
+    }
+    if char_count > MAX_SMS_CHAR_LEN {
+        bail!(
+            "rendered SMS message exceeds maximum length of {MAX_SMS_CHAR_LEN} characters (got {char_count})"
+        );
+    }
+
+    Ok(msg)
 }
 
 fn format_amount(amount: f64) -> String {
@@ -533,61 +915,105 @@ impl Default for SmsConfig {
     }
 }
 
+fn read_env_non_empty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn resolve_route_and_campaign(
+    effective_api_key: &str,
+    setting_route_id: Option<&str>,
+    setting_campaign_id: Option<&str>,
+    env_route_id: Option<String>,
+    env_campaign_id: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let clean_ref = |opt: Option<&str>| {
+        opt.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let clean_owned = |opt: Option<String>| {
+        opt.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let use_default_account_ids = effective_api_key.trim() == DEFAULT_SMS_API_KEY;
+
+    let route_id = clean_ref(setting_route_id)
+        .or_else(|| clean_owned(env_route_id))
+        .or_else(|| use_default_account_ids.then(|| DEFAULT_SMS_ROUTE_ID.to_string()));
+
+    let campaign_id = clean_ref(setting_campaign_id)
+        .or_else(|| clean_owned(env_campaign_id))
+        .or_else(|| use_default_account_ids.then(|| DEFAULT_SMS_CAMPAIGN_ID.to_string()));
+
+    (route_id, campaign_id)
+}
+
 impl SmsConfig {
     pub fn from_env() -> Self {
-        let base_url = env::var("SMS_API_BASE_URL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_SMS_BASE_URL.to_string());
+        Self::from_env_and_setting(None)
+    }
 
-        let api_key = env::var("SMS_API_KEY")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_SMS_API_KEY.to_string());
+    pub fn from_setting_or_env(
+        setting_sms: Option<&crate::settings::SmsNotificationSettings>,
+    ) -> Self {
+        Self::from_env_and_setting(setting_sms)
+    }
 
-        let campaign_id = env::var("SMS_CAMPAIGN_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .or_else(|| Some(DEFAULT_SMS_CAMPAIGN_ID.to_string()));
+    fn from_env_and_setting(
+        setting_sms: Option<&crate::settings::SmsNotificationSettings>,
+    ) -> Self {
+        let mut base_url =
+            read_env_non_empty("SMS_API_BASE_URL").unwrap_or_else(|| DEFAULT_SMS_BASE_URL.to_string());
+        let mut api_key =
+            read_env_non_empty("SMS_API_KEY").unwrap_or_else(|| DEFAULT_SMS_API_KEY.to_string());
+        let mut sender_id = read_env_non_empty("SMS_SENDER_ID").unwrap_or_default();
+        let response_type = read_env_non_empty("SMS_RESPONSE_TYPE");
+        let sms_api_type = read_env_non_empty("SMS_API_TYPE");
+        let mut provider = "samayasms".to_string();
+        let mut api_secret = read_env_non_empty("SMS_API_SECRET").unwrap_or_default();
+        let mut webhook_url = read_env_non_empty("SMS_WEBHOOK_URL");
+        let mut default_country_code = read_env_non_empty("SMS_DEFAULT_COUNTRY_CODE");
+        let mut enabled = true;
+        let mut setting_route_id: Option<&str> = None;
+        let mut setting_campaign_id: Option<&str> = None;
 
-        let route_id = env::var("SMS_ROUTE_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .or_else(|| Some(DEFAULT_SMS_ROUTE_ID.to_string()));
+        if let Some(s) = setting_sms {
+            enabled = s.enabled;
+            if !s.provider.trim().is_empty() {
+                provider = s.provider.trim().to_string();
+            }
+            if !s.base_url.trim().is_empty() {
+                base_url = s.base_url.trim().to_string();
+            }
+            if !s.api_key.trim().is_empty() {
+                api_key = s.api_key.trim().to_string();
+            }
+            if !s.sender_id.trim().is_empty() {
+                sender_id = s.sender_id.trim().to_string();
+            }
+            if !s.api_secret.trim().is_empty() {
+                api_secret = s.api_secret.trim().to_string();
+            }
+            if !s.webhook_url.trim().is_empty() {
+                webhook_url = Some(s.webhook_url.trim().to_string());
+            }
+            if !s.default_country_code.trim().is_empty() {
+                default_country_code = Some(s.default_country_code.trim().to_string());
+            }
+            setting_route_id = s.route_id.as_deref();
+            setting_campaign_id = s.campaign_id.as_deref();
+        }
 
-        let sender_id = env::var("SMS_SENDER_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
-
-        let response_type = env::var("SMS_RESPONSE_TYPE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
-        let sms_api_type = env::var("SMS_API_TYPE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
-        let api_secret = env::var("SMS_API_SECRET")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
-
-        let webhook_url = env::var("SMS_WEBHOOK_URL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
-        let default_country_code = env::var("SMS_DEFAULT_COUNTRY_CODE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let (route_id, campaign_id) = resolve_route_and_campaign(
+            &api_key,
+            setting_route_id,
+            setting_campaign_id,
+            read_env_non_empty("SMS_ROUTE_ID"),
+            read_env_non_empty("SMS_CAMPAIGN_ID"),
+        );
 
         Self {
             base_url,
@@ -597,44 +1023,12 @@ impl SmsConfig {
             sender_id,
             response_type,
             sms_api_type,
-            provider: "samayasms".to_string(),
+            provider,
             api_secret,
             webhook_url,
             default_country_code,
-            enabled: true,
+            enabled,
         }
-    }
-
-    pub fn from_setting_or_env(
-        setting_sms: Option<&crate::settings::SmsNotificationSettings>,
-    ) -> Self {
-        let mut cfg = Self::from_env();
-        let Some(s) = setting_sms else {
-            return cfg;
-        };
-        cfg.enabled = s.enabled;
-        if !s.provider.trim().is_empty() {
-            cfg.provider = s.provider.trim().to_string();
-        }
-        if !s.base_url.trim().is_empty() {
-            cfg.base_url = s.base_url.trim().to_string();
-        }
-        if !s.api_key.trim().is_empty() {
-            cfg.api_key = s.api_key.trim().to_string();
-        }
-        if !s.sender_id.trim().is_empty() {
-            cfg.sender_id = s.sender_id.trim().to_string();
-        }
-        if !s.api_secret.trim().is_empty() {
-            cfg.api_secret = s.api_secret.trim().to_string();
-        }
-        if !s.webhook_url.trim().is_empty() {
-            cfg.webhook_url = Some(s.webhook_url.trim().to_string());
-        }
-        if !s.default_country_code.trim().is_empty() {
-            cfg.default_country_code = Some(s.default_country_code.trim().to_string());
-        }
-        cfg
     }
 }
 
@@ -776,7 +1170,7 @@ impl SmsClient {
             .unwrap_or_default();
         let setting_tpl = find_sms_template_in_settings(
             settings,
-            template.sms_type,
+            &template.sms_type,
             template.template_id.as_deref(),
         )
         .ok_or_else(|| {
@@ -820,7 +1214,7 @@ impl SmsClient {
         }
         let setting_tpl = find_sms_template_in_server_data(
             s_data,
-            template.sms_type,
+            &template.sms_type,
             template.template_id.as_deref(),
         )
         .await
@@ -996,6 +1390,57 @@ pub struct SendRawSmsRequest {
     pub time: Option<String>,
 }
 
+/// GET /api/v1/sms/templates — Lists SMS templates generated dynamically from `SettingResource`.
+pub async fn list_sms_templates(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
+    let templates = generate_templates_from_server_data(&s_data).await;
+    let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
+    let resolved_cfg = SmsConfig::from_setting_or_env(setting_sms.as_ref());
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "source": "SettingResource",
+        "enabled": resolved_cfg.enabled,
+        "provider": resolved_cfg.provider,
+        "senderId": resolved_cfg.sender_id,
+        "baseUrl": resolved_cfg.base_url,
+        "routeId": resolved_cfg.route_id,
+        "campaignId": resolved_cfg.campaign_id,
+        "defaultCountryCode": resolved_cfg.default_country_code.unwrap_or_default(),
+        "templates": templates,
+    }))
+}
+
+/// GET /api/v1/sms/templates/{template_id} — Returns a generated SMS template by ID or alias.
+pub async fn get_sms_template_by_id(
+    path: web::Path<String>,
+    s_data: web::Data<Arc<ServerData>>,
+) -> HttpResponse {
+    let raw_id = path.into_inner();
+    let trimmed_id = raw_id.trim();
+    if trimmed_id.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "template_id is required"
+        }));
+    }
+
+    let templates = generate_templates_from_server_data(&s_data).await;
+    let requested_type = SmsType::from_id(trimmed_id);
+    let found = templates
+        .iter()
+        .find(|t| t.id.trim().eq_ignore_ascii_case(trimmed_id))
+        .or_else(|| {
+            templates
+                .iter()
+                .find(|t| requested_type.matches_template_id(&t.id))
+        });
+
+    match found {
+        Some(tpl) => HttpResponse::Ok().json(tpl),
+        None => HttpResponse::NotFound().json(serde_json::json!({
+            "error": format!("SMS template '{trimmed_id}' not found in SettingResource")
+        })),
+    }
+}
+
 /// POST /api/v1/sms/preview — Renders and validates an `SmsTemplate` using `SettingResource` without sending.
 pub async fn preview_sms_template(
     template: web::Json<SmsTemplate>,
@@ -1013,19 +1458,27 @@ pub async fn preview_sms_template(
     };
 
     let Some(setting_tpl) =
-        find_sms_template_in_server_data(&s_data, tpl.sms_type, tpl.template_id.as_deref()).await
+        find_sms_template_in_server_data(&s_data, &tpl.sms_type, tpl.template_id.as_deref()).await
     else {
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": format!("SMS template for {:?} not found in SettingResource", tpl.sms_type)
         }));
     };
 
+    let resolved_sms_type = if matches!(tpl.sms_type, SmsType::CUSTOM(ref id) if id.is_empty()) {
+        SmsType::from_id(&setting_tpl.id)
+    } else {
+        tpl.sms_type.clone()
+    };
+
     match tpl.render_with_template(&setting_tpl.content) {
         Ok(message) => HttpResponse::Ok().json(serde_json::json!({
             "contacts": contacts,
-            "sms_type": tpl.sms_type,
+            "sms_type": resolved_sms_type,
             "template_id": setting_tpl.id,
+            "template_name": setting_tpl.name,
             "template_active": setting_tpl.active,
+            "placeholders": extract_template_placeholders(&setting_tpl.content),
             "sms_enabled": setting_sms.as_ref().is_none_or(|s| s.enabled),
             "template_source": "setting_resource",
             "message": message,
@@ -1039,16 +1492,46 @@ pub async fn preview_sms_template(
 /// POST /api/v1/sms/send — Renders an `SmsTemplate` (using `SettingResource` templates) and sends it via SamayaSMS.
 pub async fn send_template_sms(
     template: web::Json<SmsTemplate>,
+    http_req: actix_web::HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = Instant::now();
+    if http_req.extensions().get::<crate::auth::Claims>().is_some() {
+        if let crate::permissions::PermissionCheckOutcome::Denied { message, .. } =
+            crate::permissions::enforce_request_permission(
+                &http_req,
+                &s_data,
+                "SettingResource",
+                crate::permissions::action::MANAGE_SMS,
+                crate::permissions::extract_branch_id_from_req(&http_req),
+            )
+            .await
+        {
+            return HttpResponse::Forbidden().json(serde_json::json!({ "error": message }));
+        }
+    }
     let tpl = template.into_inner();
     let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
-    let client = SmsClient::new(SmsConfig::from_setting_or_env(setting_sms.as_ref()));
-    match client.send_template_with_server_data(&tpl, &s_data).await {
-        Ok(result) => HttpResponse::Ok().json(result),
+    let cfg = SmsConfig::from_setting_or_env(setting_sms.as_ref());
+    let provider = cfg.provider.clone();
+    let client = SmsClient::new(cfg);
+
+    let (response, summary, meta) = match client.send_template_with_server_data(&tpl, &s_data).await
+    {
+        Ok(result) => {
+            let meta = serde_json::json!({
+                "templateId": tpl.template_id,
+                "receiver": result.contacts,
+                "shootId": result.shoot_id,
+                "provider": provider,
+                "vehicleNumber": tpl.vehicle_number,
+            });
+            let summary = format!("Sent template SMS to {}", result.contacts);
+            (HttpResponse::Ok().json(result), summary, meta)
+        }
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("disabled") || msg.contains("inactive") {
+            let resp = if msg.contains("disabled") || msg.contains("inactive") {
                 HttpResponse::Forbidden().json(serde_json::json!({ "error": msg }))
             } else if msg.contains("not found in SettingResource") {
                 HttpResponse::NotFound().json(serde_json::json!({ "error": msg }))
@@ -1060,27 +1543,78 @@ pub async fn send_template_sms(
                 HttpResponse::BadRequest().json(serde_json::json!({ "error": msg }))
             } else {
                 HttpResponse::BadGateway().json(serde_json::json!({ "error": msg }))
-            }
+            };
+            let meta = serde_json::json!({
+                "templateId": tpl.template_id,
+                "receiver": tpl.receiver,
+                "provider": provider,
+                "vehicleNumber": tpl.vehicle_number,
+                "error": msg,
+            });
+            (resp, format!("Template SMS send failed: {}", msg), meta)
         }
-    }
+    };
+
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&http_req),
+        category: crate::audit::AuditCategory::Notification,
+        action: crate::audit::AuditAction::SmsSend,
+        status_code: response.status().as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("SettingResource".to_string()),
+        summary,
+        branch_override: Some(tpl.sangh_branch),
+        metadata: Some(meta),
+        ..Default::default()
+    });
+
+    response
 }
 
 /// POST /api/v1/sms/send-raw — Sends a raw SMS message to comma-separated contacts via SamayaSMS.
 pub async fn send_raw_sms(
     req: web::Json<SendRawSmsRequest>,
+    http_req: actix_web::HttpRequest,
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
+    let started_at = Instant::now();
+    if http_req.extensions().get::<crate::auth::Claims>().is_some() {
+        if let crate::permissions::PermissionCheckOutcome::Denied { message, .. } =
+            crate::permissions::enforce_request_permission(
+                &http_req,
+                &s_data,
+                "SettingResource",
+                crate::permissions::action::MANAGE_SMS,
+                crate::permissions::extract_branch_id_from_req(&http_req),
+            )
+            .await
+        {
+            return HttpResponse::Forbidden().json(serde_json::json!({ "error": message }));
+        }
+    }
     let body = req.into_inner();
     let setting_sms = find_sms_notification_settings_in_server_data(&s_data).await;
-    let client = SmsClient::new(SmsConfig::from_setting_or_env(setting_sms.as_ref()));
-    match client
+    let cfg = SmsConfig::from_setting_or_env(setting_sms.as_ref());
+    let provider = cfg.provider.clone();
+    let client = SmsClient::new(cfg);
+
+    let (response, summary, meta) = match client
         .send_raw(&body.contacts, &body.msg, body.time.as_deref())
         .await
     {
-        Ok(result) => HttpResponse::Ok().json(result),
+        Ok(result) => {
+            let meta = serde_json::json!({
+                "contacts": result.contacts,
+                "shootId": result.shoot_id,
+                "provider": provider,
+                "scheduledTime": body.time,
+            });
+            let summary = format!("Sent raw SMS to {}", result.contacts);
+            (HttpResponse::Ok().json(result), summary, meta)
+        }
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("disabled") {
+            let resp = if msg.contains("disabled") {
                 HttpResponse::Forbidden().json(serde_json::json!({ "error": msg }))
             } else if msg.contains("is required")
                 || msg.contains("exceeds maximum length")
@@ -1090,13 +1624,36 @@ pub async fn send_raw_sms(
                 HttpResponse::BadRequest().json(serde_json::json!({ "error": msg }))
             } else {
                 HttpResponse::BadGateway().json(serde_json::json!({ "error": msg }))
-            }
+            };
+            let meta = serde_json::json!({
+                "contacts": body.contacts,
+                "provider": provider,
+                "scheduledTime": body.time,
+                "error": msg,
+            });
+            (resp, format!("Raw SMS send failed: {}", msg), meta)
         }
-    }
+    };
+
+    crate::audit::record_http_audit_async(crate::audit::HttpAuditEvent {
+        req: Some(&http_req),
+        category: crate::audit::AuditCategory::Notification,
+        action: crate::audit::AuditAction::SmsSend,
+        status_code: response.status().as_u16(),
+        started_at: Some(started_at),
+        resource_name: Some("SettingResource".to_string()),
+        summary,
+        metadata: Some(meta),
+        ..Default::default()
+    });
+
+    response
 }
 
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/preview", web::post().to(preview_sms_template))
+    cfg.route("/templates", web::get().to(list_sms_templates))
+        .route("/templates/{template_id}", web::get().to(get_sms_template_by_id))
+        .route("/preview", web::post().to(preview_sms_template))
         .route("/send", web::post().to(send_template_sms))
         .route("/send-raw", web::post().to(send_raw_sms));
 }
@@ -1123,6 +1680,7 @@ mod tests {
             due_date_bs: None,
             amount: None,
             scheduled_time: None,
+            variables: HashMap::new(),
         };
         assert!(invalid_paid.render_with_cache(&cache).is_err());
 
@@ -1137,6 +1695,7 @@ mod tests {
             due_date_bs: None,
             amount: None,
             scheduled_time: None,
+            variables: HashMap::new(),
         };
         assert!(invalid_rem.render_with_cache(&cache).is_err());
 
@@ -1649,6 +2208,14 @@ mod tests {
         assert!(raw_http.contains("key=36A1291E165814"));
         assert!(raw_http.contains("secret=SECRET_999"));
         assert!(raw_http.contains("contacts=9779861282176"));
+        assert!(
+            !raw_http.contains("routeid="),
+            "custom apiKey without routeId must not send default routeid=10244"
+        );
+        assert!(
+            !raw_http.contains("campaign="),
+            "custom apiKey without campaignId must not send default campaign=8572"
+        );
 
         let webhook_http = tokio::time::timeout(Duration::from_secs(2), webhook_rx)
             .await
@@ -1656,5 +2223,541 @@ mod tests {
             .unwrap();
         assert!(webhook_http.contains("SHOOT-NESTED"));
         assert!(webhook_http.contains("9779861282176"));
+    }
+
+    async fn spawn_multi_mock_sms_server(
+        expected_requests: usize,
+        response_prefix: &'static str,
+    ) -> (String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(expected_requests.max(4));
+
+        tokio::spawn(async move {
+            for idx in 1..=expected_requests {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = tx.send(req_str).await;
+
+                    let body = format!("{response_prefix}-{idx}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+            }
+        });
+
+        (format!("http://{addr}/smsapi/index.php"), rx)
+    }
+
+    fn user_exact_notifications_setting(base_url: &str) -> DatabaseResource {
+        DatabaseResource {
+            id: Some(1),
+            resource_name: Some(ResourceName::SettingResource),
+            inner_content: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "notifications": {
+                    "sms": {
+                        "apiKey": "36A1291E165814",
+                        "baseUrl": base_url,
+                        "enabled": true,
+                        "provider": "samayasms",
+                        "senderId": "Bit_Alert",
+                        "apiSecret": "",
+                        "templates": [
+                            {
+                                "id": "PAID",
+                                "name": "भुक्तानी प्राप्त",
+                                "active": true,
+                                "content": "Test gariyeko template तपाईंको सवारी नम्बर {vehicleNumber} को रकम रु {amount} प्राप्त भएको छ।\nधन्यवाद। {organizationName}\nम्याद सकिने मिति: {expiryDate}"
+                            },
+                            {
+                                "id": "PAYMENT REMAINDER",
+                                "name": "भुक्तानी रिमाइन्डर",
+                                "active": true,
+                                "content": "नमस्कार, सवारी नम्बर {vehicleNumber} को रु {amount} भुक्तानी बाँकी छ। कृपया {dueDate} भित्र भुक्तानी गर्नुहोस्।\n{organizationName}"
+                            },
+                            {
+                                "id": "URGENT",
+                                "name": "अत्यावश्यक रिमाइन्डर",
+                                "active": false,
+                                "content": "अत्यावश्यक सूचना: सवारी नम्बर {vehicleNumber} को भुक्तानी म्याद {dueDate} मा सकिँदैछ। सेवा निरन्तरताका लागि समयमै भुक्तानी गर्नुहोस्।\n{organizationName}"
+                            }
+                        ],
+                        "webhookUrl": "",
+                        "defaultCountryCode": "+977"
+                    }
+                }
+            })),
+            external_content: None,
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_generate_and_render_templates_from_user_notifications_sms_setting_resource() {
+        let mut state = crate::access::test_helpers::MockDbState::default();
+        let initial_setting =
+            user_exact_notifications_setting("https://samayasms.com.np/smsapi/index.php");
+        state.seed(ResourceName::SettingResource, initial_setting.clone());
+        let (s_data, _) =
+            crate::access::test_helpers::create_mock_server_data_with_state(state).await;
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(s_data.clone())
+                .service(web::scope("/api/v1/sms").configure(configure_routes)),
+        )
+        .await;
+
+        // 1. GET /api/v1/sms/templates generates all 3 templates from SettingResource (DB fallback works on cold cache)
+        let list_resp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/api/v1/sms/templates")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(list_resp.status(), actix_web::http::StatusCode::OK);
+        let list_body: Value = actix_web::test::read_body_json(list_resp).await;
+        assert_eq!(list_body["enabled"], true);
+        assert_eq!(list_body["provider"], "samayasms");
+        assert_eq!(list_body["senderId"], "Bit_Alert");
+        assert_eq!(list_body["defaultCountryCode"], "+977");
+        assert!(list_body.get("apiKey").is_none(), "apiKey must not be exposed");
+        assert!(
+            list_body.get("apiSecret").is_none(),
+            "apiSecret must not be exposed"
+        );
+
+        let templates = list_body["templates"].as_array().unwrap();
+        assert_eq!(templates.len(), 3);
+        assert_eq!(templates[0]["id"], "PAID");
+        assert_eq!(templates[0]["active"], true);
+        assert_eq!(templates[0]["sms_type"], "PAID");
+        assert_eq!(
+            templates[0]["placeholders"],
+            serde_json::json!(["vehicleNumber", "amount", "organizationName", "expiryDate"])
+        );
+
+        assert_eq!(templates[1]["id"], "PAYMENT REMAINDER");
+        assert_eq!(templates[1]["active"], true);
+        assert_eq!(templates[1]["sms_type"], "PAYMENT_REMAINDER");
+        assert_eq!(
+            templates[1]["placeholders"],
+            serde_json::json!(["vehicleNumber", "amount", "dueDate", "organizationName"])
+        );
+
+        assert_eq!(templates[2]["id"], "URGENT");
+        assert_eq!(templates[2]["active"], false);
+        assert_eq!(templates[2]["sms_type"], "URGENT");
+        assert_eq!(
+            templates[2]["placeholders"],
+            serde_json::json!(["vehicleNumber", "dueDate", "organizationName"])
+        );
+
+        // 2. GET /api/v1/sms/templates/{template_id} (including URL-encoded space in "PAYMENT REMAINDER")
+        for (uri, expected_id, expected_active) in [
+            ("/api/v1/sms/templates/PAID", "PAID", true),
+            (
+                "/api/v1/sms/templates/PAYMENT%20REMAINDER",
+                "PAYMENT REMAINDER",
+                true,
+            ),
+            ("/api/v1/sms/templates/URGENT", "URGENT", false),
+        ] {
+            let resp = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get().uri(uri).to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+            let tpl_json: Value = actix_web::test::read_body_json(resp).await;
+            assert_eq!(tpl_json["id"], expected_id);
+            assert_eq!(tpl_json["active"], expected_active);
+        }
+
+        let missing_resp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/api/v1/sms/templates/DOES_NOT_EXIST")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing_resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+
+        // 3. POST /api/v1/sms/preview works for PAID, PAYMENT REMAINDER, and inactive URGENT
+        let preview_paid = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "PAID",
+                    "vehicleNumber": "LU-01-KA-1234",
+                    "organizationName": "Narayani Sangh",
+                    "amount": 1500,
+                    "expiryDate": "2083-12-30"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(preview_paid.status(), actix_web::http::StatusCode::OK);
+        let paid_body: Value = actix_web::test::read_body_json(preview_paid).await;
+        assert_eq!(paid_body["contacts"], "9779861282176");
+        assert_eq!(paid_body["template_id"], "PAID");
+        assert_eq!(paid_body["template_active"], true);
+        assert_eq!(
+            paid_body["message"],
+            "Test gariyeko template तपाईंको सवारी नम्बर LU-01-KA-1234 को रकम रु 1500 प्राप्त भएको छ।\nधन्यवाद। Narayani Sangh\nम्याद सकिने मिति: 2083-12-30"
+        );
+
+        let preview_rem = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "PAYMENT REMAINDER",
+                    "variables": {
+                        "vehicleNumber": "LU-01-KA-1234",
+                        "amount": 2500,
+                        "dueDate": "2083-12-25",
+                        "organizationName": "Narayani Sangh"
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(preview_rem.status(), actix_web::http::StatusCode::OK);
+        let rem_body: Value = actix_web::test::read_body_json(preview_rem).await;
+        assert_eq!(rem_body["template_id"], "PAYMENT REMAINDER");
+        assert_eq!(
+            rem_body["message"],
+            "नमस्कार, सवारी नम्बर LU-01-KA-1234 को रु 2500 भुक्तानी बाँकी छ। कृपया 2083-12-25 भित्र भुक्तानी गर्नुहोस्।\nNarayani Sangh"
+        );
+
+        let preview_urg = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "URGENT",
+                    "vehicle_number": "LU-01-KA-1234",
+                    "sangh_branch": "Narayani Sangh",
+                    "due_date_bs": "2083-12-28"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(preview_urg.status(), actix_web::http::StatusCode::OK);
+        let urg_body: Value = actix_web::test::read_body_json(preview_urg).await;
+        assert_eq!(urg_body["template_id"], "URGENT");
+        assert_eq!(urg_body["template_active"], false);
+
+        // 4. POST /api/v1/sms/send using cache-populated SettingResource pointed to mock SamayaSMS server
+        let (mock_url, mut rx) = spawn_multi_mock_sms_server(2, "SMS-SHOOT-ID/USER").await;
+        s_data.cache.write().await.write(
+            ResourceName::SettingResource,
+            1,
+            user_exact_notifications_setting(&mock_url),
+        );
+
+        let send_paid = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/send")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "PAID",
+                    "vehicleNumber": "LU-01-KA-1234",
+                    "organizationName": "Narayani Sangh",
+                    "amount": 1500,
+                    "expiryDate": "2083-12-30"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(send_paid.status(), actix_web::http::StatusCode::OK);
+        let send_paid_res: SmsSendResult = actix_web::test::read_body_json(send_paid).await;
+        assert_eq!(send_paid_res.shoot_id, "USER-1");
+        assert_eq!(send_paid_res.contacts, "9779861282176");
+
+        let raw_paid_http = rx.recv().await.unwrap();
+        assert!(raw_paid_http.contains("key=36A1291E165814"));
+        assert!(raw_paid_http.contains("senderid=Bit_Alert"));
+        assert!(raw_paid_http.contains("type=unicode"));
+        assert!(raw_paid_http.contains("contacts=9779861282176"));
+        assert!(raw_paid_http.contains("msg=Test+gariyeko+template+"));
+        assert!(
+            !raw_paid_http.contains("routeid="),
+            "custom SettingResource apiKey without routeId must not inject default routeid"
+        );
+        assert!(
+            !raw_paid_http.contains("campaign="),
+            "custom SettingResource apiKey without campaignId must not inject default campaign"
+        );
+
+        let send_rem = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/send")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "PAYMENT REMAINDER",
+                    "vehicleNumber": "LU-01-KA-1234",
+                    "organizationName": "Narayani Sangh",
+                    "amount": 2500,
+                    "dueDate": "2083-12-25"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(send_rem.status(), actix_web::http::StatusCode::OK);
+        let send_rem_res: SmsSendResult = actix_web::test::read_body_json(send_rem).await;
+        assert_eq!(send_rem_res.shoot_id, "USER-2");
+        let raw_rem_http = rx.recv().await.unwrap();
+        assert!(raw_rem_http.contains("senderid=Bit_Alert"));
+
+        // URGENT is active: false -> 403 Forbidden
+        let send_urg = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/send")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "URGENT",
+                    "vehicleNumber": "LU-01-KA-1234",
+                    "organizationName": "Narayani Sangh",
+                    "dueDate": "2083-12-28"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(send_urg.status(), actix_web::http::StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn test_dynamic_custom_template_generated_from_setting_resource() {
+        let mut setting = user_exact_notifications_setting(DEFAULT_SMS_BASE_URL);
+        if let Some(arr) = setting
+            .inner_content
+            .as_mut()
+            .and_then(|v| v.pointer_mut("/notifications/sms/templates"))
+            .and_then(Value::as_array_mut)
+        {
+            arr.push(serde_json::json!({
+                "id": "CUSTOM_WELCOME",
+                "name": "Custom Welcome",
+                "active": true,
+                "content": "Namaste {memberName}, your code is {otp} for {organizationName}"
+            }));
+        }
+
+        let (s_data, _) = crate::access::test_helpers::create_mock_server_data_with_state(
+            crate::access::test_helpers::MockDbState::default(),
+        )
+        .await;
+        s_data
+            .cache
+            .write()
+            .await
+            .write(ResourceName::SettingResource, 1, setting);
+
+        let generated = generate_templates_from_cache(&*s_data.cache.read().await);
+        let custom = generated
+            .iter()
+            .find(|t| t.id == "CUSTOM_WELCOME")
+            .expect("CUSTOM_WELCOME template should be generated");
+        assert_eq!(
+            custom.placeholders,
+            vec!["memberName", "otp", "organizationName"]
+        );
+        assert_eq!(
+            custom.sms_type,
+            SmsType::CUSTOM("CUSTOM_WELCOME".to_string())
+        );
+
+        let mut vars = HashMap::new();
+        vars.insert("memberName".to_string(), Value::String("Sita".to_string()));
+        vars.insert("otp".to_string(), serde_json::json!(4321));
+        vars.insert(
+            "organizationName".to_string(),
+            Value::String("Narayani".to_string()),
+        );
+        assert_eq!(
+            custom.render_with_variables(&vars).unwrap(),
+            "Namaste Sita, your code is 4321 for Narayani"
+        );
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(s_data)
+                .service(web::scope("/api/v1/sms").configure(configure_routes)),
+        )
+        .await;
+
+        // Render via template_id without sms_type
+        let preview_by_tid = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "template_id": "CUSTOM_WELCOME",
+                    "variables": {
+                        "memberName": "Hari",
+                        "otp": 9876,
+                        "organizationName": "Narayani Sangh"
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(preview_by_tid.status(), actix_web::http::StatusCode::OK);
+        let body_by_tid: Value = actix_web::test::read_body_json(preview_by_tid).await;
+        assert_eq!(body_by_tid["sms_type"], "CUSTOM_WELCOME");
+        assert_eq!(
+            body_by_tid["message"],
+            "Namaste Hari, your code is 9876 for Narayani Sangh"
+        );
+
+        // Render via sms_type: "CUSTOM_WELCOME"
+        let preview_by_type = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "sms_type": "CUSTOM_WELCOME",
+                    "variables": {
+                        "memberName": "Gita",
+                        "otp": "1122",
+                        "organizationName": "Narayani Sangh"
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(preview_by_type.status(), actix_web::http::StatusCode::OK);
+        let body_by_type: Value = actix_web::test::read_body_json(preview_by_type).await;
+        assert_eq!(
+            body_by_type["message"],
+            "Namaste Gita, your code is 1122 for Narayani Sangh"
+        );
+
+        // Missing custom placeholder -> 400 Bad Request
+        let missing_otp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/api/v1/sms/preview")
+                .set_json(serde_json::json!({
+                    "receiver": "9861282176",
+                    "template_id": "CUSTOM_WELCOME",
+                    "variables": {
+                        "memberName": "Hari",
+                        "organizationName": "Narayani Sangh"
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing_otp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_sms_config_route_and_campaign_resolution_for_custom_api_key() {
+        // 1. Default account API key retains default route & campaign when none specified
+        let (default_route, default_campaign) =
+            resolve_route_and_campaign(DEFAULT_SMS_API_KEY, None, None, None, None);
+        assert_eq!(default_route.as_deref(), Some(DEFAULT_SMS_ROUTE_ID));
+        assert_eq!(default_campaign.as_deref(), Some(DEFAULT_SMS_CAMPAIGN_ID));
+
+        // 2. Custom API key without routeId/campaignId omits both (prevents "Pricing is not set for your account for this route")
+        let (custom_route, custom_campaign) =
+            resolve_route_and_campaign("36A1291E165814", None, None, None, None);
+        assert_eq!(custom_route, None);
+        assert_eq!(custom_campaign, None);
+
+        // 3. Env overrides apply to custom API key when SettingResource omits them
+        let (env_route, env_campaign) = resolve_route_and_campaign(
+            "36A1291E165814",
+            None,
+            None,
+            Some("30100".to_string()),
+            Some("7788".to_string()),
+        );
+        assert_eq!(env_route.as_deref(), Some("30100"));
+        assert_eq!(env_campaign.as_deref(), Some("7788"));
+
+        // 4. SettingResource routeId/campaignId override env
+        let (setting_route, setting_campaign) = resolve_route_and_campaign(
+            "36A1291E165814",
+            Some("20500"),
+            Some("9901"),
+            Some("30100".to_string()),
+            Some("7788".to_string()),
+        );
+        assert_eq!(setting_route.as_deref(), Some("20500"));
+        assert_eq!(setting_campaign.as_deref(), Some("9901"));
+
+        // 5. Numeric and string routeId/campaignId in SettingResource.notifications.sms deserialize & send
+        let (mock_url, req_rx) =
+            spawn_mock_sms_server("200 OK", "SMS-SHOOT-ID/CUSTOM-ROUTE-OK").await;
+        let setting = DatabaseResource {
+            id: Some(1),
+            resource_name: Some(ResourceName::SettingResource),
+            inner_content: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "notifications": {
+                    "sms": {
+                        "apiKey": "36A1291E165814",
+                        "baseUrl": mock_url,
+                        "enabled": true,
+                        "provider": "samayasms",
+                        "senderId": "Bit_Alert",
+                        "routeId": 20500,
+                        "campaignId": "9901",
+                        "defaultCountryCode": "+977",
+                        "templates": [
+                            {
+                                "id": "PAID",
+                                "active": true,
+                                "content": "Paid {vehicleNumber} {amount} {organizationName} {expiryDate}"
+                            }
+                        ]
+                    }
+                }
+            })),
+            external_content: None,
+        };
+
+        let sms_settings = extract_sms_notification_settings([&setting]).unwrap();
+        assert_eq!(sms_settings.route_id.as_deref(), Some("20500"));
+        assert_eq!(sms_settings.campaign_id.as_deref(), Some("9901"));
+
+        let cfg = SmsConfig::from_setting_or_env(Some(&sms_settings));
+        assert_eq!(cfg.api_key, "36A1291E165814");
+        assert_eq!(cfg.route_id.as_deref(), Some("20500"));
+        assert_eq!(cfg.campaign_id.as_deref(), Some("9901"));
+
+        let mut cache = Cache::new();
+        cache.write(ResourceName::SettingResource, 1, setting);
+
+        let client = SmsClient::new(cfg);
+        let tpl = SmsTemplate::new_paid("9861282176", "BA-01-PA-1", "Narayani", 500.0, "2083-12-30");
+        let sent = client.send_template_with_cache(&tpl, &cache).await.unwrap();
+        assert_eq!(sent.shoot_id, "CUSTOM-ROUTE-OK");
+
+        let raw_http = req_rx.await.unwrap();
+        assert!(raw_http.contains("key=36A1291E165814"));
+        assert!(raw_http.contains("routeid=20500"));
+        assert!(raw_http.contains("campaign=9901"));
+        assert!(raw_http.contains("senderid=Bit_Alert"));
     }
 }

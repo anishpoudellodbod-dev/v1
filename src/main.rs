@@ -24,9 +24,11 @@ pub mod members;
 mod api_stream;
 pub mod date;
 pub mod log;
+pub mod audit;
 pub mod sms;
 pub mod access;
 pub mod settings;
+pub mod permissions;
 
 #[derive(Clone)]
 pub struct ServerData {
@@ -105,6 +107,8 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: POST,      api/v1/bills/rollback/{id}",
             "method: GET,       api/v1/bills/logs",
             "method: GET,       api/v1/bills/logs/{bill_id}",
+            "method: GET,       api/v1/sms/templates",
+            "method: GET,       api/v1/sms/templates/{template_id}",
             "method: POST,      api/v1/sms/preview",
             "method: POST,      api/v1/sms/send",
             "method: POST,      api/v1/sms/send-raw",
@@ -112,8 +116,20 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: GET,       api/v1/access/user/{user_id}",
             "method: POST,      api/v1/access/permission",
             "method: PUT,       api/v1/access/user/{user_id}",
+            "method: GET,       api/v1/permissions/catalog",
+            "method: GET,       api/v1/permissions/me",
+            "method: GET,       api/v1/permissions",
+            "method: POST,      api/v1/permissions",
+            "method: GET,       api/v1/permissions/{tenant_id}/{role}",
+            "method: PUT,       api/v1/permissions/{id}",
+            "method: POST,      api/v1/permissions/check",
+            "method: POST,      api/v1/permissions/seed-defaults",
+            "method: POST,      api/v1/permissions/repair",
             "method: GET,       api/v1/logs/actions",
             "method: GET,       api/v1/logs/actions/{resource_name}",
+            "method: GET,       api/v1/audit",
+            "method: GET,       api/v1/audit/entity/{resource_name}/{resource_id}",
+            "method: GET,       api/v1/audit/summary",
             "method: GET,       api/v1/settings/resolved",
             "method: POST,      api/v1/settings/billing/calculate-vat",
             "method: GET,       api/v1/settings/billing/arrears/{vehicle}",
@@ -437,7 +453,13 @@ async fn main() -> std::io::Result<()> {
         tqms_client,
         cache: Arc::new(tokio::sync::RwLock::new(cache)),
     };
+    permissions::hydrate_role_policies(&server_data).await;
     log::init_persistent_action_logger(
+        server_data.db.clone(),
+        Some(server_data.cache.clone()),
+    )
+    .await;
+    audit::init_persistent_audit_trail(
         server_data.db.clone(),
         Some(server_data.cache.clone()),
     )
@@ -451,6 +473,14 @@ async fn main() -> std::io::Result<()> {
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header()
+            .expose_headers([
+                "X-Stream-Format",
+                "X-Batch-Size",
+                "X-Concurrency",
+                "X-Total-Items",
+                "X-Total-Pages",
+                "X-Starting-Offset",
+            ])
             .max_age(3600);
         App::new()
             .wrap(cors)
@@ -470,6 +500,15 @@ async fn main() -> std::io::Result<()> {
                         roles::Roles::Operator,
                     ]))
                     .configure(access::configure_routes),
+            )
+            .service(
+                web::scope("/api/v1/permissions")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .configure(permissions::configure_routes),
             )
             // .service(
             //     web::scope("/api/v1/Developer")
@@ -536,7 +575,9 @@ async fn main() -> std::io::Result<()> {
                 .route("/search/{resource_name}/{search_query}/{search_item}/{limit}/{offset}", web::get().to(api_stream::search))
                 .wrap(actix_web::middleware::Compress::default())
                 .wrap(middleware::AuthMiddleware::with_roles(&[
-                    roles::Roles::Admin
+                    roles::Roles::User,
+                    roles::Roles::Admin,
+                    roles::Roles::Operator,
                 ]))
             )
             .service(
@@ -568,7 +609,10 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::resource("/modify/{id}")
                             .route(web::put().to(billing_actions::modify_bill))
-                            .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Operator)),
+                            .wrap(middleware::AuthMiddleware::with_roles(&[
+                                roles::Roles::Admin,
+                                roles::Roles::Operator,
+                            ])),
                     )
                     .service(
                         web::resource("/delete/{id}")
@@ -604,6 +648,11 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/logs")
                     .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin))
                     .configure(log::configure_routes),
+            )
+            .service(
+                web::scope("/api/v1/audit")
+                    .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin))
+                    .configure(audit::configure_routes),
             )
             .service(
                 web::scope("/api/v1")
@@ -642,6 +691,7 @@ async fn main() -> std::io::Result<()> {
     .await;
 
     log::flush_action_logs().await;
+    audit::flush_audit_trail().await;
     server_result
 }
 

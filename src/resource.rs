@@ -13,6 +13,7 @@ pub enum ResourceName {
     BillingEntityResource,
     BranchResource,
     ActionLogsResource,
+    AuditTrailResource,
 }
 
 impl ResourceName {
@@ -45,6 +46,8 @@ impl ResourceName {
             Some(Self::BranchResource)
         } else if trimmed.eq_ignore_ascii_case("ActionLogsResource") {
             Some(Self::ActionLogsResource)
+        } else if trimmed.eq_ignore_ascii_case("AuditTrailResource") {
+            Some(Self::AuditTrailResource)
         } else {
             None
         }
@@ -94,6 +97,7 @@ impl ToString for ResourceName {
             ResourceName::BillingEntityResource => "BillingEntityResource".into(),
             ResourceName::BranchResource => "BranchResource".into(),
             ResourceName::ActionLogsResource => "ActionLogsResource".into(),
+            ResourceName::AuditTrailResource => "AuditTrailResource".into(),
         }
     }
 }
@@ -138,6 +142,7 @@ mod tests {
         assert_eq!(ResourceName::BillingEntityResource.to_string(), "BillingEntityResource");
         assert_eq!(ResourceName::BranchResource.to_string(), "BranchResource");
         assert_eq!(ResourceName::ActionLogsResource.to_string(), "ActionLogsResource");
+        assert_eq!(ResourceName::AuditTrailResource.to_string(), "AuditTrailResource");
     }
 
     #[test]
@@ -156,6 +161,7 @@ mod tests {
         assert_eq!(ResourceName::from("BillingEntityResource".to_string()), ResourceName::BillingEntityResource);
         assert_eq!(ResourceName::from("BranchResource".to_string()), ResourceName::BranchResource);
         assert_eq!(ResourceName::from("ActionLogsResource".to_string()), ResourceName::ActionLogsResource);
+        assert_eq!(ResourceName::from("AuditTrailResource".to_string()), ResourceName::AuditTrailResource);
     }
 
     #[test]
@@ -174,6 +180,7 @@ mod tests {
             ("BillingEntityResource", ResourceName::BillingEntityResource),
             ("BranchResource", ResourceName::BranchResource),
             ("ActionLogsResource", ResourceName::ActionLogsResource),
+            ("AuditTrailResource", ResourceName::AuditTrailResource),
         ];
 
         for (pascal, expected) in variants {

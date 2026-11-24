@@ -37,6 +37,7 @@ impl Database {
             ResourceName::BillingEntityResource,
             ResourceName::BranchResource,
             ResourceName::ActionLogsResource,
+            ResourceName::AuditTrailResource,
         ];
         Database {
             resource_name,

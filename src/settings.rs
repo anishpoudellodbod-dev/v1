@@ -350,6 +350,24 @@ pub struct SmsNotificationSettings {
     pub sender_id: String,
     #[serde(rename = "apiSecret", default)]
     pub api_secret: String,
+    #[serde(
+        rename = "routeId",
+        alias = "routeid",
+        alias = "route_id",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_string_id"
+    )]
+    pub route_id: Option<String>,
+    #[serde(
+        rename = "campaignId",
+        alias = "campaign",
+        alias = "campaign_id",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_string_id"
+    )]
+    pub campaign_id: Option<String>,
     #[serde(default)]
     pub templates: Vec<SettingSmsTemplate>,
     #[serde(rename = "webhookUrl", default)]
@@ -367,6 +385,8 @@ impl Default for SmsNotificationSettings {
             provider: default_sms_provider(),
             sender_id: String::new(),
             api_secret: String::new(),
+            route_id: None,
+            campaign_id: None,
             templates: Vec::new(),
             webhook_url: String::new(),
             default_country_code: String::new(),
@@ -2701,6 +2721,8 @@ mod tests {
             role: crate::roles::Roles::Admin,
             user_id: Some(1),
             jti: None,
+            role_name: None,
+            tenant_id: None,
         });
         let admin_resp = web_test::call_service(&app, admin_req).await;
         let admin_json: Value = web_test::read_body_json(admin_resp).await;
