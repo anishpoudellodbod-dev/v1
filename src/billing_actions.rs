@@ -220,12 +220,20 @@ pub struct VehicleBillingDetails {
     pub vehicle_id: String,
     #[serde(rename = "vehicleNumber")]
     pub vehicle_number: String,
+    #[serde(rename = "sthaniyaBranch", default, skip_serializing_if = "Option::is_none")]
+    pub sthaniya_branch: Option<String>,
     #[serde(rename = "vehicleStatus")]
     pub vehicle_status: String,
     pub owners: Option<OwnersResolution>,
     pub fees: Vec<FeeItem>,
     #[serde(rename = "paymentHistory")]
     pub payment_history: Vec<PaymentHistoryItem>,
+    #[serde(rename = "isSampleBillingData", default, skip_serializing_if = "Option::is_none")]
+    pub is_sample_billing_data: Option<bool>,
+    #[serde(rename = "sampleSourceBranch", default, skip_serializing_if = "Option::is_none")]
+    pub sample_source_branch: Option<String>,
+    #[serde(rename = "message", default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +538,62 @@ fn eq_normalized_vehicle_number(raw: &str, normalized_upper: &str) -> bool {
         .eq(normalized_upper.chars())
 }
 
+/// Returns `true` if a vehicle's JSON inner content matches the given `VehicleId`.
+fn vehicle_inner_matches_id(
+    inner: &Value,
+    q_id: &str,
+    q_id_i64: Option<i64>,
+    q_id_u64: Option<u64>,
+) -> bool {
+    if q_id.is_empty() {
+        return false;
+    }
+
+    for id_key in ["VehicleId", "vehicleId"] {
+        if let Some(vid) = inner.get(id_key) {
+            if vid.as_str().map(str::trim) == Some(q_id)
+                || (q_id_i64.is_some() && vid.as_i64() == q_id_i64)
+                || (q_id_u64.is_some() && vid.as_u64() == q_id_u64)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if a vehicle's JSON inner content matches the given normalized `VehicleNumber`.
+fn vehicle_inner_matches_number(
+    inner: &Value,
+    q_norm: &str,
+    check_normalized_field: bool,
+) -> bool {
+    if q_norm.is_empty() {
+        return false;
+    }
+
+    for num_key in ["VehicleNumber", "vehicleNumber"] {
+        if let Some(vnum) = inner.get(num_key).and_then(Value::as_str) {
+            if eq_normalized_vehicle_number(vnum, q_norm) {
+                return true;
+            }
+        }
+    }
+
+    if check_normalized_field {
+        for norm_key in ["NormalizedVehicleNumber", "normalizedVehicleNumber"] {
+            if let Some(vnorm) = inner.get(norm_key).and_then(Value::as_str) {
+                if eq_normalized_vehicle_number(vnorm, q_norm) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Returns `true` if a vehicle's JSON inner content matches the given `VehicleId` or normalized `VehicleNumber`.
 fn vehicle_inner_matches(
     inner: &Value,
@@ -539,33 +603,30 @@ fn vehicle_inner_matches(
     q_norm: &str,
     check_normalized_field: bool,
 ) -> bool {
-    if !q_id.is_empty() {
-        if let Some(vid) = inner.get("VehicleId") {
-            if vid.as_str() == Some(q_id)
-                || (q_id_i64.is_some() && vid.as_i64() == q_id_i64)
-                || (q_id_u64.is_some() && vid.as_u64() == q_id_u64)
-            {
-                return true;
-            }
-        }
-    }
+    vehicle_inner_matches_id(inner, q_id, q_id_i64, q_id_u64)
+        || vehicle_inner_matches_number(inner, q_norm, check_normalized_field)
+}
 
-    if !q_norm.is_empty() {
-        if let Some(vnum) = inner.get("VehicleNumber").and_then(Value::as_str) {
-            if eq_normalized_vehicle_number(vnum, q_norm) {
-                return true;
+fn extract_vehicle_id_and_number(inner: &Value) -> (Option<String>, Option<String>) {
+    let vid = ["VehicleId", "vehicleId"].into_iter().find_map(|k| {
+        inner.get(k).and_then(|v| {
+            let s = extract_value_str_or_int(v);
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
             }
-        }
-        if check_normalized_field {
-            if let Some(vnorm) = inner.get("NormalizedVehicleNumber").and_then(Value::as_str) {
-                if eq_normalized_vehicle_number(vnorm, q_norm) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
+        })
+    });
+    let vnum = ["VehicleNumber", "vehicleNumber"].into_iter().find_map(|k| {
+        inner
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    });
+    (vid, vnum)
 }
 
 /// Zero-allocation vehicle lookup across an iterator of `DatabaseResource`.
@@ -620,6 +681,8 @@ pub fn is_vehicle_blacklisted(inner: &Value) -> bool {
 }
 
 /// Moves the matching vehicle record out of a mutable TQMS `search_vehicles` response without cloning.
+/// When both `q_id` and `q_norm` are provided, prefers an exact match on both fields before falling back
+/// to a partial match so the caller can surface a vehicle mismatch error.
 fn take_matching_tqms_vehicle(
     tqms_response: &mut Value,
     q_id: &str,
@@ -630,8 +693,18 @@ fn take_matching_tqms_vehicle(
         .get_mut("Data")?
         .as_array_mut()?;
     let has_id = !q_id.is_empty();
+    let has_norm = !q_norm.is_empty();
     let q_id_i64 = if has_id { q_id.parse::<i64>().ok() } else { None };
     let q_id_u64 = if has_id { q_id.parse::<u64>().ok() } else { None };
+
+    if has_id && has_norm {
+        if let Some(exact) = items.iter_mut().find(|item| {
+            vehicle_inner_matches_id(item, q_id, q_id_i64, q_id_u64)
+                && vehicle_inner_matches_number(item, q_norm, true)
+        }) {
+            return Some(Value::take(exact));
+        }
+    }
 
     items
         .iter_mut()
@@ -644,8 +717,18 @@ fn take_matching_tqms_vehicle(
 fn find_matching_tqms_vehicle(tqms_response: &Value, q_id: &str, q_norm: &str) -> Option<Value> {
     let items = tqms_response.get("Data")?.get("Data")?.as_array()?;
     let has_id = !q_id.is_empty();
+    let has_norm = !q_norm.is_empty();
     let q_id_i64 = if has_id { q_id.parse::<i64>().ok() } else { None };
     let q_id_u64 = if has_id { q_id.parse::<u64>().ok() } else { None };
+
+    if has_id && has_norm {
+        if let Some(exact) = items.iter().find(|item| {
+            vehicle_inner_matches_id(item, q_id, q_id_i64, q_id_u64)
+                && vehicle_inner_matches_number(item, q_norm, true)
+        }) {
+            return Some(exact.clone());
+        }
+    }
 
     items
         .iter()
@@ -1347,6 +1430,62 @@ pub fn validate_vehicle_sangh_branch(
     Ok(None)
 }
 
+fn find_matching_vehicle_sangh_branch(
+    vehicle_inner: &Value,
+    requested_branch: &str,
+) -> Option<String> {
+    let target = requested_branch.trim();
+    if target.is_empty() {
+        return None;
+    }
+    extract_vehicle_sangh_branches(vehicle_inner)
+        .into_iter()
+        .find(|b| branch_matches(b, target))
+}
+
+fn has_billing_rule_for_sangh(
+    cache: &crate::cache::Cache,
+    sangh_branch: &str,
+    default_sangh: &str,
+) -> bool {
+    if branch_matches(sangh_branch, default_sangh) {
+        return true;
+    }
+
+    let Some(rules_map) = cache.cache.get(&ResourceName::BillingRuleResource) else {
+        return false;
+    };
+
+    rules_map.values().any(|rule| {
+        let Some(inner) = rule.inner_content.as_ref() else {
+            return false;
+        };
+        if let Some(status) = inner.get("status").and_then(Value::as_str) {
+            let st = status.trim();
+            if st.eq_ignore_ascii_case("INACTIVE")
+                || st.eq_ignore_ascii_case("DELETED")
+                || st.eq_ignore_ascii_case("DISABLED")
+                || st.eq_ignore_ascii_case("ARCHIVED")
+            {
+                return false;
+            }
+        }
+        if inner
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .is_some_and(|rt| rt.trim().eq_ignore_ascii_case("FEE_HEAD"))
+        {
+            return false;
+        }
+
+        let mut branches = Vec::new();
+        collect_branch_values(inner.get("sthaniyaBranch"), &mut branches);
+        collect_branch_values(inner.get("SanghBranch"), &mut branches);
+        collect_branch_values(inner.get("sanghBranch"), &mut branches);
+        branches.iter().any(|b| branch_matches(b, sangh_branch))
+    })
+}
+
 fn branch_unavailable_response(request_id: String) -> HttpResponse {
     HttpResponse::BadRequest().json(ApiErrorResponse {
         success: false,
@@ -1354,6 +1493,18 @@ fn branch_unavailable_response(request_id: String) -> HttpResponse {
             code: "BRANCH_UNAVAILABLE".to_string(),
             message: "branch unavailable".to_string(),
             details: vec!["branch unavailable".to_string()],
+        },
+        request_id,
+    })
+}
+
+fn vehicle_mismatch_response(request_id: String, detail: String) -> HttpResponse {
+    HttpResponse::BadRequest().json(ApiErrorResponse {
+        success: false,
+        error: ApiErrorDetails {
+            code: "VEHICLE_MISMATCH".to_string(),
+            message: "vehicleId and vehicleNumber do not match the same vehicle".to_string(),
+            details: vec![detail],
         },
         request_id,
     })
@@ -1567,40 +1718,88 @@ where
 // 4. API Endpoints
 // =========================================================================
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VehicleBillingDetailsError {
+    VehicleMismatch { detail: String },
+    BranchUnavailable,
+}
+
+fn build_vehicle_mismatch_detail(
+    q_id: &str,
+    q_num: &str,
+    conflict_inner: &Value,
+) -> String {
+    let (found_id, found_num) = extract_vehicle_id_and_number(conflict_inner);
+    format!(
+        "Requested vehicleId '{}' and vehicleNumber '{}' do not belong to the same vehicle (found vehicleId: '{}', vehicleNumber: '{}')",
+        q_id,
+        q_num,
+        found_id.as_deref().unwrap_or("unknown"),
+        found_num.as_deref().unwrap_or("unknown")
+    )
+}
+
 async fn resolve_single_vehicle_billing_details(
     q_id: &str,
     q_num: &str,
     q_norm: &str,
     tqms_vehicle: Option<Value>,
-    required_branch: &str,
+    requested_branch: &str,
     s_data: &ServerData,
-) -> Result<VehicleBillingDetails, String> {
+) -> Result<VehicleBillingDetails, VehicleBillingDetailsError> {
     let q_id_i64 = q_id.parse::<i64>().ok();
     let q_id_u64 = q_id.parse::<u64>().ok();
 
-    let (resolved_outcome, cache_update) = {
+    if let Some(ref fresh_inner) = tqms_vehicle {
+        let id_ok = vehicle_inner_matches_id(fresh_inner, q_id, q_id_i64, q_id_u64);
+        let num_ok = vehicle_inner_matches_number(fresh_inner, q_norm, true);
+        if !(id_ok && num_ok) {
+            return Err(VehicleBillingDetailsError::VehicleMismatch {
+                detail: build_vehicle_mismatch_detail(q_id, q_num, fresh_inner),
+            });
+        }
+    }
+
+    let ((resolved_outcome, has_sangh_rules), cache_update) = {
         let cache = s_data.cache.read().await;
+        let default_sangh = crate::settings::resolve_tqms_sangh_branch_from_cache(&cache)
+            .unwrap_or_else(|| REQUIRED_STHANIYA_BRANCH.to_string());
+        let has_sangh_rules = has_billing_rule_for_sangh(&cache, requested_branch, &default_sangh);
+
         let vehicles_map = cache.cache.get(&ResourceName::VehicleResource);
 
         let mut matched_cached: Option<&DatabaseResource> = None;
         let mut cached_is_blacklisted = false;
+        let mut partial_by_id: Option<&Value> = None;
+        let mut partial_by_num: Option<&Value> = None;
 
         if let Some(m) = vehicles_map {
             for res in m.values() {
                 let Some(inner) = res.inner_content.as_ref() else {
                     continue;
                 };
-                if vehicle_inner_matches(inner, q_id, q_id_i64, q_id_u64, q_norm, true) {
+                let id_ok = vehicle_inner_matches_id(inner, q_id, q_id_i64, q_id_u64);
+                let num_ok = vehicle_inner_matches_number(inner, q_norm, true);
+                if id_ok && num_ok {
                     if matched_cached.is_none() {
                         matched_cached = Some(res);
                     }
                     if !cached_is_blacklisted && is_vehicle_blacklisted(inner) {
                         cached_is_blacklisted = true;
                     }
-                    if matched_cached.is_some() && cached_is_blacklisted {
-                        break;
-                    }
+                } else if id_ok && partial_by_id.is_none() {
+                    partial_by_id = Some(inner);
+                } else if num_ok && partial_by_num.is_none() {
+                    partial_by_num = Some(inner);
                 }
+            }
+        }
+
+        if tqms_vehicle.is_none() && matched_cached.is_none() {
+            if let Some(conflict) = partial_by_num.or(partial_by_id) {
+                return Err(VehicleBillingDetailsError::VehicleMismatch {
+                    detail: build_vehicle_mismatch_detail(q_id, q_num, conflict),
+                });
             }
         }
 
@@ -1647,6 +1846,7 @@ async fn resolve_single_vehicle_billing_details(
         let outcome = resolved_inner.map(|inner| {
             let actual_id = inner
                 .get("VehicleId")
+                .or_else(|| inner.get("vehicleId"))
                 .and_then(|v| {
                     v.as_str()
                         .map(String::from)
@@ -1657,6 +1857,7 @@ async fn resolve_single_vehicle_billing_details(
 
             let actual_num = inner
                 .get("VehicleNumber")
+                .or_else(|| inner.get("vehicleNumber"))
                 .and_then(Value::as_str)
                 .unwrap_or(q_num)
                 .to_string();
@@ -1669,7 +1870,7 @@ async fn resolve_single_vehicle_billing_details(
             (inner, actual_id, actual_num, cached_is_blacklisted, history)
         });
 
-        (outcome, cache_update)
+        ((outcome, has_sangh_rules), cache_update)
     };
 
     if let Some((cache_id, updated_res)) = cache_update {
@@ -1685,16 +1886,20 @@ async fn resolve_single_vehicle_billing_details(
         return Ok(VehicleBillingDetails {
             vehicle_id: q_id.to_string(),
             vehicle_number: q_num.to_string(),
+            sthaniya_branch: Some(requested_branch.to_string()),
             vehicle_status: "NOT_FOUND".to_string(),
             owners: None,
             fees: vec![],
             payment_history: vec![],
+            is_sample_billing_data: None,
+            sample_source_branch: None,
+            message: None,
         });
     };
 
-    if !vehicle_has_sangh_branch(&inner, required_branch) {
-        return Err("branch unavailable".to_string());
-    }
+    let Some(matched_branch) = find_matching_vehicle_sangh_branch(&inner, requested_branch) else {
+        return Err(VehicleBillingDetailsError::BranchUnavailable);
+    };
 
     let is_deregistered = inner
         .get("Registration")
@@ -1722,13 +1927,31 @@ async fn resolve_single_vehicle_billing_details(
         vec![]
     };
 
+    let (is_sample_billing_data, sample_source_branch, message) = if is_eligible && !has_sangh_rules
+    {
+        (
+            Some(true),
+            Some(REQUIRED_STHANIYA_BRANCH.to_string()),
+            Some(format!(
+                "Billing rule is not setup for sangh '{}', so sample billing data of '{}' has been displayed.",
+                matched_branch, REQUIRED_STHANIYA_BRANCH
+            )),
+        )
+    } else {
+        (None, None, None)
+    };
+
     Ok(VehicleBillingDetails {
         vehicle_id: actual_id,
         vehicle_number: actual_num,
+        sthaniya_branch: Some(matched_branch),
         vehicle_status,
         owners,
         fees,
         payment_history: history,
+        is_sample_billing_data,
+        sample_source_branch,
+        message,
     })
 }
 
@@ -1772,29 +1995,19 @@ pub async fn get_vehicle_billing_details(
         });
     }
 
-    let required_branch = {
-        let cache = s_data.cache.read().await;
-        crate::settings::resolve_tqms_sangh_branch_from_cache(&cache)
-    }
-    .unwrap_or_else(|| REQUIRED_STHANIYA_BRANCH.to_string());
-
     if body
         .vehicles
         .iter()
-        .any(|q| q.sthaniya_branch.trim() != required_branch)
+        .any(|q| q.sthaniya_branch.trim().is_empty())
     {
         return HttpResponse::BadRequest().json(ApiErrorResponse {
             success: false,
             error: ApiErrorDetails {
                 code: "INVALID_REQUEST".to_string(),
-                message: format!(
-                    "Invalid sthaniyaBranch: only '{}' is supported",
-                    required_branch
-                ),
-                details: vec![format!(
-                    "Every vehicle entry must specify sthaniyaBranch as '{}'",
-                    required_branch
-                )],
+                message: "sthaniyaBranch is required for every vehicle query".to_string(),
+                details: vec![
+                    "Every vehicle entry must include a non-empty sthaniyaBranch".to_string(),
+                ],
             },
             request_id: req_id,
         });
@@ -1806,6 +2019,7 @@ pub async fn get_vehicle_billing_details(
         let q_id = query.vehicle_id.trim();
         let q_num = query.vehicle_number.trim();
         let q_norm = normalize_vehicle_number(q_num);
+        let q_branch = query.sthaniya_branch.trim();
 
         // Fetch freshest vehicle data from TQMS without holding any cache lock across await.
         let tqms_vehicle = match s_data
@@ -1829,13 +2043,18 @@ pub async fn get_vehicle_billing_details(
             q_num,
             &q_norm,
             tqms_vehicle,
-            &required_branch,
+            q_branch,
             &s_data,
         )
         .await
         {
             Ok(details) => results.push(details),
-            Err(_) => return branch_unavailable_response(req_id),
+            Err(VehicleBillingDetailsError::VehicleMismatch { detail }) => {
+                return vehicle_mismatch_response(req_id, detail)
+            }
+            Err(VehicleBillingDetailsError::BranchUnavailable) => {
+                return branch_unavailable_response(req_id)
+            }
         }
     }
 
@@ -6712,10 +6931,80 @@ mod tests {
             serde_json::from_slice(&bytes_ok).unwrap();
         assert_eq!(parsed_ok.data.len(), 2);
         assert_eq!(parsed_ok.data[0].vehicle_status, "ELIGIBLE");
+        assert_eq!(
+            parsed_ok.data[0].sthaniya_branch.as_deref(),
+            Some("Loadboard sthaniya")
+        );
+        assert_eq!(parsed_ok.data[0].is_sample_billing_data, None);
+        assert_eq!(parsed_ok.data[0].message, None);
         assert_eq!(parsed_ok.data[1].vehicle_status, "ELIGIBLE");
+        assert_eq!(parsed_ok.data[1].is_sample_billing_data, None);
 
-        // 2. Invalid / empty / wrong-case sthaniyaBranch in request throws 400 INVALID_REQUEST
-        for bad_branch in ["Lumbini sangh", "", "   ", "loadboard sthaniya"] {
+        // 2. Non-Loadboard valid branch in Vehicle's SanghBranch without billing rules
+        // returns 200 OK with Loadboard sthaniya sample billing data and explicit notice
+        let req_non_loadboard = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let body_non_loadboard: GetVehicleBillingDetailsRequest = serde_json::from_str(
+            r#"{
+                "vehicles": [
+                    {
+                        "vehicleId": "24631",
+                        "sthaniyaBranch": "Lumbini Truck Yatayat Byawasayi Sangh",
+                        "vehicleNumber": "Province-0-55-744-CA-8536"
+                    },
+                    {
+                        "vehicleId": "24632",
+                        "sthaniyaBranch": "Lumbini sangh",
+                        "vehicleNumber": "BA-01-PA-2463"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let resp_non_loadboard = get_vehicle_billing_details(
+            req_non_loadboard,
+            web::Json(body_non_loadboard),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_non_loadboard.status(), StatusCode::OK);
+        let bytes_non_loadboard = actix_web::body::to_bytes(resp_non_loadboard.into_body())
+            .await
+            .unwrap();
+        let parsed_non_loadboard: ApiResponse<Vec<VehicleBillingDetails>> =
+            serde_json::from_slice(&bytes_non_loadboard).unwrap();
+        assert_eq!(parsed_non_loadboard.data.len(), 2);
+        assert_eq!(parsed_non_loadboard.data[0].vehicle_status, "ELIGIBLE");
+        assert_eq!(
+            parsed_non_loadboard.data[0].sthaniya_branch.as_deref(),
+            Some("Lumbini Truck Yatayat Byawasayi Sangh")
+        );
+        assert_eq!(parsed_non_loadboard.data[0].fees.len(), 2);
+        assert_eq!(parsed_non_loadboard.data[0].is_sample_billing_data, Some(true));
+        assert_eq!(
+            parsed_non_loadboard.data[0].sample_source_branch.as_deref(),
+            Some("Loadboard sthaniya")
+        );
+        assert!(parsed_non_loadboard.data[0]
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
+                && m.contains("Loadboard sthaniya")));
+        assert_eq!(parsed_non_loadboard.data[1].vehicle_status, "ELIGIBLE");
+        assert_eq!(
+            parsed_non_loadboard.data[1].sthaniya_branch.as_deref(),
+            Some("Lumbini sangh")
+        );
+        assert_eq!(parsed_non_loadboard.data[1].fees.len(), 2);
+        assert_eq!(parsed_non_loadboard.data[1].is_sample_billing_data, Some(true));
+        assert_eq!(
+            parsed_non_loadboard.data[1].sample_source_branch.as_deref(),
+            Some("Loadboard sthaniya")
+        );
+
+        // 3. Empty / whitespace sthaniyaBranch in request throws 400 INVALID_REQUEST
+        for bad_branch in ["", "   "] {
             let req_bad = actix_web::test::TestRequest::post()
                 .insert_header(("Authorization", "Bearer lodbod-service-secret"))
                 .to_http_request();
@@ -6751,7 +7040,30 @@ mod tests {
         )
         .is_err());
 
-        // 3. Vehicle without "Loadboard sthaniya" in SanghBranch (only other branches) throws 400 BRANCH_UNAVAILABLE
+        // 4. Branch not present in vehicle's SanghBranch throws 400 BRANCH_UNAVAILABLE
+        let req_unrelated_branch = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_unrelated = get_vehicle_billing_details(
+            req_unrelated_branch,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24631".to_string(),
+                    sthaniya_branch: "Unrelated Branch".to_string(),
+                    vehicle_number: "Province-0-55-744-CA-8536".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_unrelated.status(), StatusCode::BAD_REQUEST);
+        let bytes_unrelated = actix_web::body::to_bytes(resp_unrelated.into_body())
+            .await
+            .unwrap();
+        let err_unrelated: ApiErrorResponse = serde_json::from_slice(&bytes_unrelated).unwrap();
+        assert_eq!(err_unrelated.error.code, "BRANCH_UNAVAILABLE");
+
+        // 5. Vehicle without "Loadboard sthaniya" in SanghBranch throws 400 BRANCH_UNAVAILABLE when requesting Loadboard sthaniya
         let req_other = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
             .to_http_request();
@@ -6773,7 +7085,7 @@ mod tests {
         assert_eq!(err_other.error.code, "BRANCH_UNAVAILABLE");
         assert_eq!(err_other.error.message, "branch unavailable");
 
-        // 4. Vehicle omitting SanghBranch key altogether throws 400 BRANCH_UNAVAILABLE
+        // 6. Vehicle omitting SanghBranch key altogether throws 400 BRANCH_UNAVAILABLE
         let req_missing = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
             .to_http_request();
@@ -6796,6 +7108,238 @@ mod tests {
         let err_missing: ApiErrorResponse = serde_json::from_slice(&bytes_missing).unwrap();
         assert_eq!(err_missing.error.code, "BRANCH_UNAVAILABLE");
         assert_eq!(err_missing.error.message, "branch unavailable");
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_rejects_vehicle_id_number_mismatch() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            100,
+            DatabaseResource {
+                id: Some(100),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24631,
+                    "VehicleNumber": "Province-0-55-744-CA-8536",
+                    "VehicleType": "Truck",
+                    "SanghBranch": "Loadboard sthaniya, Lumbini Truck Yatayat Byawasayi Sangh",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Owner One", "Phone": "9800000001" }]
+                })),
+                external_content: None,
+            },
+        );
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            101,
+            DatabaseResource {
+                id: Some(101),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 99999,
+                    "VehicleNumber": "BA-01-PA-2463",
+                    "VehicleType": "Bus",
+                    "SanghBranch": "Loadboard sthaniya",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Owner Two", "Phone": "9800000002" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. Valid vehicleNumber + wrong vehicleId in endpoint
+        let req1 = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp1 = get_vehicle_billing_details(
+            req1,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "11111".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
+                    vehicle_number: "Province-0-55-744-CA-8536".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp1.status(), StatusCode::BAD_REQUEST);
+        let bytes1 = actix_web::body::to_bytes(resp1.into_body()).await.unwrap();
+        let err1: ApiErrorResponse = serde_json::from_slice(&bytes1).unwrap();
+        assert_eq!(err1.error.code, "VEHICLE_MISMATCH");
+
+        // 2. Valid vehicleId + wrong vehicleNumber in endpoint
+        let req2 = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp2 = get_vehicle_billing_details(
+            req2,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24631".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
+                    vehicle_number: "NA-99-PA-9999".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let bytes2 = actix_web::body::to_bytes(resp2.into_body()).await.unwrap();
+        let err2: ApiErrorResponse = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(err2.error.code, "VEHICLE_MISMATCH");
+
+        // 3. vehicleId of Vehicle A paired with vehicleNumber of Vehicle B
+        let req3 = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp3 = get_vehicle_billing_details(
+            req3,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24631".to_string(),
+                    sthaniya_branch: REQUIRED_STHANIYA_BRANCH.to_string(),
+                    vehicle_number: "BA-01-PA-2463".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+        let bytes3 = actix_web::body::to_bytes(resp3.into_body()).await.unwrap();
+        let err3: ApiErrorResponse = serde_json::from_slice(&bytes3).unwrap();
+        assert_eq!(err3.error.code, "VEHICLE_MISMATCH");
+
+        // 4. Fresh TQMS vehicle matching number but conflicting ID returns VehicleMismatch
+        let fresh_tqms = serde_json::json!({
+            "VehicleId": 24631,
+            "VehicleNumber": "Province-0-55-744-CA-8536",
+            "SanghBranch": "Loadboard sthaniya",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "Fresh TQMS Owner", "Phone": "9800000001" }]
+        });
+        let mismatch_err = resolve_single_vehicle_billing_details(
+            "77777",
+            "Province-0-55-744-CA-8536",
+            "PROVINCE055744CA8536",
+            Some(fresh_tqms),
+            REQUIRED_STHANIYA_BRANCH,
+            &s_data,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            mismatch_err,
+            VehicleBillingDetailsError::VehicleMismatch { .. }
+        ));
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_billing_details_non_loadboard_branch_with_and_without_rules() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            100,
+            DatabaseResource {
+                id: Some(100),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 24631,
+                    "VehicleNumber": "Province-0-55-744-CA-8536",
+                    "VehicleType": "Truck",
+                    "SanghBranch": "Loadboard sthaniya, Lumbini Truck Yatayat Byawasayi Sangh",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Owner One", "Phone": "9800000001" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. Without billing rule for "Lumbini Truck Yatayat Byawasayi Sangh":
+        // displays sample billing data of "Loadboard sthaniya" with explicit notice
+        let req_without_rules = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_without_rules = get_vehicle_billing_details(
+            req_without_rules,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24631".to_string(),
+                    sthaniya_branch: "Lumbini Truck Yatayat Byawasayi Sangh".to_string(),
+                    vehicle_number: "Province-0-55-744-CA-8536".to_string(),
+                }],
+            }),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_without_rules.status(), StatusCode::OK);
+        let bytes_without = actix_web::body::to_bytes(resp_without_rules.into_body())
+            .await
+            .unwrap();
+        let parsed_without: ApiResponse<Vec<VehicleBillingDetails>> =
+            serde_json::from_slice(&bytes_without).unwrap();
+        assert_eq!(parsed_without.data.len(), 1);
+        assert_eq!(parsed_without.data[0].vehicle_status, "ELIGIBLE");
+        assert_eq!(parsed_without.data[0].fees.len(), 2);
+        assert_eq!(parsed_without.data[0].is_sample_billing_data, Some(true));
+        assert_eq!(
+            parsed_without.data[0].sample_source_branch.as_deref(),
+            Some("Loadboard sthaniya")
+        );
+        assert!(parsed_without.data[0]
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
+                && m.contains("Loadboard sthaniya")));
+
+        // 2. Seed an active BILLING_RULE for "Lumbini Truck Yatayat Byawasayi Sangh"
+        s_data.cache.write().await.write(
+            ResourceName::BillingRuleResource,
+            501,
+            DatabaseResource {
+                id: Some(501),
+                resource_name: Some(ResourceName::BillingRuleResource),
+                inner_content: Some(serde_json::json!({
+                    "scope": "COMMON",
+                    "amount": 500,
+                    "status": "ACTIVE",
+                    "fiscalYear": "2083/2084",
+                    "resourceType": "BILLING_RULE",
+                    "sthaniyaBranch": "Lumbini Truck Yatayat Byawasayi Sangh"
+                })),
+                external_content: None,
+            },
+        );
+
+        let req_with_rules = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+            .to_http_request();
+        let resp_with_rules = get_vehicle_billing_details(
+            req_with_rules,
+            web::Json(GetVehicleBillingDetailsRequest {
+                vehicles: vec![LodbodVehicleQuery {
+                    vehicle_id: "24631".to_string(),
+                    sthaniya_branch: "Lumbini Truck Yatayat Byawasayi Sangh".to_string(),
+                    vehicle_number: "Province-0-55-744-CA-8536".to_string(),
+                }],
+            }),
+            s_data,
+        )
+        .await;
+        assert_eq!(resp_with_rules.status(), StatusCode::OK);
+        let bytes_with = actix_web::body::to_bytes(resp_with_rules.into_body())
+            .await
+            .unwrap();
+        let parsed_with: ApiResponse<Vec<VehicleBillingDetails>> =
+            serde_json::from_slice(&bytes_with).unwrap();
+        assert_eq!(parsed_with.data.len(), 1);
+        assert_eq!(parsed_with.data[0].vehicle_status, "ELIGIBLE");
+        assert_eq!(parsed_with.data[0].is_sample_billing_data, None);
+        assert_eq!(parsed_with.data[0].sample_source_branch, None);
+        assert_eq!(parsed_with.data[0].message, None);
     }
 
     #[test]
