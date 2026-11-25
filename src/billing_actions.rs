@@ -1933,7 +1933,7 @@ async fn resolve_single_vehicle_billing_details(
             Some(true),
             Some(REQUIRED_STHANIYA_BRANCH.to_string()),
             Some(format!(
-                "Billing rule is not setup for sangh '{}', so sample billing data of '{}' has been displayed.",
+                "This is a placeholder fee heads, but there are no billing rules setup for this sangh ({}). Showing fee heads of {}.",
                 matched_branch, REQUIRED_STHANIYA_BRANCH
             )),
         )
@@ -6989,7 +6989,9 @@ mod tests {
         assert!(parsed_non_loadboard.data[0]
             .message
             .as_deref()
-            .is_some_and(|m| m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
+            .is_some_and(|m| m
+                .contains("This is a placeholder fee heads, but there are no billing rules setup for this sangh")
+                && m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
                 && m.contains("Loadboard sthaniya")));
         assert_eq!(parsed_non_loadboard.data[1].vehicle_status, "ELIGIBLE");
         assert_eq!(
@@ -7002,6 +7004,13 @@ mod tests {
             parsed_non_loadboard.data[1].sample_source_branch.as_deref(),
             Some("Loadboard sthaniya")
         );
+        assert!(parsed_non_loadboard.data[1]
+            .message
+            .as_deref()
+            .is_some_and(|m| m
+                .contains("This is a placeholder fee heads, but there are no billing rules setup for this sangh")
+                && m.contains("Lumbini sangh")
+                && m.contains("Loadboard sthaniya")));
 
         // 3. Empty / whitespace sthaniyaBranch in request throws 400 INVALID_REQUEST
         for bad_branch in ["", "   "] {
@@ -7284,6 +7293,8 @@ mod tests {
         assert_eq!(parsed_without.data.len(), 1);
         assert_eq!(parsed_without.data[0].vehicle_status, "ELIGIBLE");
         assert_eq!(parsed_without.data[0].fees.len(), 2);
+        assert_eq!(parsed_without.data[0].fees[0].fee_id, "FEE-01");
+        assert_eq!(parsed_without.data[0].fees[1].fee_id, "FEE-02");
         assert_eq!(parsed_without.data[0].is_sample_billing_data, Some(true));
         assert_eq!(
             parsed_without.data[0].sample_source_branch.as_deref(),
@@ -7292,7 +7303,9 @@ mod tests {
         assert!(parsed_without.data[0]
             .message
             .as_deref()
-            .is_some_and(|m| m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
+            .is_some_and(|m| m
+                .contains("This is a placeholder fee heads, but there are no billing rules setup for this sangh")
+                && m.contains("Lumbini Truck Yatayat Byawasayi Sangh")
                 && m.contains("Loadboard sthaniya")));
 
         // 2. Seed an active BILLING_RULE for "Lumbini Truck Yatayat Byawasayi Sangh"
