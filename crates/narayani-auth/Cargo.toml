@@ -1,0 +1,12 @@
+[package]
+name = "narayani-auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+narayani-core.workspace = true
+narayani-settings.workspace = true
+jsonwebtoken.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true

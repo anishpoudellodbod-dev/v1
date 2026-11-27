@@ -6,31 +6,32 @@ use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 mod db;
 mod login;
 use crate::db::{connect_to_db, Database};
-use crate::resource::{DatabaseResource, ResourceName::VehicleResource};
+use crate::resource::DatabaseResource;
 mod actions;
 mod auth;
 mod cache;
 mod middleware;
-mod resource;
-mod roles;
+pub use narayani_core::{resource, roles};
 mod tqms_integration;
 pub mod billing_actions;
 pub mod dashboard_statistics;
 pub mod members;
 mod api_stream;
-pub mod date;
+pub use narayani_date as date;
 pub mod log;
 pub mod audit;
 pub mod sms;
 pub mod access;
 pub mod settings;
 pub mod permissions;
+pub mod reports;
 pub mod vehicle_history;
-pub mod vehicle_number;
+pub mod file_upload;
+pub use narayani_plate as vehicle_number;
 
 #[derive(Clone)]
 pub struct ServerData {
@@ -141,6 +142,22 @@ pub async fn server_routes(s_data: web::Data<Arc<ServerData>>) -> HttpResponse {
             "method: GET,       api/v1/settings/fiscal-year/selector",
             "method: GET,       api/v1/settings/fiscal-year/access/{fiscal_year}",
             "method: GET,       api/v1/settings/vehicle-management/displaced-tagging",
+            "method: GET,       api/v1/reports/filter-options",
+            "method: GET,       api/v1/reports/income",
+            "method: GET,       api/v1/reports/income/export",
+            "method: GET,       api/v1/reports/fee-head-wise",
+            "method: GET,       api/v1/reports/fee-head-wise/export",
+            "method: GET,       api/v1/reports/vehicle-category",
+            "method: GET,       api/v1/reports/vehicle-category/export",
+            "method: POST,      api/v1/reports/mahasang",
+            "method: GET,       api/v1/reports/mahasang",
+            "method: POST,      api/v1/reports/mahasang/export",
+            "method: GET,       api/v1/reports/member-transactions/search",
+            "method: GET,       api/v1/reports/member-transactions/{vehicle_key}",
+            "method: GET,       api/v1/reports/member-transactions/{vehicle_key}/export",
+            "method: POST,      api/v1/files/upload",
+            "method: GET,       files/{filename}",
+            "method: GET,       uploads/{filename}",
         ]
         .into_iter()
         .map(String::from),
@@ -441,6 +458,9 @@ async fn main() -> std::io::Result<()> {
     if let Err(e) = db.create_tables().await {
         eprintln!("Error creating tables: {}", e);
     }
+    if let Err(e) = db.create_report_tables().await {
+        eprintln!("Error creating report projection tables: {}", e);
+    }
     create_admin_user_if_not_exists(&db).await;
     add_sthaniya_branch_to_billing_rule_resources(&db).await;
     migrate_fiscal_year_id_to_fiscal_year(&db).await;
@@ -449,6 +469,11 @@ async fn main() -> std::io::Result<()> {
     println!("Loading cache from database...");
     cache.load_from_db(&db).await;
     println!("Cache loaded from database");
+    match db.backfill_report_tables_if_empty(&cache.report_index).await {
+        Ok(0) => {}
+        Ok(count) => println!("Backfilled {count} receipts into report_receipts"),
+        Err(e) => eprintln!("Warning: report_receipts startup backfill skipped: {e}"),
+    }
     let tqms_client = Arc::new(tqms_integration::TQMSClient::new().await);
     let server_data = ServerData {
         db: Arc::new(db),
@@ -466,7 +491,7 @@ async fn main() -> std::io::Result<()> {
         Some(server_data.cache.clone()),
     )
     .await;
-    let tls_config = load_tls_config()?;
+    let _tls_config = load_tls_config()?;
     let app_port = env::var("APP_PORT").unwrap_or_else(|_| "5001".to_owned());
     println!("Starting server on port {}", app_port);
     // Create and start HTTPS server
@@ -656,6 +681,15 @@ async fn main() -> std::io::Result<()> {
                     .configure(settings::configure_routes),
             )
             .service(
+                web::scope("/api/v1/reports")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .configure(reports::configure_routes),
+            )
+            .service(
                 web::scope("/api/v1/logs")
                     .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin))
                     .configure(log::configure_routes),
@@ -664,6 +698,18 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/audit")
                     .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin))
                     .configure(audit::configure_routes),
+            )
+            .route("/files/{filename}", web::get().to(file_upload::serve_public_file))
+            .route("/uploads/{filename}", web::get().to(file_upload::serve_public_file))
+            .service(
+                web::scope("/api/v1/files")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .app_data(web::PayloadConfig::new(26 * 1024 * 1024))
+                    .route("/upload", web::post().to(file_upload::upload_file)),
             )
             .service(
                 web::scope("/api/v1")

@@ -45,11 +45,11 @@ pub struct BillLogEntry {
     pub rolled_back_by: Option<String>,
 }
 
-static LOG_STORE: OnceLock<RwLock<Vec<BillLogEntry>>> = OnceLock::new();
+static LOG_STORE: OnceLock<RwLock<narayani_storage::RingBuffer<BillLogEntry>>> = OnceLock::new();
 static LOG_COUNTER: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
 
-pub fn get_log_store() -> &'static RwLock<Vec<BillLogEntry>> {
-    LOG_STORE.get_or_init(|| RwLock::new(Vec::new()))
+pub fn get_log_store() -> &'static RwLock<narayani_storage::RingBuffer<BillLogEntry>> {
+    LOG_STORE.get_or_init(|| RwLock::new(narayani_storage::RingBuffer::with_capacity(narayani_storage::MAX_LOG_ENTRIES)))
 }
 
 pub fn generate_log_id() -> String {
@@ -68,7 +68,7 @@ pub fn add_log(entry: BillLogEntry) {
 
 pub fn get_all_logs() -> Vec<BillLogEntry> {
     let store = get_log_store().read().unwrap();
-    store.clone()
+    store.to_vec()
 }
 
 pub fn get_log_by_id(log_id: &str) -> Option<BillLogEntry> {

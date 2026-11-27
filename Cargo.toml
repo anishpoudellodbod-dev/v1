@@ -1,17 +1,32 @@
-[package]
-name = "v1"
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/narayani-core",
+    "crates/narayani-plate",
+    "crates/narayani-date",
+    "crates/narayani-settings",
+    "crates/narayani-auth",
+    "crates/narayani-vehicle-history",
+    "crates/narayani-storage",
+    "crates/narayani-integrations",
+    "crates/narayani-billing",
+    "crates/narayani-analytics",
+    "crates/narayani-file-upload",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+[workspace.dependencies]
 actix-web = { version = "4.3.1", features = ["rustls-0_21"] }
 actix-cors = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-tokio = { version = "1.32", features = ["full"] }
+tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
 dotenv = "0.15"
 jsonwebtoken = "9.2"
-futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-postgres = { version = "0.7.8", features = ["with-serde_json-1"] }
 reqwest = { version = "0.12", features = ["json"] }
@@ -20,3 +35,61 @@ anyhow = "1.0.104"
 bytes = "1"
 rustls = "0.21"
 rustls-pemfile = "1"
+unicode-normalization = "0.1.26"
+rust_xlsxwriter = "0.104.0"
+csv = "1.4.0"
+narayani-core = { path = "crates/narayani-core" }
+narayani-plate = { path = "crates/narayani-plate" }
+narayani-date = { path = "crates/narayani-date" }
+narayani-settings = { path = "crates/narayani-settings" }
+narayani-auth = { path = "crates/narayani-auth" }
+narayani-vehicle-history = { path = "crates/narayani-vehicle-history" }
+narayani-storage = { path = "crates/narayani-storage" }
+narayani-integrations = { path = "crates/narayani-integrations" }
+narayani-billing = { path = "crates/narayani-billing" }
+narayani-analytics = { path = "crates/narayani-analytics" }
+narayani-file-upload = { path = "crates/narayani-file-upload" }
+
+[package]
+name = "v1"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+actix-web.workspace = true
+actix-cors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+dotenv.workspace = true
+jsonwebtoken.workspace = true
+chrono.workspace = true
+tokio-postgres.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+unicode-normalization.workspace = true
+rust_xlsxwriter.workspace = true
+csv.workspace = true
+narayani-core.workspace = true
+narayani-plate.workspace = true
+narayani-date.workspace = true
+narayani-settings.workspace = true
+narayani-auth.workspace = true
+narayani-vehicle-history.workspace = true
+narayani-storage.workspace = true
+narayani-integrations.workspace = true
+narayani-billing.workspace = true
+narayani-analytics.workspace = true
+narayani-file-upload.workspace = true
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = 0

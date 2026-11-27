@@ -1,0 +1,17 @@
+[package]
+name = "narayani-billing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+narayani-core.workspace = true
+narayani-plate.workspace = true
+narayani-date.workspace = true
+narayani-settings.workspace = true
+narayani-vehicle-history.workspace = true
+narayani-storage.workspace = true
+narayani-integrations.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true

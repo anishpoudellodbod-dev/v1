@@ -1,0 +1,6 @@
+[package]
+name = "narayani-plate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

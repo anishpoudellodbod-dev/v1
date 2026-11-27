@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::mpsc;
 
 pub const AUDIT_SCHEMA_VERSION: u32 = 1;
-const MAX_IN_MEMORY_AUDIT_ENTRIES: usize = 50_000;
+const MAX_IN_MEMORY_AUDIT_ENTRIES: usize = narayani_storage::MAX_AUDIT_ENTRIES;
 const DB_PERSIST_BATCH_SIZE: usize = 32;
 const MAX_DRAIN_PER_CYCLE: usize = 256;
 const MAX_DIFF_DEPTH: usize = 12;

@@ -15,6 +15,7 @@ pub enum ResourceName {
     ActionLogsResource,
     AuditTrailResource,
     VehicleHistoryResource,
+    FileResource,
 }
 
 impl ResourceName {
@@ -51,6 +52,8 @@ impl ResourceName {
             Some(Self::AuditTrailResource)
         } else if trimmed.eq_ignore_ascii_case("VehicleHistoryResource") {
             Some(Self::VehicleHistoryResource)
+        } else if trimmed.eq_ignore_ascii_case("FileResource") {
+            Some(Self::FileResource)
         } else {
             None
         }
@@ -102,6 +105,7 @@ impl ToString for ResourceName {
             ResourceName::ActionLogsResource => "ActionLogsResource".into(),
             ResourceName::AuditTrailResource => "AuditTrailResource".into(),
             ResourceName::VehicleHistoryResource => "VehicleHistoryResource".into(),
+            ResourceName::FileResource => "FileResource".into(),
         }
     }
 }
@@ -148,6 +152,7 @@ mod tests {
         assert_eq!(ResourceName::ActionLogsResource.to_string(), "ActionLogsResource");
         assert_eq!(ResourceName::AuditTrailResource.to_string(), "AuditTrailResource");
         assert_eq!(ResourceName::VehicleHistoryResource.to_string(), "VehicleHistoryResource");
+        assert_eq!(ResourceName::FileResource.to_string(), "FileResource");
     }
 
     #[test]
@@ -168,6 +173,7 @@ mod tests {
         assert_eq!(ResourceName::from("ActionLogsResource".to_string()), ResourceName::ActionLogsResource);
         assert_eq!(ResourceName::from("AuditTrailResource".to_string()), ResourceName::AuditTrailResource);
         assert_eq!(ResourceName::from("VehicleHistoryResource".to_string()), ResourceName::VehicleHistoryResource);
+        assert_eq!(ResourceName::from("FileResource".to_string()), ResourceName::FileResource);
     }
 
     #[test]
@@ -188,6 +194,7 @@ mod tests {
             ("ActionLogsResource", ResourceName::ActionLogsResource),
             ("AuditTrailResource", ResourceName::AuditTrailResource),
             ("VehicleHistoryResource", ResourceName::VehicleHistoryResource),
+            ("FileResource", ResourceName::FileResource),
         ];
 
         for (pascal, expected) in variants {

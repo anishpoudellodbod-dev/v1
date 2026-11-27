@@ -1,3 +1,4 @@
+use crate::access::PermissionErrorHttpExt;
 use crate::resource::{DatabaseResource, ResourceName};
 use crate::ServerData;
 use actix_web::{web, HttpResponse, HttpMessage};
@@ -777,6 +778,7 @@ async fn update_inner(
 
         cache.write(resource_name, id, updated_resource.clone());
     }
+    crate::reports::sync_report_projection(&s_data, resource_name, id, false).await;
 
     if resource_name == ResourceName::UserResource {
         if let Some(ref inner_content) = updated_resource.inner_content {
@@ -1208,6 +1210,7 @@ async fn write_inner(
             },
         );
     }
+    crate::reports::sync_report_projection(&s_data, resource_name, id, false).await;
 
     if resource_name == ResourceName::VehicleResource {
         if let Err(err) = crate::vehicle_history::record_vehicle_change(
@@ -1681,13 +1684,12 @@ async fn delete_inner(
         let mut cache = s_data.cache.write().await;
 
         //delete from cache
-        cache.cache.entry(resource_name).and_modify(|resources| {
-            resources.remove(&id);
-        });
+        cache.remove(resource_name, id);
         if resource_name == ResourceName::PermissionResource {
             cache.remove_role_policy_by_id(id);
         }
     }
+    crate::reports::sync_report_projection(&s_data, resource_name, id, true).await;
 
     if resource_name == ResourceName::UserResource {
         if let Err(err) = crate::access::delete_permission_for_user(&s_data, id).await {
