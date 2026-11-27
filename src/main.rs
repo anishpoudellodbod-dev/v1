@@ -29,6 +29,8 @@ pub mod sms;
 pub mod access;
 pub mod settings;
 pub mod permissions;
+pub mod vehicle_history;
+pub mod vehicle_number;
 
 #[derive(Clone)]
 pub struct ServerData {
@@ -554,7 +556,7 @@ async fn main() -> std::io::Result<()> {
                         web::get().to(dashboard_statistics::get_dashboard_statistics),
                     )
                     .route(
-                        "/statistics/{fiscal_year}",
+                        "/statistics/{fiscal_year:.*}",
                         web::get().to(dashboard_statistics::get_dashboard_statistics_by_fy),
                     )
                     .service(web::scope("/members").configure(members::configure_routes)),
@@ -634,6 +636,15 @@ async fn main() -> std::io::Result<()> {
                             .route(web::get().to(billing_actions::get_bill_logs_by_bill_id))
                             .wrap(middleware::AuthMiddleware::with_role(roles::Roles::Admin)),
                     ),
+            )
+            .service(
+                web::scope("/api/v1/vehicles/history")
+                    .wrap(middleware::AuthMiddleware::with_roles(&[
+                        roles::Roles::User,
+                        roles::Roles::Admin,
+                        roles::Roles::Operator,
+                    ]))
+                    .configure(vehicle_history::configure_routes),
             )
             .service(
                 web::scope("/api/v1/settings")

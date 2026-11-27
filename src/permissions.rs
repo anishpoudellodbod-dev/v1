@@ -198,6 +198,13 @@ pub const ACTION_CATALOG: &[ResourceActionCatalogEntry] = &[
         internal_only: false,
         immutable_write_blocked: true,
     },
+    ResourceActionCatalogEntry {
+        resource: "VehicleHistoryResource",
+        basic_actions: CRUD_BASIC,
+        domain_actions: NO_DOMAIN,
+        internal_only: false,
+        immutable_write_blocked: false,
+    },
 ];
 
 /// Returns PascalCase canonical resource name (fixes `VehicleResource::to_string()` returning `"vehicleresource"`).
@@ -217,6 +224,7 @@ pub fn canonical_resource_name(resource_name: ResourceName) -> &'static str {
         ResourceName::BranchResource => "BranchResource",
         ResourceName::ActionLogsResource => "ActionLogsResource",
         ResourceName::AuditTrailResource => "AuditTrailResource",
+        ResourceName::VehicleHistoryResource => "VehicleHistoryResource",
     }
 }
 
@@ -696,6 +704,14 @@ pub fn default_admin_policy(tenant_id: &str, actor_id: Option<i32>) -> RolePermi
         "AuditTrailResource".to_string(),
         svec(&[action::READ, action::EXPORT]),
     );
+    allow.insert(
+        "VehicleHistoryResource".to_string(),
+        svec(&[action::READ, action::CREATE, action::UPDATE]),
+    );
+    allow.insert(
+        "VehicleHistoryResource".to_string(),
+        svec(&[action::READ, action::CREATE, action::UPDATE]),
+    );
 
     let mut deny = BTreeMap::new();
     deny.insert("BillResource".to_string(), svec(&[action::DELETE]));
@@ -758,6 +774,8 @@ pub fn default_cashier_policy(
     allow.insert("BillingRuleResource".to_string(), svec(&[action::READ]));
     allow.insert("BillingEntityResource".to_string(), svec(&[action::READ]));
     allow.insert("ReportResource".to_string(), svec(&[action::READ]));
+    allow.insert("VehicleHistoryResource".to_string(), svec(&[action::READ]));
+    allow.insert("VehicleHistoryResource".to_string(), svec(&[action::READ]));
 
     RolePermissionPolicy {
         schema_version: PERMISSION_SCHEMA_VERSION.to_string(),
@@ -1946,9 +1964,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_action_catalog_covers_all_14_resources_and_custom_domain_actions() {
+    fn test_action_catalog_covers_all_15_resources_and_custom_domain_actions() {
         let catalog = action_catalog();
-        assert_eq!(catalog.len(), 14);
+        assert_eq!(catalog.len(), 15);
         assert!(is_valid_action_for_resource(
             "VehicleResource",
             "CONFIRM_NUMBER_CHANGE"
@@ -2137,7 +2155,7 @@ mod tests {
             tenant_id: Some("loadboard-sthaniya".to_string()),
         });
 
-        // 0. Catalog endpoint returns all 14 resources
+        // 0. Catalog endpoint returns all 15 resources
         let cat_resp = get_action_catalog().await;
         assert_eq!(cat_resp.status(), StatusCode::OK);
         let cat_body: Value = serde_json::from_slice(
@@ -2145,7 +2163,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cat_body["schemaVersion"], PERMISSION_SCHEMA_VERSION);
-        assert_eq!(cat_body["resources"].as_array().unwrap().len(), 14);
+        assert_eq!(cat_body["resources"].as_array().unwrap().len(), 15);
 
         // 1. Seed default Admin, Cashier ([1,2]), Viewer policies
         let seed_resp = seed_default_role_policies(

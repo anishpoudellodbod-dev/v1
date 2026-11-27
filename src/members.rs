@@ -1,8 +1,8 @@
 use crate::cache::Cache;
 use crate::dashboard_statistics::{
-    current_date, extract_bill_inferred_fiscal_year, extract_bill_period_start_fiscal_year,
-    extract_bill_vehicle, extract_member_timestamp, extract_string_or_int, get_cached_db_vehicles,
-    is_bill_ignored, is_member_displaced, normalize_vehicle_number, parse_fiscal_year_start,
+    current_date, extract_bill_vehicle, extract_member_timestamp, extract_string_or_int,
+    get_cached_db_vehicles, is_bill_ignored, is_member_displaced,
+    is_member_record_within_fiscal_year, normalize_vehicle_number, resolve_bill_fiscal_year,
     DashboardQuery, FiscalYearConfig, VehicleIndex, VehicleKey,
 };
 use crate::date::Date;
@@ -47,6 +47,9 @@ fn synthesize_external_vehicle_resource(inner: &Value) -> DatabaseResource {
 fn collect_displaced_vehicles(
     members: Vec<&DatabaseResource>,
     index: &VehicleIndex<'_>,
+    target_group_id: usize,
+    target_rank: Option<i64>,
+    fy_config: &FiscalYearConfig,
 ) -> Vec<DatabaseResource> {
     if members.is_empty() {
         return Vec::new();
@@ -58,6 +61,9 @@ fn collect_displaced_vehicles(
     > = HashMap::with_capacity(members.len());
 
     for member in members {
+        if !is_member_record_within_fiscal_year(member, target_group_id, target_rank, fy_config) {
+            continue;
+        }
         let Some(inner) = &member.inner_content else {
             continue;
         };
@@ -120,13 +126,22 @@ pub fn compute_members(
     let cached_vehicles: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::VehicleResource)
         .unwrap_or_default();
+    let vehicle_histories: Vec<&DatabaseResource> = cache
+        .read_all(ResourceName::VehicleHistoryResource)
+        .unwrap_or_default();
 
-    let mut index = VehicleIndex::build(&cached_vehicles, db_vehicles);
+    let mut index =
+        VehicleIndex::build_with_history(&cached_vehicles, db_vehicles, &vehicle_histories);
 
     let settings: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::SettingResource)
         .unwrap_or_default();
     let mut fy_config = FiscalYearConfig::from_settings(&settings);
+
+    let billing_rules: Vec<&DatabaseResource> = cache
+        .read_all(ResourceName::BillingRuleResource)
+        .unwrap_or_default();
+    fy_config.apply_billing_rules(&billing_rules);
 
     let bills: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::BillResource)
@@ -145,48 +160,12 @@ pub fn compute_members(
 
         let (v_id, v_num) = extract_bill_vehicle(inner);
         let norm_num = v_num.and_then(normalize_vehicle_number);
-        index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
+        if v_id.is_some() || norm_num.is_some() {
+            index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
+        }
 
-        let bill_fy_raw = extract_string_or_int(inner.get("fiscalYearId"))
-            .or_else(|| extract_string_or_int(inner.get("fiscalYear")));
-
-        let resolved_bill_fy = if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
-            if let Some(fy) = bill_fy_raw {
-                let conflicting_setting = parse_fiscal_year_start(&period_fy).is_some_and(|y| {
-                    fy_config
-                        .setting_year_to_id
-                        .get(&y)
-                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(&fy))
-                });
-                if !conflicting_setting {
-                    fy_config.register_group(&period_fy, &[fy, period_fy.clone()]);
-                } else {
-                    fy_config.register_group(&period_fy, &[period_fy.clone()]);
-                }
-            } else {
-                fy_config.register_group(&period_fy, &[period_fy.clone()]);
-            }
-            period_fy
-        } else if let Some(bill_fy) = bill_fy_raw {
-            if parse_fiscal_year_start(&bill_fy).is_none() && !fy_config.has_ranked_group(&bill_fy) {
-                if let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) {
-                    let conflicting_setting = parse_fiscal_year_start(&inferred_fy).is_some_and(|y| {
-                        fy_config
-                            .setting_year_to_id
-                            .get(&y)
-                            .is_some_and(|sid| !sid.eq_ignore_ascii_case(&bill_fy))
-                    });
-                    if !conflicting_setting {
-                        fy_config.register_group(&inferred_fy, &[bill_fy.clone(), inferred_fy.clone()]);
-                    }
-                }
-            }
-            bill_fy
-        } else {
-            let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) else {
-                continue;
-            };
-            inferred_fy
+        let Some(resolved_bill_fy) = resolve_bill_fiscal_year(inner, &mut fy_config) else {
+            continue;
         };
 
         if v_id.is_some() || norm_num.is_some() {
@@ -197,6 +176,8 @@ pub fn compute_members(
     let target_fiscal_year = fy_config.resolve_target_fiscal_year(fiscal_year);
     let (target_group_id, target_rank) = fy_config.canonicalize(&target_fiscal_year);
 
+    let mut member_entries: HashMap<VehicleKey, DatabaseResource> =
+        HashMap::with_capacity(prepared_bills.len());
     let mut active_entries: HashMap<VehicleKey, DatabaseResource> =
         HashMap::with_capacity(prepared_bills.len());
     let mut billed_in_prior_fy: HashSet<VehicleKey> = HashSet::new();
@@ -208,6 +189,12 @@ pub fn compute_members(
 
         let (bill_group_id, bill_rank) = fy_config.canonicalize(&bill_fy);
         if bill_group_id == target_group_id {
+            member_entries.entry(vehicle_key.clone()).or_insert_with(|| {
+                match vehicle_key {
+                    VehicleKey::Canonical(idx) => index.canonical_vehicles[idx].clone(),
+                    VehicleKey::External(_) => synthesize_external_vehicle_resource(bill_inner),
+                }
+            });
             active_entries.entry(vehicle_key.clone()).or_insert_with(|| {
                 match vehicle_key {
                     VehicleKey::Canonical(idx) => index.canonical_vehicles[idx].clone(),
@@ -220,40 +207,38 @@ pub fn compute_members(
                 _ => true,
             };
             if is_prior {
+                member_entries.entry(vehicle_key.clone()).or_insert_with(|| {
+                    match vehicle_key {
+                        VehicleKey::Canonical(idx) => index.canonical_vehicles[idx].clone(),
+                        VehicleKey::External(_) => synthesize_external_vehicle_resource(bill_inner),
+                    }
+                });
                 billed_in_prior_fy.insert(vehicle_key);
             }
         }
     }
 
-    let total_users: Vec<DatabaseResource> = index
-        .canonical_vehicles
-        .iter()
-        .map(|&res| res.clone())
-        .collect();
+    let mut member_pairs: Vec<(VehicleKey, DatabaseResource)> = member_entries.into_iter().collect();
+    member_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut active_pairs: Vec<(VehicleKey, DatabaseResource)> = active_entries.into_iter().collect();
     active_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let active_canonical_indices: HashSet<usize> = active_pairs
-        .iter()
-        .filter_map(|(key, _)| match key {
-            VehicleKey::Canonical(idx) => Some(*idx),
-            VehicleKey::External(_) => None,
-        })
-        .collect();
+    let active_keys: HashSet<VehicleKey> = active_pairs.iter().map(|(k, _)| k.clone()).collect();
 
-    let inactive_year: Vec<DatabaseResource> = index
-        .canonical_vehicles
+    let inactive_year: Vec<DatabaseResource> = member_pairs
         .iter()
-        .enumerate()
-        .filter_map(|(idx, &res)| {
-            if !active_canonical_indices.contains(&idx) {
+        .filter_map(|(key, res)| {
+            if !active_keys.contains(key) {
                 Some(res.clone())
             } else {
                 None
             }
         })
         .collect();
+
+    let total_users: Vec<DatabaseResource> =
+        member_pairs.into_iter().map(|(_, res)| res).collect();
 
     let new_users: Vec<DatabaseResource> = active_pairs
         .iter()
@@ -274,7 +259,13 @@ pub fn compute_members(
         .unwrap_or_default();
     let displaced_users =
         if crate::settings::is_displaced_tagging_enabled_in_resources(settings.iter().copied()) {
-            collect_displaced_vehicles(members, &index)
+            collect_displaced_vehicles(
+                members,
+                &index,
+                target_group_id,
+                target_rank,
+                &fy_config,
+            )
         } else {
             Vec::new()
         };
@@ -302,11 +293,12 @@ async fn load_members_for_fy(
 }
 
 fn normalize_path_fy(path: web::Path<String>) -> Option<String> {
-    let trimmed = path.into_inner().trim().to_string();
+    let trimmed = path.into_inner();
+    let trimmed = trimmed.trim().trim_matches('/').trim();
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(trimmed.to_string())
     }
 }
 
@@ -414,37 +406,37 @@ pub async fn get_inactive_year_by_fy(
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("", web::get().to(get_members))
         .route("/total_users", web::get().to(get_total_users))
-        .route("/total_users/{fiscal_year}", web::get().to(get_total_users_by_fy))
+        .route("/total_users/{fiscal_year:.*}", web::get().to(get_total_users_by_fy))
         .route("/total", web::get().to(get_total_users))
-        .route("/total/{fiscal_year}", web::get().to(get_total_users_by_fy))
+        .route("/total/{fiscal_year:.*}", web::get().to(get_total_users_by_fy))
         .route("/total_active_users", web::get().to(get_total_active_users))
         .route(
-            "/total_active_users/{fiscal_year}",
+            "/total_active_users/{fiscal_year:.*}",
             web::get().to(get_total_active_users_by_fy),
         )
         .route("/active", web::get().to(get_total_active_users))
-        .route("/active/{fiscal_year}", web::get().to(get_total_active_users_by_fy))
+        .route("/active/{fiscal_year:.*}", web::get().to(get_total_active_users_by_fy))
         .route("/new_users", web::get().to(get_new_users))
-        .route("/new_users/{fiscal_year}", web::get().to(get_new_users_by_fy))
+        .route("/new_users/{fiscal_year:.*}", web::get().to(get_new_users_by_fy))
         .route("/new", web::get().to(get_new_users))
-        .route("/new/{fiscal_year}", web::get().to(get_new_users_by_fy))
+        .route("/new/{fiscal_year:.*}", web::get().to(get_new_users_by_fy))
         .route("/displaced_users", web::get().to(get_displaced_users))
         .route(
-            "/displaced_users/{fiscal_year}",
+            "/displaced_users/{fiscal_year:.*}",
             web::get().to(get_displaced_users_by_fy),
         )
         .route("/displaced", web::get().to(get_displaced_users))
-        .route("/displaced/{fiscal_year}", web::get().to(get_displaced_users_by_fy))
+        .route("/displaced/{fiscal_year:.*}", web::get().to(get_displaced_users_by_fy))
         .route("/inactive_year", web::get().to(get_inactive_year))
-        .route("/inactive_year/{fiscal_year}", web::get().to(get_inactive_year_by_fy))
+        .route("/inactive_year/{fiscal_year:.*}", web::get().to(get_inactive_year_by_fy))
         .route("/total_inactive_users", web::get().to(get_inactive_year))
         .route(
-            "/total_inactive_users/{fiscal_year}",
+            "/total_inactive_users/{fiscal_year:.*}",
             web::get().to(get_inactive_year_by_fy),
         )
         .route("/inactive", web::get().to(get_inactive_year))
-        .route("/inactive/{fiscal_year}", web::get().to(get_inactive_year_by_fy))
-        .route("/{fiscal_year}", web::get().to(get_members_by_fy));
+        .route("/inactive/{fiscal_year:.*}", web::get().to(get_inactive_year_by_fy))
+        .route("/{fiscal_year:.*}", web::get().to(get_members_by_fy));
 }
 
 #[cfg(test)]
@@ -571,18 +563,25 @@ mod tests {
             make_vehicle(2, 102, "BA-01-PA-1002", Some("2026-11-02T00:00:00Z")),
         );
 
-        // Vehicle 103: only cancelled bill in 2083/84 -> inactive
+        // Vehicle 103: only cancelled bill in 2083/84 -> NON-MEMBER (excluded from total_users & inactive_year)
         cache.write(
             ResourceName::VehicleResource,
             3,
             make_vehicle(3, 103, "BA-01-PA-1003", Some("2026-11-03T00:00:00Z")),
         );
 
-        // Vehicle 104: no bills, latest MemberResource says DISPLACED -> inactive AND displaced
+        // Vehicle 104: no bills, latest MemberResource says DISPLACED -> non-member for billing, counted in displaced_users
         cache.write(
             ResourceName::VehicleResource,
             4,
             make_vehicle(4, 104, "BA-01-PA-1004", Some("2026-11-04T00:00:00Z")),
+        );
+
+        // Vehicle 105: valid bill ONLY in 2081/82 -> member, inactive in 2083/84
+        cache.write(
+            ResourceName::VehicleResource,
+            5,
+            make_vehicle(5, 105, "BA-01-PA-1005", Some("2024-11-05T00:00:00Z")),
         );
 
         // Bills
@@ -590,6 +589,11 @@ mod tests {
             ResourceName::BillResource,
             1,
             make_bill(1, "101", "BA-01-PA-1001", "2081/82", Some("2024-11-01"), None),
+        );
+        cache.write(
+            ResourceName::BillResource,
+            6,
+            make_bill(6, "105", "BA-01-PA-1005", "2081/82", Some("2024-11-05"), Some("PAID")),
         );
         cache.write(
             ResourceName::BillResource,
@@ -711,11 +715,11 @@ mod tests {
             assert_eq!(members.inactive_year.len(), stats.total_inactive_users_year);
             assert_eq!(members.total_inactive_users, members.inactive_year);
 
-            assert_eq!(members.total_users.len(), 4);
+            assert_eq!(members.total_users.len(), 4); // 101, 102, 105, external 999 (excludes cancelled-only 103 & unbilled 104)
             assert_eq!(members.total_active_users.len(), 3); // 101, 102, external 999
             assert_eq!(members.new_users.len(), 2); // 102, external 999
             assert_eq!(members.displaced_users.len(), 1); // 104
-            assert_eq!(members.inactive_year.len(), 2); // 103, 104
+            assert_eq!(members.inactive_year.len(), 1); // 105
         }
     }
 
@@ -747,7 +751,7 @@ mod tests {
         assert_eq!(parsed_all.total_active_users.len(), 3);
         assert_eq!(parsed_all.new_users.len(), 2);
         assert_eq!(parsed_all.displaced_users.len(), 1);
-        assert_eq!(parsed_all.inactive_year.len(), 2);
+        assert_eq!(parsed_all.inactive_year.len(), 1);
 
         // 2. Each individual array route returns its JSON array (`Vec<DatabaseResource>`)
         for (path, expected_len) in [
@@ -758,8 +762,8 @@ mod tests {
             ("/api/v1/members/new_users", 2),
             ("/api/v1/members/new_users?fiscalYearId=15f21721-50e8-41af-9596-9d8cdb8d6a16", 2),
             ("/api/v1/members/displaced_users", 1),
-            ("/api/v1/members/inactive_year", 2),
-            ("/api/v1/dashboard/members/inactive_year?fiscal_year=2083/84", 2),
+            ("/api/v1/members/inactive_year", 1),
+            ("/api/v1/dashboard/members/inactive_year?fiscal_year=2083/84", 1),
         ] {
             let resp =
                 actix_test::call_service(&app, actix_test::TestRequest::get().uri(path).to_request())
@@ -769,7 +773,7 @@ mod tests {
             assert_eq!(list.len(), expected_len, "length mismatch for route: {}", path);
         }
 
-        // 3. Past fiscal year without active FY bills shows only 2081/82 active vehicle
+        // 3. Past fiscal year without active FY bills shows 2081/82 active vehicles (101 and 105)
         let resp_2081 = actix_test::call_service(
             &app,
             actix_test::TestRequest::get()
@@ -779,8 +783,10 @@ mod tests {
         .await;
         assert_eq!(resp_2081.status(), StatusCode::OK);
         let list_2081: Vec<DatabaseResource> = actix_test::read_body_json(resp_2081).await;
-        assert_eq!(list_2081.len(), 1);
-        assert_eq!(list_2081[0].id, Some(1));
+        assert_eq!(list_2081.len(), 2);
+        let ids_2081: Vec<i32> = list_2081.iter().filter_map(|r| r.id).collect();
+        assert!(ids_2081.contains(&1));
+        assert!(ids_2081.contains(&5));
     }
 
     #[test]
@@ -824,5 +830,220 @@ mod tests {
             DateParams::from("2026-11-16").into(),
         );
         assert_eq!(enabled.displaced_users.len(), 1);
+    }
+
+    #[actix_web::test]
+    async fn test_dashboard_members_excludes_cancelled_only_and_unbilled_and_dedups_via_history() {
+        let mut cache = Cache::new();
+
+        // Vehicle 31409 (only CANCELLED bill 258) -> MUST NOT appear in members
+        cache.write(
+            ResourceName::VehicleResource,
+            1,
+            make_vehicle(1, 31409, "Province-3-22-55-KA-256", Some("2026-11-27T00:00:00Z")),
+        );
+        // Vehicle 35930 (valid bill 215, plus later updated ID/Number linked via VehicleHistoryResource)
+        cache.write(
+            ResourceName::VehicleResource,
+            2,
+            make_vehicle(2, 99999, "Province-5-01-KA-9999", Some("2026-11-27T01:00:00Z")),
+        );
+        // Unbilled Vehicle -> MUST NOT appear in members
+        cache.write(
+            ResourceName::VehicleResource,
+            3,
+            make_vehicle(3, 55555, "BA-01-KA-5555", Some("2026-11-27T02:00:00Z")),
+        );
+
+        // User's CANCELLED bill sample (id: 258, vehicle: 31409)
+        cache.write(
+            ResourceName::BillResource,
+            258,
+            DatabaseResource {
+                id: Some(258),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 1000,
+                    "status": "CANCELLED",
+                    "vehicle": {
+                        "id": "31409",
+                        "vehicleNumber": "Province-3-22-55-KA-256"
+                    },
+                    "fiscalYear": "2082/2083",
+                    "billingDate": "2026-11-27",
+                    "billingType": "MEMBERSHIP",
+                    "auditHistory": [{ "at": "2026-11-27T08:32:00.913Z", "action": "CANCELLED", "reason": "hjkl" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // User's valid bill sample (id: 215, vehicle: 35930 / State-3-G-KK-8211)
+        cache.write(
+            ResourceName::BillResource,
+            215,
+            DatabaseResource {
+                id: Some(215),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 1000,
+                    "vehicle": {
+                        "id": "35930",
+                        "vehicleNumber": "State-3-G-KK-8211"
+                    },
+                    "fiscalYear": "2082/2083",
+                    "billingDate": "2026-11-26",
+                    "billingType": "MEMBERSHIP"
+                })),
+                external_content: None,
+            },
+        );
+
+        // Second valid bill for the SAME physical vehicle after BOTH VehicleId & VehicleNumber changed
+        cache.write(
+            ResourceName::BillResource,
+            216,
+            DatabaseResource {
+                id: Some(216),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 500,
+                    "vehicle": {
+                        "id": "99999",
+                        "vehicleNumber": "Province-5-01-KA-9999"
+                    },
+                    "fiscalYear": "2082/2083",
+                    "billingDate": "2026-11-27",
+                    "billingType": "MEMBERSHIP"
+                })),
+                external_content: None,
+            },
+        );
+
+        // VehicleHistoryResource linked list tying (35930, State-3-G-KK-8211) <-> (99999, Province-5-01-KA-9999)
+        let mut chain =
+            crate::vehicle_history::VehicleHistoryChain::new("VHIST-DEDUP-1".to_string());
+        let old_snap = json!({ "VehicleId": 35930, "VehicleNumber": "State-3-G-KK-8211" });
+        let new_snap = json!({ "VehicleId": 99999, "VehicleNumber": "Province-5-01-KA-9999" });
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::Create,
+            Some(2),
+            None,
+            Some(&old_snap),
+            None,
+            None,
+        );
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::Update,
+            Some(2),
+            Some(&old_snap),
+            Some(&new_snap),
+            None,
+            None,
+        );
+        cache.write(
+            ResourceName::VehicleHistoryResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::VehicleHistoryResource),
+                inner_content: Some(chain.to_json_value()),
+                external_content: None,
+            },
+        );
+
+        let s_data = create_mock_server_data(cache).await;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(s_data)
+                .service(web::scope("/api/v1/dashboard/members").configure(configure_routes)),
+        )
+        .await;
+
+        let resp = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::get()
+                .uri("/api/v1/dashboard/members/2082%2F2083")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let members: DashboardMembers = actix_test::read_body_json(resp).await;
+        assert_eq!(members.total_users.len(), 1);
+        assert_eq!(members.total_users[0].id, Some(2));
+        assert_eq!(members.total_active_users.len(), 1);
+        assert_eq!(members.inactive_year.len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_members_routes_scope_by_selected_fiscal_year_and_support_slash_paths() {
+        let mut cache = Cache::new();
+        for (id, vid, num) in [
+            (1, 1001i64, "BA-01-PA-1001"),
+            (2, 1002i64, "BA-01-PA-1002"),
+            (3, 1003i64, "BA-01-PA-1003"),
+        ] {
+            cache.write(
+                ResourceName::VehicleResource,
+                id,
+                make_vehicle(id, vid, num, Some("2026-11-27T00:00:00Z")),
+            );
+        }
+
+        for (bill_id, vid, num, fy) in [
+            (1, "1001", "BA-01-PA-1001", "2081/2082"),
+            (2, "1002", "BA-01-PA-1002", "2082/2083"),
+            (3, "1003", "BA-01-PA-1003", "2083/2084"),
+        ] {
+            cache.write(
+                ResourceName::BillResource,
+                bill_id,
+                DatabaseResource {
+                    id: Some(bill_id),
+                    resource_name: Some(ResourceName::BillResource),
+                    inner_content: Some(json!({
+                        "total": 1000,
+                        "vehicle": { "id": vid, "vehicleNumber": num },
+                        "fiscalYear": fy,
+                        "periodStart": "2026-11-27",
+                        "billingType": "MEMBERSHIP"
+                    })),
+                    external_content: None,
+                },
+            );
+        }
+
+        let s_data = create_mock_server_data(cache).await;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(s_data)
+                .service(web::scope("/api/v1/dashboard/members").configure(configure_routes)),
+        )
+        .await;
+
+        for (uri, expected_total, expected_active, expected_inactive) in [
+            ("/api/v1/dashboard/members/2081/2082", 1usize, 1usize, 0usize),
+            ("/api/v1/dashboard/members/2082/2083", 2, 1, 1),
+            ("/api/v1/dashboard/members/2083/2084", 3, 1, 2),
+        ] {
+            let resp = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(uri).to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "failed route {uri}");
+            let members: DashboardMembers = actix_test::read_body_json(resp).await;
+            assert_eq!(members.total_users.len(), expected_total, "total mismatch for {uri}");
+            assert_eq!(
+                members.total_active_users.len(),
+                expected_active,
+                "active mismatch for {uri}"
+            );
+            assert_eq!(
+                members.inactive_year.len(),
+                expected_inactive,
+                "inactive mismatch for {uri}"
+            );
+        }
     }
 }

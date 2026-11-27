@@ -76,6 +76,14 @@ impl<'a> VehicleIndex<'a> {
         cached_vehicles: &[&'a DatabaseResource],
         db_vehicles: &[DatabaseResource],
     ) -> Self {
+        Self::build_with_history(cached_vehicles, db_vehicles, &[])
+    }
+
+    pub(crate) fn build_with_history(
+        cached_vehicles: &[&'a DatabaseResource],
+        db_vehicles: &[DatabaseResource],
+        vehicle_histories: &[&DatabaseResource],
+    ) -> Self {
         let cap = cached_vehicles.len();
         let mut canonical_vehicles = Vec::with_capacity(cap);
         let mut by_db_id = HashMap::with_capacity(cap);
@@ -178,14 +186,61 @@ impl<'a> VehicleIndex<'a> {
             }
         }
 
+        let mut by_external_id = HashMap::new();
+        let mut by_external_number = HashMap::new();
+
+        // Link all historical IDs/numbers recorded in VehicleHistoryResource linked lists
+        // to the same canonical vehicle (or unified external group) even if both ID & number changed.
+        for hist_res in vehicle_histories {
+            let Some(inner) = hist_res.inner_content.as_ref() else {
+                continue;
+            };
+            let (h_db_ids, h_vids, h_nums) =
+                crate::vehicle_history::extract_all_identifiers_from_history(inner);
+            let matched_idx = h_db_ids
+                .iter()
+                .find_map(|id| by_db_id.get(id).copied())
+                .or_else(|| h_vids.iter().find_map(|vid| by_vehicle_id.get(vid).copied()))
+                .or_else(|| h_nums.iter().find_map(|num| by_vehicle_number.get(num).copied()));
+
+            if let Some(idx) = matched_idx {
+                for id in h_db_ids {
+                    by_db_id.entry(id).or_insert(idx);
+                }
+                for vid in h_vids {
+                    by_vehicle_id.entry(vid).or_insert(idx);
+                }
+                for num in h_nums {
+                    by_vehicle_number.entry(num).or_insert(idx);
+                }
+            } else {
+                let ext_group_key = inner
+                    .get("vehicleUid")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|uid| format!("hist:{}", uid))
+                    .or_else(|| h_vids.first().map(|id| format!("id:{}", id)))
+                    .or_else(|| h_nums.first().map(|n| format!("num:{}", n)));
+                if let Some(key) = ext_group_key {
+                    for vid in h_vids {
+                        by_external_id.entry(vid).or_insert_with(|| key.clone());
+                    }
+                    for num in h_nums {
+                        by_external_number.entry(num).or_insert_with(|| key.clone());
+                    }
+                }
+            }
+        }
+
         Self {
             canonical_count: canonical_vehicles.len(),
             canonical_vehicles,
             by_db_id,
             by_vehicle_id,
             by_vehicle_number,
-            by_external_id: HashMap::new(),
-            by_external_number: HashMap::new(),
+            by_external_id,
+            by_external_number,
         }
     }
 
@@ -674,7 +729,7 @@ impl FiscalYearConfig {
 
         let group_id = if matching_groups.is_empty() {
             let gid = self.group_display.len();
-            let rank = parsed_rank.map(|y| (y as i64) * 1000 + gid as i64);
+            let rank = parsed_rank.map(|y| y as i64);
             self.group_display.push(display.to_string());
             self.group_rank.push(rank);
             gid
@@ -702,7 +757,7 @@ impl FiscalYearConfig {
 
             if self.group_rank[primary_gid].is_none() {
                 if let Some(y) = parsed_rank {
-                    self.group_rank[primary_gid] = Some((y as i64) * 1000 + primary_gid as i64);
+                    self.group_rank[primary_gid] = Some(y as i64);
                 }
             }
             if parse_fiscal_year_start(&self.group_display[primary_gid]).is_none()
@@ -742,6 +797,15 @@ impl FiscalYearConfig {
             .is_some_and(|gid| self.group_rank.get(gid).copied().flatten().is_some())
     }
 
+    pub(crate) fn lookup_group_and_rank(&self, raw: &str) -> (Option<usize>, Option<i64>) {
+        let trimmed = raw.trim();
+        let gid = self.lookup_group_id(trimmed);
+        let rank = gid
+            .and_then(|g| self.group_rank.get(g).copied().flatten())
+            .or_else(|| parse_fiscal_year_start(trimmed).map(|y| y as i64));
+        (gid, rank)
+    }
+
     pub(crate) fn canonicalize(&mut self, raw: &str) -> (usize, Option<i64>) {
         let trimmed = raw.trim();
         if let Some(gid) = self.lookup_group_id(trimmed) {
@@ -750,7 +814,7 @@ impl FiscalYearConfig {
 
         let aliases = expand_fiscal_year_aliases(trimmed);
         let gid = self.group_display.len();
-        let rank = parse_fiscal_year_start(trimmed).map(|y| (y as i64) * 1000);
+        let rank = parse_fiscal_year_start(trimmed).map(|y| y as i64);
         self.group_display.push(trimmed.to_string());
         self.group_rank.push(rank);
         for alias in aliases {
@@ -841,6 +905,23 @@ pub(crate) fn parse_fiscal_year_start(raw: &str) -> Option<i32> {
     }
 }
 
+fn push_fiscal_year_start_aliases(aliases: &mut Vec<String>, start_num: i32) {
+    let start = format!("{:04}", start_num);
+    let next_year = start_num + 1;
+    let expected_short = format!("{:02}", next_year % 100);
+    let expected_three = format!("{:03}", next_year % 1000);
+    let expected_full = format!("{:04}", next_year);
+    if (2000..=2099).contains(&start_num) {
+        aliases.push(start.clone());
+    }
+    aliases.push(format!("{start}/{expected_short}"));
+    aliases.push(format!("{start}/{expected_three}"));
+    aliases.push(format!("{start}/{expected_full}"));
+    aliases.push(format!("{start}-{expected_short}"));
+    aliases.push(format!("{start}-{expected_three}"));
+    aliases.push(format!("{start}-{expected_full}"));
+}
+
 fn expand_fiscal_year_aliases(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -859,13 +940,14 @@ fn expand_fiscal_year_aliases(raw: &str) -> Vec<String> {
                 let expected_three = format!("{:03}", next_year % 1000);
                 let expected_full = format!("{:04}", next_year);
                 if end == expected_short || end == expected_three || end == expected_full {
-                    if (2000..=2099).contains(&start_num) {
-                        aliases.push(start.to_string());
-                    }
-                    aliases.push(format!("{start}/{expected_short}"));
-                    aliases.push(format!("{start}/{expected_three}"));
-                    aliases.push(format!("{start}/{expected_full}"));
+                    push_fiscal_year_start_aliases(&mut aliases, start_num);
                 }
+            }
+        }
+    } else if ascii.len() == 4 && ascii.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(start_num) = ascii.parse::<i32>() {
+            if (2000..=2099).contains(&start_num) {
+                push_fiscal_year_start_aliases(&mut aliases, start_num);
             }
         }
     }
@@ -1004,6 +1086,135 @@ pub(crate) fn extract_bill_inferred_fiscal_year(inner: &Value) -> Option<String>
         })
 }
 
+pub(crate) fn resolve_bill_fiscal_year(
+    inner: &Value,
+    fy_config: &mut FiscalYearConfig,
+) -> Option<String> {
+    let bill_fy_id = extract_string_or_int(inner.get("fiscalYearId"));
+    let bill_fy_label = extract_string_or_int(inner.get("fiscalYear"));
+    if let (Some(ref fy_id), Some(ref fy_label)) = (&bill_fy_id, &bill_fy_label) {
+        if !fy_id.eq_ignore_ascii_case(fy_label) {
+            let distinct_explicit_years = matches!(
+                (parse_fiscal_year_start(fy_id), parse_fiscal_year_start(fy_label)),
+                (Some(y1), Some(y2)) if y1 != y2
+            );
+            if !distinct_explicit_years {
+                if let Some(y) = parse_fiscal_year_start(fy_label) {
+                    let conflicting_setting = fy_config
+                        .setting_year_to_id
+                        .get(&y)
+                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(fy_id));
+                    if !conflicting_setting {
+                        fy_config.register_group(fy_label, &[fy_id.clone(), fy_label.clone()]);
+                    }
+                }
+            }
+        }
+    }
+
+    let bill_fy_raw = bill_fy_label.or(bill_fy_id);
+
+    if let Some(fy) = bill_fy_raw {
+        // Explicit BS fiscal year (e.g. "2082/2083") is authoritative and must never be
+        // overwritten by or merged with an AD periodStart date from another BS year.
+        if parse_fiscal_year_start(&fy).is_some() {
+            fy_config.register_group(&fy, &[fy.clone()]);
+            return Some(fy);
+        }
+
+        // Opaque FY identifier (e.g. UUID or numeric ID) resolves via periodStart/date fallback.
+        if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
+            let conflicting_setting = parse_fiscal_year_start(&period_fy).is_some_and(|y| {
+                fy_config
+                    .setting_year_to_id
+                    .get(&y)
+                    .is_some_and(|sid| !sid.eq_ignore_ascii_case(&fy))
+            });
+            if !conflicting_setting {
+                fy_config.register_group(&period_fy, &[fy, period_fy.clone()]);
+            } else {
+                fy_config.register_group(&period_fy, &[period_fy.clone()]);
+            }
+            return Some(period_fy);
+        }
+
+        if !fy_config.has_ranked_group(&fy) {
+            if let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) {
+                let conflicting_setting = parse_fiscal_year_start(&inferred_fy).is_some_and(|y| {
+                    fy_config
+                        .setting_year_to_id
+                        .get(&y)
+                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(&fy))
+                });
+                if !conflicting_setting {
+                    fy_config.register_group(&inferred_fy, &[fy.clone(), inferred_fy.clone()]);
+                }
+            }
+        }
+
+        return Some(fy);
+    }
+
+    if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
+        fy_config.register_group(&period_fy, &[period_fy.clone()]);
+        return Some(period_fy);
+    }
+
+    if let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) {
+        fy_config.register_group(&inferred_fy, &[inferred_fy.clone()]);
+        return Some(inferred_fy);
+    }
+
+    None
+}
+
+pub(crate) fn is_member_record_within_fiscal_year(
+    member: &DatabaseResource,
+    target_group_id: usize,
+    target_rank: Option<i64>,
+    fy_config: &FiscalYearConfig,
+) -> bool {
+    let member_fy = member
+        .inner_content
+        .as_ref()
+        .and_then(|inner| {
+            extract_string_or_int(inner.get("fiscalYear"))
+                .or_else(|| extract_string_or_int(inner.get("fiscalYearId")))
+        })
+        .or_else(|| {
+            member
+                .external_content
+                .as_ref()
+                .and_then(|ext| ext.get("createdTime"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    member
+                        .inner_content
+                        .as_ref()
+                        .and_then(|inner| inner.get("taggedAt"))
+                        .and_then(Value::as_str)
+                })
+                .and_then(infer_bs_fiscal_year_from_date_str)
+        });
+
+    let Some(member_fy) = member_fy else {
+        return true;
+    };
+
+    let (member_gid, member_rank) = fy_config.lookup_group_and_rank(&member_fy);
+    if member_gid == Some(target_group_id) {
+        return true;
+    }
+
+    if let (Some(mr), Some(tr)) = (member_rank, target_rank) {
+        if mr > tr {
+            return false;
+        }
+    }
+
+    true
+}
+
 pub(crate) fn extract_string_or_int(val: Option<&Value>) -> Option<String> {
     let val = val?;
     val.as_str()
@@ -1092,6 +1303,7 @@ pub(crate) fn is_bill_ignored(inner: &Value) -> bool {
             || s.eq_ignore_ascii_case("ROLLED_BACK")
             || s.eq_ignore_ascii_case("CANCELLED")
             || s.eq_ignore_ascii_case("CANCELED")
+            || s.eq_ignore_ascii_case("VOID")
         {
             return true;
         }
@@ -1106,6 +1318,7 @@ pub(crate) fn is_bill_ignored(inner: &Value) -> bool {
                     let action = a.trim();
                     action.eq_ignore_ascii_case("CANCELLED")
                         || action.eq_ignore_ascii_case("CANCELED")
+                        || action.eq_ignore_ascii_case("VOID")
                 })
         }) {
             return true;
@@ -1148,7 +1361,13 @@ pub(crate) fn is_member_displaced(inner: &Value) -> bool {
             .is_some_and(|s| s.trim().eq_ignore_ascii_case("DISPLACED"))
 }
 
-fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleIndex<'_>) -> usize {
+fn count_displaced_vehicles(
+    members: Vec<&DatabaseResource>,
+    index: &VehicleIndex<'_>,
+    target_group_id: usize,
+    target_rank: Option<i64>,
+    fy_config: &FiscalYearConfig,
+) -> usize {
     if members.is_empty() {
         return 0;
     }
@@ -1160,6 +1379,9 @@ fn count_displaced_vehicles(members: Vec<&DatabaseResource>, index: &VehicleInde
     let mut displaced_count = 0usize;
 
     for member in members {
+        if !is_member_record_within_fiscal_year(member, target_group_id, target_rank, fy_config) {
+            continue;
+        }
         let Some(inner) = &member.inner_content else {
             continue;
         };
@@ -1225,8 +1447,12 @@ pub fn compute_statistics(
     let cached_vehicles: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::VehicleResource)
         .unwrap_or_default();
+    let vehicle_histories: Vec<&DatabaseResource> = cache
+        .read_all(ResourceName::VehicleHistoryResource)
+        .unwrap_or_default();
 
-    let mut index = VehicleIndex::build(&cached_vehicles, db_vehicles);
+    let mut index =
+        VehicleIndex::build_with_history(&cached_vehicles, db_vehicles, &vehicle_histories);
 
     let settings: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::SettingResource)
@@ -1257,62 +1483,12 @@ pub fn compute_statistics(
 
         let (v_id, v_num) = extract_bill_vehicle(inner);
         let norm_num = v_num.and_then(normalize_vehicle_number);
-        index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
-
-        let bill_fy_id = extract_string_or_int(inner.get("fiscalYearId"));
-        let bill_fy_label = extract_string_or_int(inner.get("fiscalYear"));
-        if let (Some(ref fy_id), Some(ref fy_label)) = (&bill_fy_id, &bill_fy_label) {
-            if !fy_id.eq_ignore_ascii_case(fy_label) {
-                if let Some(y) = parse_fiscal_year_start(fy_label) {
-                    let conflicting_setting = fy_config
-                        .setting_year_to_id
-                        .get(&y)
-                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(fy_id));
-                    if !conflicting_setting {
-                        fy_config.register_group(fy_label, &[fy_id.clone(), fy_label.clone()]);
-                    }
-                }
-            }
+        if v_id.is_some() || norm_num.is_some() {
+            index.register_bill_vehicle_with_norm(v_id.as_deref(), norm_num.as_deref());
         }
-        let bill_fy_raw = bill_fy_label.or(bill_fy_id);
 
-        let resolved_bill_fy = if let Some(period_fy) = extract_bill_period_start_fiscal_year(inner) {
-            if let Some(fy) = bill_fy_raw {
-                let conflicting_setting = parse_fiscal_year_start(&period_fy).is_some_and(|y| {
-                    fy_config
-                        .setting_year_to_id
-                        .get(&y)
-                        .is_some_and(|sid| !sid.eq_ignore_ascii_case(&fy))
-                });
-                if !conflicting_setting {
-                    fy_config.register_group(&period_fy, &[fy, period_fy.clone()]);
-                } else {
-                    fy_config.register_group(&period_fy, &[period_fy.clone()]);
-                }
-            } else {
-                fy_config.register_group(&period_fy, &[period_fy.clone()]);
-            }
-            period_fy
-        } else if let Some(bill_fy) = bill_fy_raw {
-            if parse_fiscal_year_start(&bill_fy).is_none() && !fy_config.has_ranked_group(&bill_fy) {
-                if let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) {
-                    let conflicting_setting = parse_fiscal_year_start(&inferred_fy).is_some_and(|y| {
-                        fy_config
-                            .setting_year_to_id
-                            .get(&y)
-                            .is_some_and(|sid| !sid.eq_ignore_ascii_case(&bill_fy))
-                    });
-                    if !conflicting_setting {
-                        fy_config.register_group(&inferred_fy, &[bill_fy.clone(), inferred_fy.clone()]);
-                    }
-                }
-            }
-            bill_fy
-        } else {
-            let Some(inferred_fy) = extract_bill_inferred_fiscal_year(inner) else {
-                continue;
-            };
-            inferred_fy
+        let Some(resolved_bill_fy) = resolve_bill_fiscal_year(inner, &mut fy_config) else {
+            continue;
         };
 
         if v_id.is_some() || norm_num.is_some() {
@@ -1323,6 +1499,7 @@ pub fn compute_statistics(
     let target_fiscal_year = fy_config.resolve_target_fiscal_year(fiscal_year);
     let (target_group_id, target_rank) = fy_config.canonicalize(&target_fiscal_year);
 
+    let mut member_keys: HashSet<VehicleKey> = HashSet::with_capacity(prepared_bills.len());
     let mut active_in_target: HashSet<VehicleKey> = HashSet::with_capacity(prepared_bills.len());
     let mut billed_in_prior_fy: HashSet<VehicleKey> = HashSet::new();
 
@@ -1333,6 +1510,7 @@ pub fn compute_statistics(
 
         let (bill_group_id, bill_rank) = fy_config.canonicalize(&bill_fy);
         if bill_group_id == target_group_id {
+            member_keys.insert(vehicle_key.clone());
             active_in_target.insert(vehicle_key);
         } else {
             let is_prior = match (bill_rank, target_rank) {
@@ -1340,30 +1518,36 @@ pub fn compute_statistics(
                 _ => true,
             };
             if is_prior {
+                member_keys.insert(vehicle_key.clone());
                 billed_in_prior_fy.insert(vehicle_key);
             }
         }
     }
 
-    let total_users_year = index.canonical_count;
+    let total_users_year = member_keys.len();
     let total_active_users_year = active_in_target.len();
     let new_users_year = active_in_target
         .iter()
         .filter(|key| !billed_in_prior_fy.contains(*key))
         .count();
 
-    let active_canonical_count = active_in_target
+    let total_inactive_users_year = member_keys
         .iter()
-        .filter(|key| matches!(key, VehicleKey::Canonical(_)))
+        .filter(|key| !active_in_target.contains(*key))
         .count();
-    let total_inactive_users_year = total_users_year.saturating_sub(active_canonical_count);
 
     let members: Vec<&DatabaseResource> = cache
         .read_all(ResourceName::MemberResource)
         .unwrap_or_default();
     let displaced_users_year =
         if crate::settings::is_displaced_tagging_enabled_in_resources(settings.iter().copied()) {
-            count_displaced_vehicles(members, &index)
+            count_displaced_vehicles(
+                members,
+                &index,
+                target_group_id,
+                target_rank,
+                &fy_config,
+            )
         } else {
             0
         };
@@ -1491,10 +1675,11 @@ pub async fn get_dashboard_statistics_by_fy(
     s_data: web::Data<Arc<ServerData>>,
 ) -> HttpResponse {
     let fy = path.into_inner();
-    let requested = if fy.trim().is_empty() {
+    let trimmed = fy.trim().trim_matches('/').trim();
+    let requested = if trimmed.is_empty() {
         None
     } else {
-        Some(fy.as_str())
+        Some(trimmed)
     };
 
     let db_vehicles = get_cached_db_vehicles(&s_data).await;
@@ -1627,10 +1812,10 @@ mod tests {
 
         let stats = compute_statistics(Some("2083/84"), &cache, &[], test_date());
         assert_eq!(stats.fiscal_year, "2083/84");
-        assert_eq!(stats.total_users_year, 2);
+        assert_eq!(stats.total_users_year, 1);
         assert_eq!(stats.total_active_users_year, 1);
         assert_eq!(stats.new_users_year, 1);
-        assert_eq!(stats.total_inactive_users_year, 1);
+        assert_eq!(stats.total_inactive_users_year, 0);
         assert_eq!(stats.displaced_users_year, 0);
     }
 
@@ -2132,11 +2317,11 @@ mod tests {
         );
 
         let stats = compute_statistics(Some("2083/84"), &cache, &[], test_date());
-        // Cached vehicle 701 only had ignored bills -> inactive; external EXT-55 counted once -> active
+        // Cached vehicle 701 only had ignored bills -> non-member; external EXT-55 counted once -> active member
         assert_eq!(stats.total_users_year, 1);
         assert_eq!(stats.total_active_users_year, 1);
         assert_eq!(stats.new_users_year, 1);
-        assert_eq!(stats.total_inactive_users_year, 1);
+        assert_eq!(stats.total_inactive_users_year, 0);
     }
 
     #[test]
@@ -2578,14 +2763,14 @@ mod tests {
             Some(uuid_fy),
         ] {
             let stats = compute_statistics(requested, &cache, &[], test_date());
-            assert_eq!(stats.total_users_year, 49);
+            assert_eq!(stats.total_users_year, 47);
             assert_eq!(
                 stats.total_active_users_year, 47,
                 "active mismatch for {:?}",
                 requested
             );
             assert_eq!(stats.new_users_year, 47);
-            assert_eq!(stats.total_inactive_users_year, 2);
+            assert_eq!(stats.total_inactive_users_year, 0);
         }
 
         // Verify rule IDs in linked-fee-rules are never registered as fiscal years
@@ -2764,14 +2949,14 @@ mod tests {
 
         for requested in [None, Some("2082/2083"), Some("2082/83"), Some(uuid_fy)] {
             let stats = compute_statistics(requested, &cache, &[], test_date());
-            assert_eq!(stats.total_users_year, 4, "total mismatch for {requested:?}");
+            assert_eq!(stats.total_users_year, 3, "total mismatch for {requested:?}");
             assert_eq!(
                 stats.total_active_users_year, 3,
                 "active mismatch for {requested:?}"
             );
             assert_eq!(stats.new_users_year, 3, "new mismatch for {requested:?}");
             assert_eq!(
-                stats.total_inactive_users_year, 1,
+                stats.total_inactive_users_year, 0,
                 "inactive mismatch for {requested:?}"
             );
         }
@@ -2840,10 +3025,10 @@ mod tests {
 
         let stats = compute_statistics(None, &cache, &[], test_date());
         assert_eq!(stats.fiscal_year, "2082/2083");
-        assert_eq!(stats.total_users_year, 2);
+        assert_eq!(stats.total_users_year, 1);
         assert_eq!(stats.total_active_users_year, 1);
         assert_eq!(stats.new_users_year, 1);
-        assert_eq!(stats.total_inactive_users_year, 1);
+        assert_eq!(stats.total_inactive_users_year, 0);
     }
 
     #[test]
@@ -2980,5 +3165,188 @@ mod tests {
         let stats_disabled = compute_statistics(None, &cache, &[], test_date());
         assert_eq!(stats_disabled.fiscal_year, "2083/84");
         assert_eq!(stats_disabled.displaced_users_year, 0);
+    }
+
+    #[actix_web::test]
+    async fn test_fiscal_year_change_updates_members_for_selected_range_and_does_not_merge_explicit_fy_with_period_start()
+    {
+        let mut cache = Cache::new();
+
+        for (id, vid, num) in [
+            (1, 1001i64, "BA-01-PA-1001"),
+            (2, 1002i64, "BA-01-PA-1002"),
+            (3, 1003i64, "BA-01-PA-1003"),
+        ] {
+            cache.write(
+                ResourceName::VehicleResource,
+                id,
+                make_vehicle(id, vid, num, Some("2026-11-27T00:00:00Z")),
+            );
+        }
+
+        // Vehicle 1001 billed explicitly in "2081/2082"
+        cache.write(
+            ResourceName::BillResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 1000,
+                    "vehicle": { "id": "1001", "vehicleNumber": "BA-01-PA-1001" },
+                    "fiscalYear": "2081/2082",
+                    "billingDate": "2024-11-27",
+                    "periodStart": "2024-11-27",
+                    "billingType": "MEMBERSHIP"
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 1002 billed explicitly in "2082/2083", EVEN THOUGH periodStart is "2026-11-27" (BS 2083/84)
+        cache.write(
+            ResourceName::BillResource,
+            2,
+            DatabaseResource {
+                id: Some(2),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 1000,
+                    "vehicle": { "id": "1002", "vehicleNumber": "BA-01-PA-1002" },
+                    "fiscalYear": "2082/2083",
+                    "billingDate": "2026-11-27",
+                    "periodStart": "2026-11-27",
+                    "billingType": "MEMBERSHIP"
+                })),
+                external_content: None,
+            },
+        );
+
+        // Vehicle 1003 billed explicitly in "2083/2084"
+        cache.write(
+            ResourceName::BillResource,
+            3,
+            DatabaseResource {
+                id: Some(3),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(json!({
+                    "total": 1000,
+                    "vehicle": { "id": "1003", "vehicleNumber": "BA-01-PA-1003" },
+                    "fiscalYear": "2083/2084",
+                    "billingDate": "2026-11-27",
+                    "periodStart": "2026-11-27",
+                    "billingType": "MEMBERSHIP"
+                })),
+                external_content: None,
+            },
+        );
+
+        // Member displaced in BS 2083/84 ("2026-11-27") must appear in 2083/84, NOT in earlier FYs
+        cache.write(
+            ResourceName::MemberResource,
+            10,
+            make_member(
+                10,
+                "1002",
+                "BA-01-PA-1002",
+                true,
+                "DISPLACED",
+                Some("2026-11-27T00:00:00Z"),
+            ),
+        );
+
+        // Verify compute_statistics produces distinct scoped counts per selected fiscal year
+        let s_2080 = compute_statistics(Some("2080/2081"), &cache, &[], test_date());
+        assert_eq!(
+            (
+                s_2080.total_users_year,
+                s_2080.total_active_users_year,
+                s_2080.new_users_year,
+                s_2080.total_inactive_users_year,
+                s_2080.displaced_users_year
+            ),
+            (0, 0, 0, 0, 0)
+        );
+
+        let s_2081 = compute_statistics(Some("2081/2082"), &cache, &[], test_date());
+        assert_eq!(
+            (
+                s_2081.total_users_year,
+                s_2081.total_active_users_year,
+                s_2081.new_users_year,
+                s_2081.total_inactive_users_year,
+                s_2081.displaced_users_year
+            ),
+            (1, 1, 1, 0, 0)
+        );
+
+        let s_2082 = compute_statistics(Some("2082/2083"), &cache, &[], test_date());
+        assert_eq!(
+            (
+                s_2082.total_users_year,
+                s_2082.total_active_users_year,
+                s_2082.new_users_year,
+                s_2082.total_inactive_users_year,
+                s_2082.displaced_users_year
+            ),
+            (2, 1, 1, 1, 0)
+        );
+
+        let s_2083 = compute_statistics(Some("2083/2084"), &cache, &[], test_date());
+        assert_eq!(
+            (
+                s_2083.total_users_year,
+                s_2083.total_active_users_year,
+                s_2083.new_users_year,
+                s_2083.total_inactive_users_year,
+                s_2083.displaced_users_year
+            ),
+            (3, 1, 1, 2, 1)
+        );
+
+        // Verify HTTP routes with slash-separated, hyphenated, percent-encoded, and bare year params
+        let s_data = create_mock_server_data_for_tests(cache).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new().app_data(s_data).service(
+                web::scope("/api/v1/dashboard")
+                    .route("/statistics", web::get().to(get_dashboard_statistics))
+                    .route(
+                        "/statistics/{fiscal_year:.*}",
+                        web::get().to(get_dashboard_statistics_by_fy),
+                    ),
+            ),
+        )
+        .await;
+
+        let route_expectations = [
+            ("/api/v1/dashboard/statistics/2080/2081", (0, 0, 0, 0, 0)),
+            ("/api/v1/dashboard/statistics/2081/2082", (1, 1, 1, 0, 0)),
+            ("/api/v1/dashboard/statistics/2082/2083", (2, 1, 1, 1, 0)),
+            ("/api/v1/dashboard/statistics/2082-2083", (2, 1, 1, 1, 0)),
+            ("/api/v1/dashboard/statistics/2082%2F2083", (2, 1, 1, 1, 0)),
+            ("/api/v1/dashboard/statistics/2082", (2, 1, 1, 1, 0)),
+            ("/api/v1/dashboard/statistics/2083/2084", (3, 1, 1, 2, 1)),
+        ];
+
+        for (uri, expected) in route_expectations {
+            let resp = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get().uri(uri).to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "failed route {uri}");
+            let parsed: DashBoardStatistics = actix_web::test::read_body_json(resp).await;
+            assert_eq!(
+                (
+                    parsed.total_users_year,
+                    parsed.total_active_users_year,
+                    parsed.new_users_year,
+                    parsed.total_inactive_users_year,
+                    parsed.displaced_users_year
+                ),
+                expected,
+                "stats mismatch for {uri}"
+            );
+        }
     }
 }

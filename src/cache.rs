@@ -176,12 +176,24 @@ impl Cache {
 
         let query_lower = search_query.to_lowercase();
         let path: Vec<&'b str> = field_name.split('.').collect();
+        let vehicle_expansion = if *resource_name == ResourceName::VehicleResource
+            && crate::vehicle_history::is_vehicle_number_search_field(field_name)
+        {
+            Some(crate::vehicle_history::VehicleSearchExpansion::from_cache(
+                self,
+                search_query,
+            ))
+        } else {
+            None
+        };
 
         Box::new(items.filter(move |resource| {
-            resource
-                .inner_content
-                .as_ref()
-                .is_some_and(|inner| Self::matches_path(inner, &path, &query_lower))
+            resource.inner_content.as_ref().is_some_and(|inner| {
+                Self::matches_path(inner, &path, &query_lower)
+                    || vehicle_expansion
+                        .as_ref()
+                        .is_some_and(|exp| exp.matches_vehicle_inner(resource.id, inner))
+            })
         }))
     }
     pub fn search_innercontent_batch(
@@ -855,5 +867,101 @@ mod tests {
             deduped[0].inner_content.as_ref().unwrap()["metadata"]["tags"][0],
             "blacklisted"
         );
+    }
+
+    #[test]
+    fn test_cache_search_broadens_by_canonical_vehicle_number_and_history_without_mutating_data() {
+        let mut cache = Cache::new();
+        // Stored with canonical "Province-4-15-23-KHA-5555"
+        cache.write(
+            ResourceName::VehicleResource,
+            10,
+            make_sample_vehicle(10, "Province-4-15-23-KHA-5555", "Gandaki Owner", 41523),
+        );
+        // Stored with transitional provincial plate, with historical zonal plate recorded in VehicleHistoryResource
+        cache.write(
+            ResourceName::VehicleResource,
+            20,
+            make_sample_vehicle(20, "Province-3-01-23-KHA-5555", "Bagmati Owner", 30123),
+        );
+
+        let before = serde_json::json!({
+            "VehicleId": "30123",
+            "VehicleNumber": "BA-23-KHA-5555"
+        });
+        let after = serde_json::json!({
+            "VehicleId": "30123",
+            "VehicleNumber": "Province-3-01-23-KHA-5555"
+        });
+        let mut chain =
+            crate::vehicle_history::VehicleHistoryChain::new("VHIST-CACHE-20".to_string());
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::Create,
+            Some(20),
+            None,
+            Some(&before),
+            None,
+            None,
+        );
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::VehicleNumberChange,
+            Some(20),
+            Some(&before),
+            Some(&after),
+            None,
+            None,
+        );
+        cache.write(
+            ResourceName::VehicleHistoryResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(ResourceName::VehicleHistoryResource),
+                inner_content: Some(chain.to_json_value()),
+                external_content: None,
+            },
+        );
+
+        // 1. Canonical provincial aliases find the stored "Province-4-15-23-KHA-5555" without changing stored data
+        for alias in [
+            "Ga Pra 15-23-KHA-5555",
+            "P4-15-23-KHA-5555",
+            "Gandaki Pradesh 15 23 KHA 5555",
+        ] {
+            let (matches, count) =
+                cache.search_innercontent(ResourceName::VehicleResource, "VehicleNumber", alias, 10);
+            assert_eq!(count, 1, "expected 1 hit for alias {alias}");
+            assert_eq!(matches[0].id, Some(10));
+            assert_eq!(
+                matches[0].inner_content.as_ref().unwrap()["VehicleNumber"],
+                "Province-4-15-23-KHA-5555"
+            );
+        }
+
+        // Verify stored cache entry was never altered
+        assert_eq!(
+            cache
+                .read(ResourceName::VehicleResource, 10)
+                .unwrap()
+                .inner_content
+                .unwrap()["VehicleNumber"],
+            "Province-4-15-23-KHA-5555"
+        );
+
+        // 2. Historical zonal plate (and its alias "Bagmati 23 KHA 5555") finds vehicle 20 ("Province-3-01-23-KHA-5555")
+        for hist_query in ["BA-23-KHA-5555", "Bagmati 23 KHA 5555"] {
+            let (matches, count) = cache.search_innercontent(
+                ResourceName::VehicleResource,
+                "VehicleNumber",
+                hist_query,
+                10,
+            );
+            assert_eq!(count, 1, "expected 1 hit for historical query {hist_query}");
+            assert_eq!(matches[0].id, Some(20));
+            assert_eq!(
+                matches[0].inner_content.as_ref().unwrap()["VehicleNumber"],
+                "Province-3-01-23-KHA-5555"
+            );
+        }
     }
 }

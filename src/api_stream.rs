@@ -95,6 +95,28 @@ pub async fn search(
         }
     };
 
+    if resource_name == ResourceName::VehicleResource
+        && !s_data
+            .cache
+            .read()
+            .await
+            .is_fully_loaded(ResourceName::VehicleHistoryResource)
+    {
+        if let Ok(hist_resources) = s_data
+            .db
+            .read_all_resource(ResourceName::VehicleHistoryResource)
+            .await
+        {
+            let mut cache = s_data.cache.write().await;
+            for hist in hist_resources {
+                if let Some(hid) = hist.id {
+                    cache.write(ResourceName::VehicleHistoryResource, hid, hist);
+                }
+            }
+            cache.mark_fully_loaded(ResourceName::VehicleHistoryResource);
+        }
+    }
+
     let first_batch = {
         let cache = s_data.cache.read().await;
 

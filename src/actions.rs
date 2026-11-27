@@ -259,6 +259,28 @@ async fn search_inner(
         }
     }
 
+    if resource_name == ResourceName::VehicleResource
+        && !s_data
+            .cache
+            .read()
+            .await
+            .is_fully_loaded(ResourceName::VehicleHistoryResource)
+    {
+        if let Ok(hist_resources) = s_data
+            .db
+            .read_all_resource(ResourceName::VehicleHistoryResource)
+            .await
+        {
+            let mut cache = s_data.cache.write().await;
+            for hist in hist_resources {
+                if let Some(hid) = hist.id {
+                    cache.write(ResourceName::VehicleHistoryResource, hid, hist);
+                }
+            }
+            cache.mark_fully_loaded(ResourceName::VehicleHistoryResource);
+        }
+    }
+
     let cache = s_data.cache.read().await;
     let db_resources =
         cache.search_innercontent(resource_name, &search_item, &search_query, ulimit);
@@ -393,6 +415,11 @@ async fn update_inner(
             false,
         );
     }
+
+    let actor_email = req
+        .extensions()
+        .get::<crate::auth::Claims>()
+        .map(|c| c.sub.clone());
 
     let branch_id = db_resource
         .inner_content
@@ -764,6 +791,26 @@ async fn update_inner(
         }
     }
 
+    if resource_name == ResourceName::VehicleResource {
+        if let Err(err) = crate::vehicle_history::record_vehicle_change(
+            &s_data,
+            crate::vehicle_history::VehicleChangeType::Update,
+            Some(id),
+            before_state.as_ref(),
+            after_state.as_ref(),
+            actor_email,
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to record VehicleHistoryResource on VehicleResource {} update: {}",
+                id, err
+            );
+        }
+    }
+
     (
         HttpResponse::Ok().json(format!("Resource updated with id: {}", id)),
         Some(format!("Updated {} with id {}", resource_name.to_string(), id)),
@@ -844,6 +891,11 @@ async fn write_inner(
     bool,
     bool,
 ) {
+    let actor_email = req
+        .extensions()
+        .get::<crate::auth::Claims>()
+        .map(|c| c.sub.clone());
+
     let branch_id = db_resource
         .inner_content
         .as_ref()
@@ -1155,6 +1207,26 @@ async fn write_inner(
                 ..db_resource.clone()
             },
         );
+    }
+
+    if resource_name == ResourceName::VehicleResource {
+        if let Err(err) = crate::vehicle_history::record_vehicle_change(
+            &s_data,
+            crate::vehicle_history::VehicleChangeType::Create,
+            Some(id),
+            None,
+            db_resource.inner_content.as_ref(),
+            actor_email,
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to record VehicleHistoryResource on VehicleResource {} create: {}",
+                id, err
+            );
+        }
     }
 
     let after_state = db_resource.inner_content.clone();
@@ -1536,6 +1608,11 @@ async fn delete_inner(
         None
     };
 
+    let actor_email = req
+        .extensions()
+        .get::<crate::auth::Claims>()
+        .map(|c| c.sub.clone());
+
     let branch_id = crate::permissions::extract_branch_id_from_req(&req).or_else(|| {
         cached_before
             .as_ref()
@@ -1616,6 +1693,26 @@ async fn delete_inner(
         if let Err(err) = crate::access::delete_permission_for_user(&s_data, id).await {
             eprintln!(
                 "Failed to delete paired PermissionResource for UserResource {}: {}",
+                id, err
+            );
+        }
+    }
+
+    if resource_name == ResourceName::VehicleResource {
+        if let Err(err) = crate::vehicle_history::record_vehicle_change(
+            &s_data,
+            crate::vehicle_history::VehicleChangeType::Delete,
+            Some(id),
+            before_state.as_ref(),
+            None,
+            actor_email,
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to record VehicleHistoryResource on VehicleResource {} delete: {}",
                 id, err
             );
         }

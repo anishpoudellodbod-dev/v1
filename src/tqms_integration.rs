@@ -282,50 +282,51 @@ fn extract_vehicle_id_str(v: &Value) -> Option<String> {
     None
 }
 
-fn extract_vehicle_norm_num(inner: &Value) -> String {
+fn extract_raw_vehicle_num(inner: &Value) -> Option<&str> {
     inner
         .get("VehicleNumber")
         .or_else(|| inner.get("vehicleNumber"))
         .or_else(|| inner.get("NormalizedVehicleNumber"))
         .or_else(|| inner.get("normalizedVehicleNumber"))
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_vehicle_norm_num(inner: &Value) -> String {
+    extract_raw_vehicle_num(inner)
         .map(normalize_vehicle_num)
         .unwrap_or_default()
 }
 
-fn matches_vehicle_number_field(val: Option<&Value>, q_raw: &str, q_norm: &str) -> bool {
+fn extract_canonical_norm_num(inner: &Value) -> Option<String> {
+    extract_raw_vehicle_num(inner).and_then(crate::vehicle_number::canonical_normalized_key)
+}
+
+fn matches_vehicle_number_field(
+    val: Option<&Value>,
+    q_raw: &str,
+    q_norm: &str,
+    q_parsed: Option<&crate::vehicle_number::VehicleNumber>,
+) -> bool {
     let Some(s) = val.and_then(Value::as_str) else {
         return false;
     };
     if contains_case_insensitive(s, q_raw) {
         return true;
     }
-    !q_norm.is_empty() && normalize_vehicle_num(s).contains(q_norm)
-}
-
-fn vehicle_matches_search_params(
-    inner: &Value,
-    params: &VehicleSearchParameters,
-    query_norm_num: &str,
-) -> bool {
-    if let Some(q_raw) = params
-        .vehicle_number
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let num_match = matches_vehicle_number_field(inner.get("VehicleNumber"), q_raw, query_norm_num)
-            || matches_vehicle_number_field(
-                inner.get("NormalizedVehicleNumber"),
-                q_raw,
-                query_norm_num,
-            );
-        let id_match = extract_vehicle_id_str(inner).is_some_and(|id| id == q_raw);
-        if !num_match && !id_match {
-            return false;
+    if !q_norm.is_empty() && normalize_vehicle_num(s).contains(q_norm) {
+        return true;
+    }
+    if let Some(q_vn) = q_parsed {
+        if crate::vehicle_number::parse_vehicle_number(s).as_ref() == Some(q_vn) {
+            return true;
         }
     }
+    false
+}
 
+fn vehicle_matches_non_number_filters(inner: &Value, params: &VehicleSearchParameters) -> bool {
     if let Some(q_owner) = params
         .owner_name
         .as_deref()
@@ -391,6 +392,38 @@ fn vehicle_matches_search_params(
     true
 }
 
+fn vehicle_matches_search_params(
+    inner: &Value,
+    params: &VehicleSearchParameters,
+    query_norm_num: &str,
+    query_parsed: Option<&crate::vehicle_number::VehicleNumber>,
+) -> bool {
+    if let Some(q_raw) = params
+        .vehicle_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let num_match = matches_vehicle_number_field(
+            inner.get("VehicleNumber"),
+            q_raw,
+            query_norm_num,
+            query_parsed,
+        ) || matches_vehicle_number_field(
+            inner.get("NormalizedVehicleNumber"),
+            q_raw,
+            query_norm_num,
+            query_parsed,
+        );
+        let id_match = extract_vehicle_id_str(inner).is_some_and(|id| id == q_raw);
+        if !num_match && !id_match {
+            return false;
+        }
+    }
+
+    vehicle_matches_non_number_filters(inner, params)
+}
+
 fn search_cache_vehicles_with_id_lookup(
     cache: &crate::cache::Cache,
     params: &VehicleSearchParameters,
@@ -406,6 +439,14 @@ fn search_cache_vehicles_with_id_lookup(
         .map(normalize_vehicle_num)
         .unwrap_or_default();
 
+    let expansion = params
+        .vehicle_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|q| crate::vehicle_history::VehicleSearchExpansion::from_cache(cache, q));
+    let query_parsed = expansion.as_ref().and_then(|e| e.query_parsed.as_ref());
+
     let mut matched_resources: Vec<DatabaseResource> = Vec::new();
     let mut seen_cache_ids: HashSet<i32> = HashSet::new();
     let mut target_vehicle_ids: HashSet<String> = HashSet::new();
@@ -418,18 +459,28 @@ fn search_cache_vehicles_with_id_lookup(
     {
         target_vehicle_ids.insert(q_raw.to_string());
     }
+    if let Some(ref exp) = expansion {
+        target_vehicle_ids.extend(exp.matched_vehicle_ids.iter().cloned());
+    }
     for item in tqms_items {
         if let Some(vid) = extract_vehicle_id_str(item) {
             target_vehicle_ids.insert(vid);
         }
     }
 
-    // Pass 1: search cache directly with the provided search parameters
+    // Pass 1: search cache directly with provided params, canonical VehicleNumber equivalence, and VehicleHistoryResource expansion
     for res in &cached_vehicles {
         let Some(inner) = &res.inner_content else {
             continue;
         };
-        if vehicle_matches_search_params(inner, params, &query_norm_num) {
+        let direct_match =
+            vehicle_matches_search_params(inner, params, &query_norm_num, query_parsed);
+        let expanded_match = expansion
+            .as_ref()
+            .is_some_and(|exp| exp.matches_vehicle_inner(res.id, inner))
+            && vehicle_matches_non_number_filters(inner, params);
+
+        if direct_match || expanded_match {
             if let Some(id_str) = extract_vehicle_id_str(inner) {
                 target_vehicle_ids.insert(id_str);
             }
@@ -459,7 +510,9 @@ fn search_cache_vehicles_with_id_lookup(
             let Some(vid) = extract_vehicle_id_str(inner) else {
                 continue;
             };
-            if !target_vehicle_ids.contains(&vid) {
+            if !target_vehicle_ids.contains(&vid)
+                || !vehicle_matches_non_number_filters(inner, params)
+            {
                 continue;
             }
             if let Some(cid) = res.id {
@@ -501,6 +554,7 @@ fn find_matching_vehicle_resource<'a, I>(
     resources: I,
     vid: Option<&str>,
     norm_num: &str,
+    canonical_key: Option<&str>,
 ) -> Option<&'a DatabaseResource>
 where
     I: IntoIterator<Item = &'a DatabaseResource>,
@@ -511,7 +565,9 @@ where
         };
         let id_match = vid.is_some_and(|v| extract_vehicle_id_str(inner).as_deref() == Some(v));
         let num_match = !norm_num.is_empty() && extract_vehicle_norm_num(inner) == norm_num;
-        id_match || num_match
+        let canon_match =
+            canonical_key.is_some_and(|ck| extract_canonical_norm_num(inner).as_deref() == Some(ck));
+        id_match || num_match || canon_match
     })
 }
 
@@ -549,9 +605,11 @@ fn extract_tqms_vehicle_items(payload: &Value) -> Vec<Value> {
 }
 
 /// Ensures every TQMS vehicle exists in either `s_data.cache` or `s_data.db`
-/// (matched by `VehicleId` or normalized `VehicleNumber`). Vehicles present in DB
-/// but missing from cache are synced into cache; vehicles absent from both DB and cache
-/// are created as new `VehicleResource` records in DB and written into cache.
+/// (matched by `VehicleId`, normalized `VehicleNumber`, or canonical `VehicleNumber` equivalence).
+/// Vehicles present in DB but missing from cache are synced into cache; vehicles absent from both
+/// DB and cache are created as new `VehicleResource` records in DB and written into cache.
+/// Existing `VehicleResource` data is never overwritten; if only `VehicleNumber` changed compared
+/// to a matched record, that number change is recorded onto `VehicleHistoryResource`.
 pub async fn ensure_tqms_vehicles_in_cache_and_db(
     s_data: &ServerData,
     tqms_items: &[Value],
@@ -560,6 +618,7 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
         return Vec::new();
     }
 
+    let mut number_only_changes: Vec<(Option<i32>, Value, Value)> = Vec::new();
     let uncached_items: Vec<Value> = {
         let cache = s_data.cache.read().await;
         let cached = cache.read_all(VehicleResource).unwrap_or_default();
@@ -572,9 +631,28 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
                 if vid.is_none() && norm_num.is_empty() {
                     return None;
                 }
-                if find_matching_vehicle_resource(cached.iter().copied(), vid.as_deref(), &norm_num)
-                    .is_some()
-                {
+                let canonical_key = extract_canonical_norm_num(item);
+                if let Some(existing) = find_matching_vehicle_resource(
+                    cached.iter().copied(),
+                    vid.as_deref(),
+                    &norm_num,
+                    canonical_key.as_deref(),
+                ) {
+                    let clean_item = clean_tqms_vehicle_value(item);
+                    if let Some(existing_inner) = existing.inner_content.as_ref() {
+                        if crate::vehicle_history::detect_vehicle_number_only_change(
+                            Some(existing_inner),
+                            Some(&clean_item),
+                        )
+                        .is_some()
+                        {
+                            number_only_changes.push((
+                                existing.id,
+                                existing_inner.clone(),
+                                clean_item,
+                            ));
+                        }
+                    }
                     None
                 } else {
                     Some(clean_tqms_vehicle_value(item))
@@ -582,6 +660,26 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
             })
             .collect()
     };
+
+    for (existing_id, before_inner, after_inner) in number_only_changes {
+        if let Err(err) = crate::vehicle_history::record_vehicle_change(
+            s_data,
+            crate::vehicle_history::VehicleChangeType::VehicleNumberChange,
+            existing_id,
+            Some(&before_inner),
+            Some(&after_inner),
+            Some("tqms_sync".to_string()),
+            None,
+            None,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to record VehicleNumberChange on TQMS match for VehicleResource {:?}: {}",
+                existing_id, err
+            );
+        }
+    }
 
     if uncached_items.is_empty() {
         return Vec::new();
@@ -598,11 +696,13 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
     for clean_item in uncached_items {
         let vid = extract_vehicle_id_str(&clean_item);
         let norm_num = extract_vehicle_norm_num(&clean_item);
+        let canonical_key = extract_canonical_norm_num(&clean_item);
 
         if let Some(existing_db_res) = find_matching_vehicle_resource(
             known_db_vehicles.iter(),
             vid.as_deref(),
             &norm_num,
+            canonical_key.as_deref(),
         )
         .cloned()
         {
@@ -611,7 +711,27 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
                     .cache
                     .write()
                     .await
-                    .write(VehicleResource, db_id, existing_db_res);
+                    .write(VehicleResource, db_id, existing_db_res.clone());
+            }
+            if let Some(existing_inner) = existing_db_res.inner_content.as_ref() {
+                if crate::vehicle_history::detect_vehicle_number_only_change(
+                    Some(existing_inner),
+                    Some(&clean_item),
+                )
+                .is_some()
+                {
+                    let _ = crate::vehicle_history::record_vehicle_change(
+                        s_data,
+                        crate::vehicle_history::VehicleChangeType::VehicleNumberChange,
+                        existing_db_res.id,
+                        Some(existing_inner),
+                        Some(&clean_item),
+                        Some("tqms_sync".to_string()),
+                        None,
+                        None,
+                    )
+                    .await;
+                }
             }
             continue;
         }
@@ -636,6 +756,23 @@ pub async fn ensure_tqms_vehicles_in_cache_and_db(
                     .write()
                     .await
                     .write(VehicleResource, created_id, new_res.clone());
+                if let Err(err) = crate::vehicle_history::record_vehicle_change(
+                    s_data,
+                    crate::vehicle_history::VehicleChangeType::Sync,
+                    Some(created_id),
+                    None,
+                    new_res.inner_content.as_ref(),
+                    Some("tqms_sync".to_string()),
+                    Some("Created from TQMS sync".to_string()),
+                    None,
+                )
+                .await
+                {
+                    eprintln!(
+                        "Failed to record VehicleHistoryResource on TQMS sync for VehicleResource {}: {}",
+                        created_id, err
+                    );
+                }
                 known_db_vehicles.push(new_res.clone());
                 created_resources.push(new_res);
             }
@@ -672,7 +809,7 @@ fn merge_and_annotate_vehicle_results(
     let raw_cache_hits = search_cache_vehicles_with_id_lookup(cache, params, &tqms_items);
 
     let mut tqms_ids: HashSet<String> = HashSet::with_capacity(tqms_items.len());
-    let mut tqms_norms: HashSet<String> = HashSet::with_capacity(tqms_items.len());
+    let mut tqms_norms: HashSet<String> = HashSet::with_capacity(tqms_items.len() * 2);
     for item in &tqms_items {
         if let Some(vid) = extract_vehicle_id_str(item) {
             tqms_ids.insert(vid);
@@ -681,10 +818,13 @@ fn merge_and_annotate_vehicle_results(
         if !norm.is_empty() {
             tqms_norms.insert(norm);
         }
+        if let Some(canon_norm) = extract_canonical_norm_num(item) {
+            tqms_norms.insert(canon_norm);
+        }
     }
 
     let mut cache_ids: HashSet<String> = HashSet::with_capacity(raw_cache_hits.len());
-    let mut cache_norms: HashSet<String> = HashSet::with_capacity(raw_cache_hits.len());
+    let mut cache_norms: HashSet<String> = HashSet::with_capacity(raw_cache_hits.len() * 2);
     for (_, item) in &raw_cache_hits {
         if let Some(vid) = extract_vehicle_id_str(item) {
             cache_ids.insert(vid);
@@ -692,6 +832,32 @@ fn merge_and_annotate_vehicle_results(
         let norm = extract_vehicle_norm_num(item);
         if !norm.is_empty() {
             cache_norms.insert(norm);
+        }
+        if let Some(canon_norm) = extract_canonical_norm_num(item) {
+            cache_norms.insert(canon_norm);
+        }
+    }
+
+    // Broaden billing <-> TQMS cross-matching across cached VehicleHistoryResource links
+    if let Ok(histories) = cache.read_all(crate::resource::ResourceName::VehicleHistoryResource) {
+        for hist in histories {
+            let Some(inner) = hist.inner_content.as_ref() else {
+                continue;
+            };
+            let (_, h_vids, h_norms) =
+                crate::vehicle_history::extract_all_identifiers_from_history(inner);
+            if h_vids.iter().any(|id| tqms_ids.contains(id))
+                || h_norms.iter().any(|n| tqms_norms.contains(n))
+            {
+                tqms_ids.extend(h_vids.iter().cloned());
+                tqms_norms.extend(h_norms.iter().cloned());
+            }
+            if h_vids.iter().any(|id| cache_ids.contains(id))
+                || h_norms.iter().any(|n| cache_norms.contains(n))
+            {
+                cache_ids.extend(h_vids);
+                cache_norms.extend(h_norms);
+            }
         }
     }
 
@@ -701,7 +867,8 @@ fn merge_and_annotate_vehicle_results(
             || {
                 let norm = extract_vehicle_norm_num(&item);
                 !norm.is_empty() && tqms_norms.contains(&norm)
-            };
+            }
+            || extract_canonical_norm_num(&item).is_some_and(|c| tqms_norms.contains(&c));
         insert_vehicle_flags(&mut item, "cache", true, in_tqms, cache_id);
         cache_results.push(item);
     }
@@ -712,7 +879,8 @@ fn merge_and_annotate_vehicle_results(
             || {
                 let norm = extract_vehicle_norm_num(&item);
                 !norm.is_empty() && cache_norms.contains(&norm)
-            };
+            }
+            || extract_canonical_norm_num(&item).is_some_and(|c| cache_norms.contains(&c));
         insert_vehicle_flags(&mut item, "tqms", in_billing, true, None);
         tqms_results.push(item);
     }
@@ -762,6 +930,31 @@ pub async fn search_vehicles(
     if let Ok(ref val) = tqms_result {
         let tqms_items = extract_tqms_vehicle_items(val);
         ensure_tqms_vehicles_in_cache_and_db(&s_data, &tqms_items).await;
+    }
+
+    if !s_data
+        .cache
+        .read()
+        .await
+        .is_fully_loaded(crate::resource::ResourceName::VehicleHistoryResource)
+    {
+        if let Ok(hist_resources) = s_data
+            .db
+            .read_all_resource(crate::resource::ResourceName::VehicleHistoryResource)
+            .await
+        {
+            let mut cache_w = s_data.cache.write().await;
+            for hist in hist_resources {
+                if let Some(hid) = hist.id {
+                    cache_w.write(
+                        crate::resource::ResourceName::VehicleHistoryResource,
+                        hid,
+                        hist,
+                    );
+                }
+            }
+            cache_w.mark_fully_loaded(crate::resource::ResourceName::VehicleHistoryResource);
+        }
     }
 
     let cache = s_data.cache.read().await;
@@ -2425,12 +2618,15 @@ mod tests {
             #[derive(Clone, Copy)]
             enum QueryKind {
                 SelectVehicles,
+                SelectOther,
                 InsertVehicle,
+                InsertOther,
             }
 
             let mut current_query = QueryKind::InsertVehicle;
             let mut pending_insert: (Option<Value>, Option<Value>) = (None, None);
             let mut resp_buf: Vec<u8> = Vec::new();
+            let mut other_insert_id: i32 = 50_000;
 
             loop {
                 let Ok(tag) = server_io.read_u8().await else {
@@ -2447,18 +2643,25 @@ mod tests {
 
                 match tag {
                     b'P' => {
-                        let sql = String::from_utf8_lossy(&body);
-                        current_query = if sql.contains("INSERT INTO") {
-                            QueryKind::InsertVehicle
-                        } else {
+                        let sql = String::from_utf8_lossy(&body).to_ascii_lowercase();
+                        let is_vehicle_table = sql.contains("vehicleresource");
+                        current_query = if sql.contains("insert into") {
+                            if is_vehicle_table {
+                                QueryKind::InsertVehicle
+                            } else {
+                                QueryKind::InsertOther
+                            }
+                        } else if is_vehicle_table {
                             QueryKind::SelectVehicles
+                        } else {
+                            QueryKind::SelectOther
                         };
                         resp_buf.extend_from_slice(&[b'1', 0, 0, 0, 4]);
                     }
                     b'D' => {
                         if body.first() == Some(&b'S') {
                             match current_query {
-                                QueryKind::SelectVehicles => {
+                                QueryKind::SelectVehicles | QueryKind::SelectOther => {
                                     // 0 parameters
                                     push_pg_msg(&mut resp_buf, b't', &0i16.to_be_bytes());
                                     // 3 columns: id, inner_content, external_content
@@ -2474,7 +2677,7 @@ mod tests {
                                     );
                                     push_pg_msg(&mut resp_buf, b'T', &fields);
                                 }
-                                QueryKind::InsertVehicle => {
+                                QueryKind::InsertVehicle | QueryKind::InsertOther => {
                                     // 2 JSONB params (3802)
                                     resp_buf.extend_from_slice(&[
                                         b't', 0, 0, 0, 14, 0, 2, 0, 0, 0x0e, 0xda, 0, 0, 0x0e,
@@ -2531,6 +2734,9 @@ mod tests {
                                 let complete = format!("SELECT {}\0", guard.rows.len());
                                 push_pg_msg(&mut resp_buf, b'C', complete.as_bytes());
                             }
+                            QueryKind::SelectOther => {
+                                push_pg_msg(&mut resp_buf, b'C', b"SELECT 0\0");
+                            }
                             QueryKind::InsertVehicle => {
                                 let assigned_id = guard.next_id;
                                 guard.next_id += 1;
@@ -2544,6 +2750,16 @@ mod tests {
                                 guard.rows.push(new_row.clone());
                                 guard.inserted.push(new_row);
 
+                                let mut row_buf = Vec::new();
+                                row_buf.extend_from_slice(&1i16.to_be_bytes());
+                                row_buf.extend_from_slice(&4i32.to_be_bytes());
+                                row_buf.extend_from_slice(&assigned_id.to_be_bytes());
+                                push_pg_msg(&mut resp_buf, b'D', &row_buf);
+                                push_pg_msg(&mut resp_buf, b'C', b"INSERT 0 1\0");
+                            }
+                            QueryKind::InsertOther => {
+                                let assigned_id = other_insert_id;
+                                other_insert_id += 1;
                                 let mut row_buf = Vec::new();
                                 row_buf.extend_from_slice(&1i16.to_be_bytes());
                                 row_buf.extend_from_slice(&4i32.to_be_bytes());
@@ -3347,5 +3563,133 @@ mod tests {
 
         let guard = db_state.lock().await;
         assert_eq!(guard.tables.get("vehicleresource").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_tqms_search_broadens_by_canonical_vehicle_number_and_history_without_mutating_data() {
+        let mut cache = Cache::new();
+        cache.write(
+            VehicleResource,
+            7001,
+            make_cached_vehicle(7001, 41523, "Province-4-15-23-KHA-5555", "Gandaki Owner"),
+        );
+        cache.write(
+            VehicleResource,
+            7002,
+            make_cached_vehicle(7002, 30123, "Province-3-01-23-KHA-5555", "Bagmati Owner"),
+        );
+
+        let before = json!({
+            "VehicleId": 30123,
+            "VehicleNumber": "BA-23-KHA-5555",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "Bagmati Owner" }]
+        });
+        let after = json!({
+            "VehicleId": 30123,
+            "VehicleNumber": "Province-3-01-23-KHA-5555",
+            "Registration": { "Status": "ACTIVE" },
+            "Owners": [{ "Name": "Bagmati Owner" }]
+        });
+        let mut chain =
+            crate::vehicle_history::VehicleHistoryChain::new("VHIST-TQMS-7002".to_string());
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::Create,
+            Some(7002),
+            None,
+            Some(&before),
+            None,
+            None,
+        );
+        chain.prepend_node(
+            crate::vehicle_history::VehicleChangeType::VehicleNumberChange,
+            Some(7002),
+            Some(&before),
+            Some(&after),
+            None,
+            None,
+        );
+        cache.write(
+            crate::resource::ResourceName::VehicleHistoryResource,
+            1,
+            DatabaseResource {
+                id: Some(1),
+                resource_name: Some(crate::resource::ResourceName::VehicleHistoryResource),
+                inner_content: Some(chain.to_json_value()),
+                external_content: None,
+            },
+        );
+
+        // 1. Canonical alias query finds cached "Province-4-15-23-KHA-5555" and cross-matches TQMS alias
+        let params_alias = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("Ga Pra 15-23-KHA-5555".to_string()),
+            owner_name: None,
+            sangh_branch: None,
+            status: None,
+        };
+        let tqms_response = json!({
+            "Code": 200,
+            "Message": "Success",
+            "Data": {
+                "Data": [{
+                    "VehicleId": 41523,
+                    "VehicleNumber": "P4-15-23-KHA-5555",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Gandaki Owner" }]
+                }],
+                "Paging": { "Page": 1, "TotalItems": 1 }
+            }
+        });
+        let merged = merge_and_annotate_vehicle_results(&cache, &params_alias, Ok(tqms_response))
+            .expect("expected merged alias search");
+        let cache_items = merged.pointer("/Data/cache_results").and_then(Value::as_array).unwrap();
+        let tqms_items = merged.pointer("/Data/tqms_results").and_then(Value::as_array).unwrap();
+        assert_eq!(cache_items.len(), 1);
+        assert_eq!(cache_items[0]["cache_id"], 7001);
+        assert_eq!(cache_items[0]["VehicleNumber"], "Province-4-15-23-KHA-5555");
+        assert_eq!(cache_items[0]["is_in_tqms"], true);
+        assert_eq!(tqms_items.len(), 1);
+        assert_eq!(tqms_items[0]["is_in_billing"], true);
+
+        // 2. Historical plate query finds vehicle 7002 via VehicleHistoryResource, respecting non-number filters
+        let params_hist = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("BA-23-KHA-5555".to_string()),
+            owner_name: Some("Bagmati".to_string()),
+            sangh_branch: None,
+            status: Some(Status::ACTIVE),
+        };
+        let merged_hist = merge_and_annotate_vehicle_results(
+            &cache,
+            &params_hist,
+            Err(anyhow::anyhow!("TQMS offline")),
+        )
+        .expect("historical plate match should succeed");
+        let hist_hits = merged_hist
+            .pointer("/Data/cache_results")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(hist_hits.len(), 1);
+        assert_eq!(hist_hits[0]["cache_id"], 7002);
+        assert_eq!(hist_hits[0]["VehicleNumber"], "Province-3-01-23-KHA-5555");
+
+        // 3. Non-matching non-number filter still filters out historical hit
+        let params_wrong_owner = VehicleSearchParameters {
+            page: Some(1),
+            page_size: Some(20),
+            vehicle_number: Some("BA-23-KHA-5555".to_string()),
+            owner_name: Some("Someone Else".to_string()),
+            sangh_branch: None,
+            status: None,
+        };
+        assert!(merge_and_annotate_vehicle_results(
+            &cache,
+            &params_wrong_owner,
+            Err(anyhow::anyhow!("TQMS offline")),
+        )
+        .is_err());
     }
 }

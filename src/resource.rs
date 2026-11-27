@@ -14,6 +14,7 @@ pub enum ResourceName {
     BranchResource,
     ActionLogsResource,
     AuditTrailResource,
+    VehicleHistoryResource,
 }
 
 impl ResourceName {
@@ -48,6 +49,8 @@ impl ResourceName {
             Some(Self::ActionLogsResource)
         } else if trimmed.eq_ignore_ascii_case("AuditTrailResource") {
             Some(Self::AuditTrailResource)
+        } else if trimmed.eq_ignore_ascii_case("VehicleHistoryResource") {
+            Some(Self::VehicleHistoryResource)
         } else {
             None
         }
@@ -98,6 +101,7 @@ impl ToString for ResourceName {
             ResourceName::BranchResource => "BranchResource".into(),
             ResourceName::ActionLogsResource => "ActionLogsResource".into(),
             ResourceName::AuditTrailResource => "AuditTrailResource".into(),
+            ResourceName::VehicleHistoryResource => "VehicleHistoryResource".into(),
         }
     }
 }
@@ -143,6 +147,7 @@ mod tests {
         assert_eq!(ResourceName::BranchResource.to_string(), "BranchResource");
         assert_eq!(ResourceName::ActionLogsResource.to_string(), "ActionLogsResource");
         assert_eq!(ResourceName::AuditTrailResource.to_string(), "AuditTrailResource");
+        assert_eq!(ResourceName::VehicleHistoryResource.to_string(), "VehicleHistoryResource");
     }
 
     #[test]
@@ -162,6 +167,7 @@ mod tests {
         assert_eq!(ResourceName::from("BranchResource".to_string()), ResourceName::BranchResource);
         assert_eq!(ResourceName::from("ActionLogsResource".to_string()), ResourceName::ActionLogsResource);
         assert_eq!(ResourceName::from("AuditTrailResource".to_string()), ResourceName::AuditTrailResource);
+        assert_eq!(ResourceName::from("VehicleHistoryResource".to_string()), ResourceName::VehicleHistoryResource);
     }
 
     #[test]
@@ -181,6 +187,7 @@ mod tests {
             ("BranchResource", ResourceName::BranchResource),
             ("ActionLogsResource", ResourceName::ActionLogsResource),
             ("AuditTrailResource", ResourceName::AuditTrailResource),
+            ("VehicleHistoryResource", ResourceName::VehicleHistoryResource),
         ];
 
         for (pascal, expected) in variants {

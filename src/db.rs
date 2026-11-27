@@ -38,6 +38,7 @@ impl Database {
             ResourceName::BranchResource,
             ResourceName::ActionLogsResource,
             ResourceName::AuditTrailResource,
+            ResourceName::VehicleHistoryResource,
         ];
         Database {
             resource_name,

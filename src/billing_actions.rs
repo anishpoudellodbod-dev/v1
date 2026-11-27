@@ -183,6 +183,7 @@ pub struct FeeItem {
     pub billing_period_type: String,
     #[serde(rename = "vehicleDetails")]
     pub vehicle_details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub periods: Vec<PeriodItem>,
 }
 
@@ -226,7 +227,7 @@ pub struct VehicleBillingDetails {
     pub vehicle_status: String,
     pub owners: Option<OwnersResolution>,
     pub fees: Vec<FeeItem>,
-    #[serde(rename = "paymentHistory")]
+    #[serde(rename = "paymentHistory", default, skip_serializing_if = "Vec::is_empty")]
     pub payment_history: Vec<PaymentHistoryItem>,
     #[serde(rename = "isSampleBillingData", default, skip_serializing_if = "Option::is_none")]
     pub is_sample_billing_data: Option<bool>,
@@ -243,7 +244,30 @@ pub struct SelectedFeePeriod {
     pub amount: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn deserialize_opt_amount_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Option::<Value>::deserialize(deserializer)?;
+    match val {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected string or number for SelectedFee.amount, got {}",
+            other
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelectedFee {
     #[serde(rename = "feeId")]
     pub fee_id: String,
@@ -251,8 +275,15 @@ pub struct SelectedFee {
     pub fee_title: String,
     #[serde(rename = "fiscalYear")]
     pub fiscal_year: String,
-    #[serde(rename = "billingPeriodType")]
+    #[serde(rename = "billingPeriodType", default)]
     pub billing_period_type: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_amount_string"
+    )]
+    pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub periods: Vec<SelectedFeePeriod>,
 }
 
@@ -1862,12 +1893,7 @@ async fn resolve_single_vehicle_billing_details(
                 .unwrap_or(q_num)
                 .to_string();
 
-            let history = match cache.cache.get(&ResourceName::BillResource) {
-                Some(bm) => extract_payment_history_from_iter(&actual_id, &actual_num, bm.values()),
-                None => Vec::new(),
-            };
-
-            (inner, actual_id, actual_num, cached_is_blacklisted, history)
+            (inner, actual_id, actual_num, cached_is_blacklisted)
         });
 
         ((outcome, has_sangh_rules), cache_update)
@@ -1881,7 +1907,7 @@ async fn resolve_single_vehicle_billing_details(
             .write(ResourceName::VehicleResource, cache_id, updated_res);
     }
 
-    let Some((inner, actual_id, actual_num, cached_is_blacklisted, history)) = resolved_outcome
+    let Some((inner, actual_id, actual_num, cached_is_blacklisted)) = resolved_outcome
     else {
         return Ok(VehicleBillingDetails {
             vehicle_id: q_id.to_string(),
@@ -1922,7 +1948,11 @@ async fn resolve_single_vehicle_billing_details(
             "vehicleCategory": vtype.clone().unwrap_or_else(|| Value::String("Vehicle".to_string())),
             "vehicleType": vtype.unwrap_or_else(|| Value::String("Commercial".to_string()))
         }));
-        generate_applicable_fees(v_details, None, &history)
+        let mut generated = generate_applicable_fees(v_details, None, &[]);
+        for fee in &mut generated {
+            fee.periods.clear();
+        }
+        generated
     } else {
         vec![]
     };
@@ -1948,7 +1978,7 @@ async fn resolve_single_vehicle_billing_details(
         vehicle_status,
         owners,
         fees,
-        payment_history: history,
+        payment_history: vec![],
         is_sample_billing_data,
         sample_source_branch,
         message,
@@ -2245,19 +2275,39 @@ pub async fn submit_vehicle_payment(
         normalize_bill_date(&processed_at)
     };
 
-    let total_periods: usize = payload.selected_fees.iter().map(|f| f.periods.len()).sum();
-    let mut bill_items = Vec::with_capacity(total_periods);
+    let total_items: usize = payload
+        .selected_fees
+        .iter()
+        .map(|f| f.periods.len().max(1))
+        .sum();
+    let mut bill_items = Vec::with_capacity(total_items);
+    let selected_fees_count = payload.selected_fees.len();
     for fee in &payload.selected_fees {
-        for p in &fee.periods {
-            let p_amt: f64 = p.amount.parse().unwrap_or(0.0);
+        if fee.periods.is_empty() {
+            let f_amt: f64 = fee
+                .amount
+                .as_deref()
+                .and_then(|a| a.trim().parse::<f64>().ok())
+                .unwrap_or_else(|| if selected_fees_count == 1 { total_amount } else { 0.0 });
             bill_items.push(serde_json::json!({
                 "title": fee.fee_title,
-                "amount": p_amt,
+                "amount": f_amt,
                 "ruleId": fee.fee_id,
-                "periodId": p.period_id,
                 "billingEntity": "नारायणी यातायात व्यवसायी संघ",
                 "billingEntityId": "1"
             }));
+        } else {
+            for p in &fee.periods {
+                let p_amt: f64 = p.amount.parse().unwrap_or(0.0);
+                bill_items.push(serde_json::json!({
+                    "title": fee.fee_title,
+                    "amount": p_amt,
+                    "ruleId": fee.fee_id,
+                    "periodId": p.period_id,
+                    "billingEntity": "नारायणी यातायात व्यवसायी संघ",
+                    "billingEntityId": "1"
+                }));
+            }
         }
     }
 
@@ -5195,6 +5245,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-07".to_string(),
                     amount: "2000.00".to_string(),
@@ -5942,6 +5993,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-07".to_string(),
                     amount: "2000.00".to_string(),
@@ -6082,6 +6134,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-07".to_string(),
                     amount: "2000.00".to_string(),
@@ -6114,6 +6167,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-07".to_string(),
                     amount: "2000.00".to_string(),
@@ -6417,6 +6471,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-08".to_string(),
                     amount: "2000.00".to_string(),
@@ -6460,6 +6515,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-08".to_string(),
                     amount: "2000.00".to_string(),
@@ -6927,6 +6983,19 @@ mod tests {
         let resp_ok = get_vehicle_billing_details(req_ok, web::Json(body_ok), s_data.clone()).await;
         assert_eq!(resp_ok.status(), StatusCode::OK);
         let bytes_ok = actix_web::body::to_bytes(resp_ok.into_body()).await.unwrap();
+        let raw_ok: Value = serde_json::from_slice(&bytes_ok).unwrap();
+        assert!(raw_ok["data"][0].get("paymentHistory").is_none());
+        assert!(raw_ok["data"][0]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
+        assert!(raw_ok["data"][1].get("paymentHistory").is_none());
+        assert!(raw_ok["data"][1]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
         let parsed_ok: ApiResponse<Vec<VehicleBillingDetails>> =
             serde_json::from_slice(&bytes_ok).unwrap();
         assert_eq!(parsed_ok.data.len(), 2);
@@ -6935,9 +7004,13 @@ mod tests {
             parsed_ok.data[0].sthaniya_branch.as_deref(),
             Some("Loadboard sthaniya")
         );
+        assert!(parsed_ok.data[0].payment_history.is_empty());
+        assert!(parsed_ok.data[0].fees.iter().all(|f| f.periods.is_empty()));
         assert_eq!(parsed_ok.data[0].is_sample_billing_data, None);
         assert_eq!(parsed_ok.data[0].message, None);
         assert_eq!(parsed_ok.data[1].vehicle_status, "ELIGIBLE");
+        assert!(parsed_ok.data[1].payment_history.is_empty());
+        assert!(parsed_ok.data[1].fees.iter().all(|f| f.periods.is_empty()));
         assert_eq!(parsed_ok.data[1].is_sample_billing_data, None);
 
         // 2. Non-Loadboard valid branch in Vehicle's SanghBranch without billing rules
@@ -6972,6 +7045,19 @@ mod tests {
         let bytes_non_loadboard = actix_web::body::to_bytes(resp_non_loadboard.into_body())
             .await
             .unwrap();
+        let raw_non_loadboard: Value = serde_json::from_slice(&bytes_non_loadboard).unwrap();
+        assert!(raw_non_loadboard["data"][0].get("paymentHistory").is_none());
+        assert!(raw_non_loadboard["data"][0]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
+        assert!(raw_non_loadboard["data"][1].get("paymentHistory").is_none());
+        assert!(raw_non_loadboard["data"][1]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
         let parsed_non_loadboard: ApiResponse<Vec<VehicleBillingDetails>> =
             serde_json::from_slice(&bytes_non_loadboard).unwrap();
         assert_eq!(parsed_non_loadboard.data.len(), 2);
@@ -6981,6 +7067,11 @@ mod tests {
             Some("Lumbini Truck Yatayat Byawasayi Sangh")
         );
         assert_eq!(parsed_non_loadboard.data[0].fees.len(), 2);
+        assert!(parsed_non_loadboard.data[0].payment_history.is_empty());
+        assert!(parsed_non_loadboard.data[0]
+            .fees
+            .iter()
+            .all(|f| f.periods.is_empty()));
         assert_eq!(parsed_non_loadboard.data[0].is_sample_billing_data, Some(true));
         assert_eq!(
             parsed_non_loadboard.data[0].sample_source_branch.as_deref(),
@@ -7267,8 +7358,36 @@ mod tests {
             },
         );
 
+        // Seed a prior BillResource payment to ensure paymentHistory and periods stay omitted even when bills exist
+        s_data.cache.write().await.write(
+            ResourceName::BillResource,
+            255,
+            DatabaseResource {
+                id: Some(255),
+                resource_name: Some(ResourceName::BillResource),
+                inner_content: Some(serde_json::json!({
+                    "vehicle": {
+                        "id": "24631",
+                        "vehicleNumber": "Province-0-55-744-CA-8536"
+                    },
+                    "paymentMethod": "eSewa",
+                    "billingDate": "2026-10-28",
+                    "receiptNumber": "ONL-000986",
+                    "fiscalYearId": "2083/84",
+                    "lodbodPaymentReferenceId": "LB-PAY-1100",
+                    "items": [{
+                        "title": "Sadahitkosh Sulka",
+                        "amount": 2000.0,
+                        "ruleId": "FEE-01",
+                        "periodId": "2083-07"
+                    }]
+                })),
+                external_content: None,
+            },
+        );
+
         // 1. Without billing rule for "Lumbini Truck Yatayat Byawasayi Sangh":
-        // displays sample billing data of "Loadboard sthaniya" with explicit notice
+        // displays placeholder fee heads of "Loadboard sthaniya" without periods/paymentHistory
         let req_without_rules = actix_web::test::TestRequest::post()
             .insert_header(("Authorization", "Bearer lodbod-service-secret"))
             .to_http_request();
@@ -7288,6 +7407,13 @@ mod tests {
         let bytes_without = actix_web::body::to_bytes(resp_without_rules.into_body())
             .await
             .unwrap();
+        let raw_without: Value = serde_json::from_slice(&bytes_without).unwrap();
+        assert!(raw_without["data"][0].get("paymentHistory").is_none());
+        assert!(raw_without["data"][0]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
         let parsed_without: ApiResponse<Vec<VehicleBillingDetails>> =
             serde_json::from_slice(&bytes_without).unwrap();
         assert_eq!(parsed_without.data.len(), 1);
@@ -7295,6 +7421,8 @@ mod tests {
         assert_eq!(parsed_without.data[0].fees.len(), 2);
         assert_eq!(parsed_without.data[0].fees[0].fee_id, "FEE-01");
         assert_eq!(parsed_without.data[0].fees[1].fee_id, "FEE-02");
+        assert!(parsed_without.data[0].payment_history.is_empty());
+        assert!(parsed_without.data[0].fees.iter().all(|f| f.periods.is_empty()));
         assert_eq!(parsed_without.data[0].is_sample_billing_data, Some(true));
         assert_eq!(
             parsed_without.data[0].sample_source_branch.as_deref(),
@@ -7346,13 +7474,171 @@ mod tests {
         let bytes_with = actix_web::body::to_bytes(resp_with_rules.into_body())
             .await
             .unwrap();
+        let raw_with: Value = serde_json::from_slice(&bytes_with).unwrap();
+        assert!(raw_with["data"][0].get("paymentHistory").is_none());
+        assert!(raw_with["data"][0]["fees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f.get("periods").is_none()));
         let parsed_with: ApiResponse<Vec<VehicleBillingDetails>> =
             serde_json::from_slice(&bytes_with).unwrap();
         assert_eq!(parsed_with.data.len(), 1);
         assert_eq!(parsed_with.data[0].vehicle_status, "ELIGIBLE");
+        assert!(parsed_with.data[0].payment_history.is_empty());
+        assert!(parsed_with.data[0].fees.iter().all(|f| f.periods.is_empty()));
         assert_eq!(parsed_with.data[0].is_sample_billing_data, None);
         assert_eq!(parsed_with.data[0].sample_source_branch, None);
         assert_eq!(parsed_with.data[0].message, None);
+    }
+
+    #[actix_web::test]
+    async fn test_submit_vehicle_payment_without_periods_uses_fee_amount_or_paid_amount() {
+        let s_data = create_mock_server_data().await;
+
+        s_data.cache.write().await.write(
+            ResourceName::VehicleResource,
+            810,
+            DatabaseResource {
+                id: Some(810),
+                resource_name: Some(ResourceName::VehicleResource),
+                inner_content: Some(serde_json::json!({
+                    "VehicleId": 34119,
+                    "VehicleNumber": "Ko Pra-09-009-GHA-9090",
+                    "VehicleType": "5 pangree",
+                    "SanghBranch": "Loadboard sthaniya, Lumbini Truck Yatayat Byawasayi Sangh",
+                    "Registration": { "Status": "ACTIVE" },
+                    "Owners": [{ "Name": "Owner Test", "Phone": "9603265148" }]
+                })),
+                external_content: None,
+            },
+        );
+
+        // 1. Multiple selectedFees with explicit string and numeric amount and NO periods
+        let uniq = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let raw_multi_json = serde_json::json!({
+            "lodbodPaymentReferenceId": format!("LB-NO-PERIOD-1-{}", uniq),
+            "esewaTransactionId": format!("ESEWA-NP-1-{}", uniq),
+            "paymentVerifiedBy": "LODBOD",
+            "paymentVerifiedAt": "2026-11-27T12:00:00+05:45",
+            "vehicleId": "34119",
+            "vehicleNumber": "Ko Pra-09-009-GHA-9090",
+            "paidAmount": "2500.00",
+            "currency": "NPR",
+            "selectedFees": [
+                {
+                    "feeId": "FEE-01",
+                    "feeTitle": "Sadahitkosh Sulka",
+                    "fiscalYear": "2083/2084",
+                    "billingPeriodType": "MONTH",
+                    "amount": "2000.00"
+                },
+                {
+                    "feeId": "FEE-02",
+                    "feeTitle": "सदस्यता नविकरण शूल्क",
+                    "fiscalYear": "2083/2084",
+                    "billingPeriodType": "YEAR",
+                    "amount": 500
+                }
+            ]
+        });
+        let req_multi: SubmitVehiclePaymentRequest =
+            serde_json::from_value(raw_multi_json).unwrap();
+        let resp_multi = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Json(req_multi),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_multi.status(), StatusCode::CREATED);
+        let res_multi: ApiResponse<VehiclePaymentResult> = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_multi.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(res_multi.data.status, "SUCCESS");
+        assert_eq!(res_multi.data.receipt_status.as_deref(), Some("GENERATED"));
+        let bill_id_1: i32 = res_multi
+            .data
+            .billing_id
+            .as_deref()
+            .unwrap()
+            .strip_prefix("BILL-")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // 2. Single selectedFee omitting BOTH periods and amount falls back to paidAmount
+        let raw_single_json = serde_json::json!({
+            "lodbodPaymentReferenceId": format!("LB-NO-PERIOD-2-{}", uniq),
+            "esewaTransactionId": format!("ESEWA-NP-2-{}", uniq),
+            "paymentVerifiedBy": "LODBOD",
+            "paymentVerifiedAt": "2026-11-28T12:00:00+05:45",
+            "vehicleId": "34119",
+            "vehicleNumber": "Ko Pra-09-009-GHA-9090",
+            "paidAmount": "750.00",
+            "currency": "NPR",
+            "selectedFees": [
+                {
+                    "feeId": "FEE-03",
+                    "feeTitle": "Custom Fee",
+                    "fiscalYear": "2083/2084"
+                }
+            ]
+        });
+        let req_single: SubmitVehiclePaymentRequest =
+            serde_json::from_value(raw_single_json).unwrap();
+        let resp_single = submit_vehicle_payment(
+            actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", "Bearer lodbod-service-secret"))
+                .to_http_request(),
+            web::Json(req_single),
+            s_data.clone(),
+        )
+        .await;
+        assert_eq!(resp_single.status(), StatusCode::CREATED);
+        let res_single: ApiResponse<VehiclePaymentResult> = serde_json::from_slice(
+            &actix_web::body::to_bytes(resp_single.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(res_single.data.status, "SUCCESS");
+        assert_eq!(res_single.data.receipt_status.as_deref(), Some("GENERATED"));
+        let bill_id_2: i32 = res_single
+            .data
+            .billing_id
+            .as_deref()
+            .unwrap()
+            .strip_prefix("BILL-")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let cache = s_data.cache.read().await;
+        let bill_1 = cache.read(ResourceName::BillResource, bill_id_1).unwrap();
+        let items_1 = bill_1.inner_content.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items_1.len(), 2);
+        assert_eq!(items_1[0]["amount"], 2000.0);
+        assert_eq!(items_1[0]["ruleId"], "FEE-01");
+        assert!(items_1[0].get("periodId").is_none());
+        assert_eq!(items_1[1]["amount"], 500.0);
+        assert_eq!(items_1[1]["ruleId"], "FEE-02");
+        assert!(items_1[1].get("periodId").is_none());
+
+        let bill_2 = cache.read(ResourceName::BillResource, bill_id_2).unwrap();
+        let items_2 = bill_2.inner_content.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items_2.len(), 1);
+        assert_eq!(items_2[0]["amount"], 750.0);
+        assert_eq!(items_2[0]["ruleId"], "FEE-03");
+        assert!(items_2[0].get("periodId").is_none());
     }
 
     #[test]
@@ -7798,6 +8084,7 @@ mod tests {
                 fee_title: "Sadahitkosh Sulka".to_string(),
                 fiscal_year: "2083/2084".to_string(),
                 billing_period_type: "MONTH".to_string(),
+                amount: None,
                 periods: vec![SelectedFeePeriod {
                     period_id: "2083-08".to_string(),
                     amount: "2000.00".to_string(),
