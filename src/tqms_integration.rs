@@ -1269,6 +1269,17 @@ pub async fn get_vehicle_details(
     }
 }
 
+pub async fn get_vehicle_documents(
+    vehicle_number: web::Path<String>,
+    s_data: web::Data<Arc<ServerData>>,
+) -> HttpResponse {
+    match s_data.tqms_client.get_vehicle_documents(&vehicle_number).await {
+        Ok(res) => HttpResponse::Ok().json(res),
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Failed to get vehicle documents: {e:?}")),
+    }
+}
+
 const MAX_STREAM_SYNC_BATCH_SIZE: usize = 500;
 const MAX_STREAM_SYNC_CONCURRENCY: usize = 64;
 const STREAM_SYNC_MAX_ATTEMPTS: u32 = 5;
@@ -3463,5 +3474,87 @@ mod tests {
             Err(anyhow::anyhow!("TQMS offline")),
         )
         .is_err());
+    }
+
+    #[actix_web::test]
+    async fn test_get_vehicle_documents_route_fetches_from_tqms() {
+        use crate::access::test_helpers::{create_mock_server_data_with_state, MockDbState};
+        use actix_web::{http::StatusCode, test, App};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock TQMS listener");
+        let addr = listener.local_addr().unwrap();
+
+        let expected_body = json!({
+            "Code": 200,
+            "Message": "Success",
+            "Data": [
+                { "DocumentType": "BlueBook", "DocumentUrl": "https://tqms.example/doc/1.pdf" }
+            ]
+        });
+        let expected_body_str = expected_body.to_string();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.expect("read request");
+            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            assert!(
+                req_text.starts_with("GET /api/v1/cts/vehicle/NA-5-KHA-1234/documents "),
+                "unexpected request line: {req_text}"
+            );
+            assert!(
+                req_text.contains("authorization: Bearer test-tqms-token")
+                    || req_text.contains("Authorization: Bearer test-tqms-token"),
+                "missing bearer token in request: {req_text}"
+            );
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                expected_body_str.len(),
+                expected_body_str
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let (base_data, _db_state) = create_mock_server_data_with_state(MockDbState::default()).await;
+        let custom_state = web::Data::new(Arc::new(ServerData {
+            db: base_data.db.clone(),
+            tqms_client: Arc::new(TQMSClient::with_base_url_and_token(
+                format!("http://{addr}"),
+                "test-tqms-token".to_string(),
+            )),
+            cache: base_data.cache.clone(),
+        }));
+
+        let app = test::init_service(
+            App::new()
+                .app_data(custom_state)
+                .service(
+                    web::scope("/api/v1/tqms").route(
+                        "/vehicle_documents/{vehicle_number}",
+                        web::get().to(get_vehicle_documents),
+                    ),
+                ),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/v1/tqms/vehicle_documents/NA-5-KHA-1234")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body, expected_body);
+
+        server_task.await.expect("mock TQMS server finished");
     }
 }

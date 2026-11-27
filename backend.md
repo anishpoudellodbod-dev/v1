@@ -7,10 +7,10 @@ This document consolidates the **current implemented backend**, the **Reports Ar
 ## 1. Tech Stack & Project Layout
 
 ### 1.1 Workspace `Cargo.toml`
-- **Workspace Members (11 crates, `resolver = "2"`):**
+- **Workspace Members (12 crates, `resolver = "2"`):**
   - Root thin binary: `v1` (`version = "0.1.0"`, `edition = "2021"`)
   - Layer 0 leaf crates: `narayani-core`, `narayani-plate`, `narayani-date`
-  - Layer 1 domain crates: `narayani-settings`, `narayani-auth`, `narayani-vehicle-history`
+  - Layer 1 domain crates: `narayani-settings`, `narayani-auth`, `narayani-vehicle-history`, `narayani-file-upload`
   - Layer 2 storage crate: `narayani-storage`
   - Layer 3 application/analytics crates: `narayani-integrations`, `narayani-billing`, `narayani-analytics`
 - **Core Dependencies:**
@@ -29,7 +29,7 @@ Workspace root contains `Cargo.toml`, `Cargo.lock`, `.env`, `billing-narayani.se
 - Auth & Authorization: `auth.rs`, `middleware.rs`, `login.rs`, `access.rs`, `permissions.rs`
 - Generic CRUD & Streaming: `actions.rs`, `api_stream.rs`
 - Observability & Settings: `log.rs`, `audit.rs`, `settings.rs`
-- Domain, Vehicles, Integrations & Reporting HTTP layers: `billing_actions.rs`, `tqms_integration.rs`, `sms.rs`, `dashboard_statistics.rs`, `members.rs`, `vehicle_history.rs`, `reports.rs`
+- Domain, Vehicles, Integrations & Reporting HTTP layers: `billing_actions.rs`, `tqms_integration.rs`, `sms.rs`, `dashboard_statistics.rs`, `members.rs`, `vehicle_history.rs`, `reports.rs`, `file_upload.rs`
 
 ---
 
@@ -57,6 +57,9 @@ Workspace root contains `Cargo.toml`, `Cargo.lock`, `.env`, `billing-narayani.se
 | `SMS_DEFAULT_COUNTRY_CODE` | Optional | `sms.rs` | Fallback default country code (e.g., `+977`) |
 | `SMS_ROUTE_ID` | `"10244"` fallback | `sms.rs` | Route ID fallback when account requires explicit pricing route |
 | `SMS_CAMPAIGN_ID` | `"8572"` fallback | `sms.rs` | Campaign ID fallback for SamayaSMS |
+| `UPLOAD_DIR` | `"uploads"` | `narayani-file-upload` | Local disk directory for uploaded files |
+| `MAX_UPLOAD_SIZE_BYTES` | `26214400` (25 MiB) | `narayani-file-upload` | Maximum accepted uploaded file size in bytes |
+| `PUBLIC_FILES_BASE_PATH` | `"/files"` | `narayani-file-upload` | Base URL path returned in `FileMetadata.url` for public file retrieval |
 
 ### Key & Certificate Files
 - `private.pem` / `public.pem`: RSA keys in the working directory used by `auth.rs` for RS512 JWT signing and RS256/RS384/RS512 verification.
@@ -139,6 +142,7 @@ CREATE TABLE IF NOT EXISTS <lowercase_resource_name> (
 | `ActionLogsResource` | `"ActionLogsResource"` | Yes | Yes | Persistent `ACTLOG-*` entries |
 | `AuditTrailResource` | `"AuditTrailResource"` | Yes | Yes | Immutable `AUD-*` entries |
 | `VehicleHistoryResource` | `"VehicleHistoryResource"` | Yes | Yes | Linked-list (`head -> next -> null`) per-vehicle identity & plate history |
+| `FileResource` | `"FileResource"` | Yes | Yes | Uploaded file metadata (`originalName`, `storedName`, `contentType`, `sizeBytes`, `url`, `diskPath`, `uploadedAt`, `uploadedBy`) |
 
 ### 4.2 `Cache` Mechanics (`src/cache.rs`)
 - Current fields:
@@ -238,11 +242,13 @@ All four top-level fields on `DatabaseResource` are `Option<...>`:
 | Vehicle History | `GET /api/v1/vehicles/history`, `POST /record`, `GET /{identifier}` | `vehicle_history` | Auth + `VehicleHistoryResource:READ`/`UPDATE` |
 | Bills | `POST /create`, `PUT /modify/{id}`, `DELETE /delete/{id}`, `POST /rollback/{id}`, `GET /logs`, `GET /logs/{bill_id}` under `/api/v1/bills` | `billing_actions` | Role + domain RBAC + `SettingResource` VAT/FY/cancelled/linked-fee checks |
 | Lodbod | `POST /vehicles/billing-details`, `POST /payments/vehicle-receipts`, `GET /payments/{lodbodPaymentReferenceId}/vehicle-receipts` under `/api/integrations/lodbod/v1` | `billing_actions` | `LODBOD_SERVICE_TOKEN` or Admin/Operator JWT; `VEHICLE_MISMATCH` (`400`) on `vehicleId` vs `vehicleNumber` conflict; validates `sthaniyaBranch` against `VehicleResource.SanghBranch`; falls back to `"Loadboard sthaniya"` fee heads with placeholder message when sangh lacks rules; omits `periods` & `paymentHistory` in `/billing-details`; `periods` optional on `/vehicle-receipts` |
-| TQMS | `POST /api/v1/tqms/search`, `GET /validate/{vehicle_number}`, `GET /vehicle_details/{vehicle_number}`, `GET /sync`, `GET /sync/{concurency}`, `GET /stream_sync/{batch_size}/{concurrency}`, `GET /api/v1/read_all/VehicleTypes`, `GET /api/v1/get_vehicles_tqms` | `tqms_integration` | Streams SSE (default) or NDJSON; records `VehicleHistoryResource` on sync *(preserve `/sync/{concurency}` spelling for backward compatibility)* |
+| TQMS | `POST /api/v1/tqms/search`, `GET /validate/{vehicle_number}`, `GET /vehicle_details/{vehicle_number}`, `GET /vehicle_documents/{vehicle_number}`, `GET /sync`, `GET /sync/{concurency}`, `GET /stream_sync/{batch_size}/{concurrency}`, `GET /api/v1/read_all/VehicleTypes`, `GET /api/v1/get_vehicles_tqms` | `tqms_integration` | Streams SSE (default) or NDJSON; records `VehicleHistoryResource` on sync *(preserve `/sync/{concurency}` spelling for backward compatibility)* |
 | SMS | `GET /templates`, `GET /templates/{id}`, `POST /preview`, `POST /send`, `POST /send-raw` under `/api/v1/sms` | `sms` | SamayaSMS provider + settings templates + 500ms rate limit |
 | Settings | `GET /resolved`, `POST /billing/calculate-vat`, `GET /billing/arrears/{vehicle}`, `POST /billing/linked-fees/evaluate`, `GET /receipts/cancellation-check/{bill_id}`, `GET /insurance/eligibility/{vehicle}`, `GET /fiscal-year/selector`, `GET /fiscal-year/access/{fiscal_year:.*}`, `GET /vehicle-management/displaced-tagging` under `/api/v1/settings` | `settings` | Auth + redacts SMS secrets for non-Admin callers |
 | Dashboard & Members | `GET /api/v1/dashboard/statistics`, `GET /api/v1/dashboard/statistics/{fiscal_year:.*}`, `GET /api/v1/dashboard/members/...`, `GET /api/v1/members/...` | `dashboard_statistics`, `members` | Supports slash-separated FYs (e.g. `/2082/2083`); explicit BS `fiscalYear` is authoritative over `periodStart`; counts only vehicles with $\ge 1$ non-`CANCELLED`/non-ignored `BillResource`; scopes `total_users`, `total_inactive_users`, and `displaced_users` to `<= target_fiscal_year` |
 | Logs & Audit | `GET /api/v1/logs/actions`, `GET /api/v1/logs/actions/{resource_name}`, `GET /api/v1/audit`, `GET /api/v1/audit/summary`, `GET /api/v1/audit/entity/{resource_name}/{resource_id}` | `log`, `audit` | Admin-only; buffered async PostgreSQL persistence via unbounded MPSC channels |
+| Files | `POST /api/v1/files/upload` | `file_upload` | Auth (`User\|Admin\|Operator`); accepts `multipart/form-data` or raw body + `X-File-Name`, saves file to disk (`UPLOAD_DIR`), persists `FileResource` metadata to DB & cache |
+| Public Files | `GET /files/{filename}`, `GET /uploads/{filename}` | `file_upload` | **No auth or tokens required**; serves stored file inline with MIME detection & path-traversal rejection |
 
 ---
 
@@ -303,7 +309,7 @@ Mutations on `BillResource`, `VehicleResource`, and `VehicleHistoryResource` pro
 
 ## 9. Modular Cargo Workspace & Rust Collections (Implemented)
 
-### 9.1 11-Crate Workspace Dependency DAG
+### 9.1 12-Crate Workspace Dependency DAG
 Splitting `v1` into an acyclic 5-layer workspace isolates pure domain logic from `actix-web`, `reqwest`, and `tokio-postgres`, trims `tokio` features (`["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"]`), drops `futures` in favor of `futures-util`, and enables `[profile.dev]` `debug = "line-tables-only"` with `[profile.dev.package."*"] opt-level = 2`:
 
 ```mermaid
@@ -315,6 +321,7 @@ flowchart TD
     L1_settings["narayani-settings (AppSettings & rules)"]
     L1_auth["narayani-auth (JWT, RevokedTokenStore & dual RBAC)"]
     L1_vhist["narayani-vehicle-history (chains & VehicleAliasMap)"]
+    L1_fupload["narayani-file-upload (multipart/raw upload, disk storage & MIME lookup)"]
 
     L2_storage["narayani-storage (PG pool, Cache, RingBuffer, ReportIndex)"]
 
@@ -331,6 +338,7 @@ flowchart TD
     L1_auth --> L1_settings
     L1_vhist --> L0_core
     L1_vhist --> L0_plate
+    L1_fupload --> L0_core
 
     L2_storage --> L0_core
     L2_storage --> L0_date

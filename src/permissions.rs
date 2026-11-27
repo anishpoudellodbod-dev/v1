@@ -1137,7 +1137,8 @@ mod tests {
     #[test]
     fn test_action_catalog_covers_all_15_resources_and_custom_domain_actions() {
         let catalog = action_catalog();
-        assert_eq!(catalog.len(), 15);
+        assert_eq!(catalog.len(), 16);
+        assert!(is_valid_action_for_resource("FileResource", "CREATE"));
         assert!(is_valid_action_for_resource(
             "VehicleResource",
             "CONFIRM_NUMBER_CHANGE"
@@ -1326,7 +1327,7 @@ mod tests {
             tenant_id: Some("loadboard-sthaniya".to_string()),
         });
 
-        // 0. Catalog endpoint returns all 15 resources
+        // 0. Catalog endpoint returns all 16 resources
         let cat_resp = get_action_catalog().await;
         assert_eq!(cat_resp.status(), StatusCode::OK);
         let cat_body: Value = serde_json::from_slice(
@@ -1334,7 +1335,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cat_body["schemaVersion"], PERMISSION_SCHEMA_VERSION);
-        assert_eq!(cat_body["resources"].as_array().unwrap().len(), 15);
+        assert_eq!(cat_body["resources"].as_array().unwrap().len(), 16);
 
         // 1. Seed default Admin, Cashier ([1,2]), Viewer policies
         let seed_resp = seed_default_role_policies(
